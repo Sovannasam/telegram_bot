@@ -1,0 +1,4 @@
+python-telegram-bot
+pytz
+openpyxl
+psycopg2-binary
