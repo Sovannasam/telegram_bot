@@ -16,7 +16,7 @@ from telegram import Update
 from telegram.constants import ChatType, ParseMode
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
-# = a===========================
+# =============================
 # LOGGING
 # =============================
 logging.basicConfig(
@@ -29,7 +29,6 @@ log = logging.getLogger("bot")
 # CONFIG
 # =============================
 def get_env_variable(var_name: str) -> str:
-    """Gets an environment variable or raises an error."""
     value = os.getenv(var_name)
     if not value:
         raise RuntimeError(
@@ -40,7 +39,8 @@ def get_env_variable(var_name: str) -> str:
 
 BOT_TOKEN = get_env_variable("BOT_TOKEN")
 DATABASE_URL = get_env_variable("DATABASE_URL")
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "excelmerge") # telegram username (without @)
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "excelmerge")  # telegram username (without @)
+WA_DAILY_LIMIT = int(os.getenv("WA_DAILY_LIMIT", "4"))      # max sends per number per logical day
 
 TIMEZONE = pytz.timezone("Asia/Phnom_Penh")
 
@@ -50,21 +50,18 @@ TIMEZONE = pytz.timezone("Asia/Phnom_Penh")
 db_lock = asyncio.Lock()
 
 def get_db_connection():
-    """Establishes a connection to the PostgreSQL database."""
     try:
-        conn = psycopg2.connect(DATABASE_URL)
-        return conn
+        return psycopg2.connect(DATABASE_URL)
     except psycopg2.OperationalError as e:
         log.error("Could not connect to database: %s", e)
         raise
 
 def setup_database():
-    """Ensures the required tables exist in the database."""
     log.info("Setting up database schema...")
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            # Table for key-value JSON storage (for state and owners)
+            # KV store
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS kv_storage (
                     key TEXT PRIMARY KEY,
@@ -72,7 +69,7 @@ def setup_database():
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 );
             """)
-            # Table for the audit log (replaces the CSV)
+            # Audit log
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id SERIAL PRIMARY KEY,
@@ -88,13 +85,23 @@ def setup_database():
                     owner TEXT
                 );
             """)
+            # Daily quota per WhatsApp number
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS wa_daily_usage (
+                    day DATE NOT NULL,
+                    number_norm TEXT NOT NULL,
+                    sent_count INTEGER NOT NULL DEFAULT 0,
+                    last_sent TIMESTAMPTZ,
+                    PRIMARY KEY (day, number_norm)
+                );
+            """)
             conn.commit()
         log.info("Database schema is ready.")
     finally:
         conn.close()
 
 # =============================
-# STATE (Now in Database)
+# STATE (DB-backed)
 # =============================
 BASE_STATE = {
     "user_names": {},
@@ -107,7 +114,6 @@ BASE_STATE = {
 state: Dict = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
 
 def load_state():
-    """Loads state from the 'state' key in the database."""
     global state
     conn = get_db_connection()
     try:
@@ -119,23 +125,19 @@ def load_state():
                 state = {**BASE_STATE, **loaded}
                 log.info("Bot state loaded from database.")
             else:
-                log.info("No state found in database, using base state.")
                 state = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
-                save_state() # Save initial state
+                save_state()
     except Exception as e:
         log.warning("Failed to load state from DB: %s", e)
     finally:
         conn.close()
 
-    # Ensure nested dictionaries exist
     state.setdefault("rr", {}).setdefault("username_entry_idx", {})
     state["rr"].setdefault("wa_entry_idx", {})
     state.setdefault("issued", {}).setdefault("username", {})
     state["issued"].setdefault("whatsapp", {})
 
-
 def save_state():
-    """Saves the current state to the 'state' key in the database."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -152,7 +154,7 @@ def save_state():
         conn.close()
 
 # =============================
-# OWNER DIRECTORY (Now in Database)
+# OWNER DIRECTORY (DB-backed)
 # =============================
 OWNER_DATA: List[dict] = []
 HANDLE_INDEX: Dict[str, List[dict]] = {}
@@ -160,7 +162,6 @@ PHONE_INDEX: Dict[str, dict] = {}
 USERNAME_POOL: List[Dict] = []
 WHATSAPP_POOL: List[Dict] = []
 
-# ... (Helper functions like _norm_handle, _is_admin, etc. remain the same) ...
 def _norm_handle(h: str) -> str: return re.sub(r"^@", "", (h or "").strip().lower())
 def _norm_phone(p: str) -> str: return re.sub(r"\D+", "", (p or ""))
 def _norm_owner_name(s: str) -> str:
@@ -179,7 +180,8 @@ def _owner_is_paused(group: dict) -> bool:
             dt = datetime.fromisoformat(until)
             if dt.tzinfo is None: dt = TIMEZONE.localize(dt)
             return datetime.now(tz=TIMEZONE) < dt
-        except Exception: return False
+        except Exception:
+            return False
     return False
 
 def _ensure_owner_shape(g: dict) -> dict:
@@ -187,25 +189,27 @@ def _ensure_owner_shape(g: dict) -> dict:
     g.setdefault("disabled", False)
     g.setdefault("entries", [])
     g.setdefault("whatsapp", [])
+    # entries
     norm_entries = []
     for e in g.get("entries", []):
         if isinstance(e, dict):
             e.setdefault("telegram", ""); e.setdefault("phone", ""); e.setdefault("disabled", False)
             norm_entries.append(e)
     g["entries"] = norm_entries
+    # whatsapp
     norm_wa = []
     for w in g.get("whatsapp", []):
         if isinstance(w, dict):
             w.setdefault("number", w.get("number") or w.get("phone") or "")
             w.setdefault("disabled", False)
-            if (w["number"] or "").strip(): norm_wa.append(w)
+            if (w["number"] or "").strip():
+                norm_wa.append({"number": w["number"].strip(), "disabled": bool(w.get("disabled", False))})
         elif isinstance(w, str) and w.strip():
             norm_wa.append({"number": w.strip(), "disabled": False})
     g["whatsapp"] = norm_wa
     return g
 
 def save_owner_directory():
-    """Saves the OWNER_DATA list to the 'owners' key in the database."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -222,7 +226,6 @@ def save_owner_directory():
         conn.close()
 
 def load_owner_directory():
-    """Loads owner data from DB and rebuilds in-memory pools and indexes."""
     global OWNER_DATA, HANDLE_INDEX, PHONE_INDEX, USERNAME_POOL, WHATSAPP_POOL
     OWNER_DATA, HANDLE_INDEX, PHONE_INDEX = [], {}, {}
     USERNAME_POOL, WHATSAPP_POOL = [], []
@@ -232,11 +235,7 @@ def load_owner_directory():
         with conn.cursor() as cur:
             cur.execute("SELECT data FROM kv_storage WHERE key = 'owners'")
             result = cur.fetchone()
-            if result and result[0]:
-                OWNER_DATA = result[0]
-            else:
-                log.warning("Owner directory not found in database. Will create on first add.")
-                OWNER_DATA = []
+            OWNER_DATA = (result[0] or []) if result else []
     except Exception as e:
         log.error("Failed to load owners from DB: %s", e)
         OWNER_DATA = []
@@ -245,10 +244,10 @@ def load_owner_directory():
 
     OWNER_DATA = [_ensure_owner_shape(dict(g)) for g in OWNER_DATA]
 
-    # Rebuilding logic remains the same, operating on the loaded OWNER_DATA
     for group in OWNER_DATA:
         owner = _norm_owner_name(group.get("owner") or "")
         if not owner or _owner_is_paused(group): continue
+        # usernames
         usernames: List[str] = []
         for entry in group.get("entries", []):
             if entry.get("disabled"): continue
@@ -262,6 +261,7 @@ def load_owner_directory():
             if ph:
                 PHONE_INDEX[_norm_phone(ph)] = {"owner": owner, "phone": ph, "telegram": tel, "channel": "telegram"}
         if usernames: USERNAME_POOL.append({"owner": owner, "usernames": usernames})
+        # whatsapp
         numbers: List[str] = []
         for w in group.get("whatsapp", []):
             if w.get("disabled"): continue
@@ -270,17 +270,60 @@ def load_owner_directory():
                 numbers.append(num)
                 PHONE_INDEX[_norm_phone(num)] = {"owner": owner, "phone": num, "telegram": None, "channel": "whatsapp"}
         if numbers: WHATSAPP_POOL.append({"owner": owner, "numbers": numbers})
+
     log.info("[owner_directory] owners(active): usernames=%d, whatsapp=%d | handles=%d, phones=%d",
              len(USERNAME_POOL), len(WHATSAPP_POOL), len(HANDLE_INDEX), len(PHONE_INDEX))
 
 # =============================
+# QUOTA: per-number per-day
+# =============================
+def _logical_day_today() -> date:
+    now = datetime.now(TIMEZONE)
+    return (now - timedelta(hours=5)).date()  # 05:00 boundary
+
+def _wa_get_count(number_norm: str, day: date) -> int:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT sent_count FROM wa_daily_usage WHERE day=%s AND number_norm=%s",
+                        (day, number_norm))
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+    except Exception as e:
+        log.warning("Quota read failed: %s", e)
+        return 0
+    finally:
+        conn.close()
+
+def _wa_inc_count(number_norm: str, day: date):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO wa_daily_usage (day, number_norm, sent_count, last_sent)
+                VALUES (%s, %s, 1, %s)
+                ON CONFLICT (day, number_norm)
+                DO UPDATE SET sent_count = wa_daily_usage.sent_count + 1,
+                              last_sent = EXCLUDED.last_sent
+            """, (day, number_norm, datetime.now(TIMEZONE)))
+            conn.commit()
+    except Exception as e:
+        log.warning("Quota write failed: %s", e)
+    finally:
+        conn.close()
+
+def _wa_quota_reached(number_raw: str) -> bool:
+    n = _norm_phone(number_raw)
+    cnt = _wa_get_count(n, _logical_day_today())
+    return cnt >= WA_DAILY_LIMIT
+
+# =============================
 # Rotation-preserving rebuild & Round-robin helpers
-# (These functions do not need changes as they operate on in-memory variables)
 # =============================
 def _owner_list_from_pool(pool) -> List[str]: return [blk["owner"] for blk in pool]
 def _preserve_owner_pointer(old_list: List[str], new_list: List[str], old_idx: int) -> int:
     if not new_list: return 0
-    old_list = list(old_list or []);
+    old_list = list(old_list or [])
     if not old_list: return 0
     old_idx = old_idx % len(old_list)
     start_owner = old_list[old_idx]
@@ -309,12 +352,16 @@ def _rebuild_pools_preserving_rotation():
         old_wa_owner_idx   = rr.get("wa_owner_idx", 0)
         old_user_entry_idx = dict(rr.get("username_entry_idx", {}))
         old_wa_entry_idx   = dict(rr.get("wa_entry_idx", {}))
+
         load_owner_directory()
         save_owner_directory()
+
         new_user_owner_list = _owner_list_from_pool(USERNAME_POOL)
         new_wa_owner_list   = _owner_list_from_pool(WHATSAPP_POOL)
+
         rr["username_owner_idx"] = _preserve_owner_pointer(old_user_owner_list, new_user_owner_list, old_user_owner_idx)
         rr["wa_owner_idx"] = _preserve_owner_pointer(old_wa_owner_list, new_wa_owner_list, old_wa_owner_idx)
+
         rr.setdefault("username_entry_idx", old_user_entry_idx)
         rr.setdefault("wa_entry_idx", old_wa_entry_idx)
         _preserve_entry_indices(rr["username_entry_idx"], USERNAME_POOL, "usernames")
@@ -324,7 +371,6 @@ def _rebuild_pools_preserving_rotation():
         db_lock.release()
 
 def _next_from_username_pool() -> Optional[Dict[str, str]]:
-    # ... Function implementation is unchanged ...
     if not USERNAME_POOL: return None
     rr = state["rr"]
     idx = rr.get("username_owner_idx", 0) % len(USERNAME_POOL)
@@ -342,46 +388,55 @@ def _next_from_username_pool() -> Optional[Dict[str, str]]:
     return None
 
 def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
-    # ... Function implementation is unchanged ...
+    """Owner-rotating WhatsApp with per-number daily quota."""
     if not WHATSAPP_POOL: return None
     rr = state["rr"]
     owner_idx = rr.get("wa_owner_idx", 0) % len(WHATSAPP_POOL)
-    for _ in range(len(WHATSAPP_POOL)):
+
+    for _ in range(len(WHATSAPP_POOL)):  # loop owners
         block = WHATSAPP_POOL[owner_idx]
         owner = block["owner"]
-        numbers = block.get("numbers", [])
+        numbers = block.get("numbers", []) or []
         if numbers:
-            ni = rr["wa_entry_idx"].get(owner, 0) % len(numbers)
-            number = numbers[ni]
-            rr["wa_entry_idx"][owner] = (ni + 1) % len(numbers)
-            rr["wa_owner_idx"] = (owner_idx + 1) % len(WHATSAPP_POOL)
-            save_state()
-            return {"owner": owner, "number": number}
+            start = rr["wa_entry_idx"].get(owner, 0) % len(numbers)
+            # try each number once for this owner to find one under quota
+            for step in range(len(numbers)):
+                cand = numbers[(start + step) % len(numbers)]
+                if _wa_quota_reached(cand):
+                    continue
+                # choose this number
+                rr["wa_entry_idx"][owner] = ((start + step) + 1) % len(numbers)
+                rr["wa_owner_idx"] = (owner_idx + 1) % len(WHATSAPP_POOL)
+                save_state()
+                return {"owner": owner, "number": cand}
         owner_idx = (owner_idx + 1) % len(WHATSAPP_POOL)
     return None
 
 # =============================
-# REGEXES (unchanged)
+# REGEXES
 # =============================
-WHO_USING_REGEX = re.compile(r"^\s*who(?:['\u2019]s| is)\s+using\s+(?:@?([A-Za-z0-9_\.]+)|(\+?\d[\d\s\-]{6,}\d))\s*$", re.IGNORECASE)
+WHO_USING_REGEX = re.compile(
+    r"^\s*who(?:['\u2019]s| is)\s+using\s+(?:@?([A-Za-z0-9_\.]+)|(\+?\d[\d\s\-]{6,}\d))\s*$",
+    re.IGNORECASE
+)
 NEED_USERNAME_RX = re.compile(r"^\s*i\s*need\s*(?:user\s*name|username)\s*$", re.IGNORECASE)
 NEED_WHATSAPP_RX = re.compile(r"^\s*i\s*need\s*(?:id\s*)?whats?app\s*$", re.IGNORECASE)
-STOP_OPEN_RX = re.compile(r"^\s*(stop|open)\s+@?(.+?)\s*$", re.IGNORECASE)
-ADD_OWNER_RX = re.compile(r"^\s*add\s+owner\s+@?(.+?)\s*$", re.IGNORECASE)
-ADD_USERNAME_RX = re.compile(r"^\s*add\s+username\s+@([A-Za-z0-9_]{3,})\s+to\s+@?(.+?)\s*$", re.IGNORECASE)
-ADD_WHATSAPP_RX = re.compile(r"^\s*add\s+whats?app\s+(\+?\d[\d\s\-]{6,}\d)\s+to\s+@?(.+?)\s*$", re.IGNORECASE)
-DEL_USERNAME_RX = re.compile(r"^\s*delete\s+username\s+@([A-Za-z0-9_]{3,})\s*$", re.IGNORECASE)
-DEL_WHATSAPP_RX = re.compile(r"^\s*delete\s+whats?app\s+(\+?\d[\d\s\-]{6,}\d)\s*$", re.IGNORECASE)
-LIST_OWNERS_RX = re.compile(r"^\s*list\s+owners\s*$", re.IGNORECASE)
-LIST_OWNER_DETAIL_RX = re.compile(r"^\s*list\s+owner\s+@?(.+?)\s*$", re.IGNORECASE)
-LIST_DISABLED_RX = re.compile(r"^\s*list\s+disabled\s*$", re.IGNORECASE)
-SEND_REPORT_RX = re.compile(r"^\s*(?:send\s+report|report)(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
+
+STOP_OPEN_RX        = re.compile(r"^\s*(stop|open)\s+(.+?)\s*$", re.IGNORECASE)
+ADD_OWNER_RX        = re.compile(r"^\s*add\s+owner\s+@?(.+?)\s*$", re.IGNORECASE)
+ADD_USERNAME_RX     = re.compile(r"^\s*add\s+username\s+@([A-Za-z0-9_]{3,})\s+to\s+@?(.+?)\s*$", re.IGNORECASE)
+ADD_WHATSAPP_RX     = re.compile(r"^\s*add\s+whats?app\s+(\+?\d[\d\s\-]{6,}\d)\s+to\s+@?(.+?)\s*$", re.IGNORECASE)
+DEL_USERNAME_RX     = re.compile(r"^\s*delete\s+username\s+@([A-Za-z0-9_]{3,})\s*$", re.IGNORECASE)
+DEL_WHATSAPP_RX     = re.compile(r"^\s*delete\s+whats?app\s+(\+?\d[\d\s\-]{6,}\d)\s*$", re.IGNORECASE)
+LIST_OWNERS_RX      = re.compile(r"^\s*list\s+owners\s*$", re.IGNORECASE)
+LIST_OWNER_DETAIL_RX= re.compile(r"^\s*list\s+owner\s+@?(.+?)\s*$", re.IGNORECASE)
+LIST_DISABLED_RX    = re.compile(r"^\s*list\s+disabled\s*$", re.IGNORECASE)
+SEND_REPORT_RX      = re.compile(r"^\s*(?:send\s+report|report)(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 
 # =============================
-# CSV AUDIT LOG (Now in Database)
+# AUDIT LOG (DB)
 # =============================
 def _log_event(kind: str, action: str, update: Update, value: str, owner: str = ""):
-    """Writes an audit event to the audit_log table."""
     conn = get_db_connection()
     try:
         u = update.effective_user
@@ -405,27 +460,39 @@ def _log_event(kind: str, action: str, update: Update, value: str, owner: str = 
         conn.close()
 
 # =============================
-# UTIL (unchanged, but state helpers now talk to DB indirectly)
+# UTIL
 # =============================
-def cache_user_info(user): state.setdefault("user_names", {})[str(user.id)] = {"first_name": user.first_name or "", "username": user.username or ""}
+def cache_user_info(user):
+    state.setdefault("user_names", {})[str(user.id)] = {
+        "first_name": user.first_name or "",
+        "username": user.username or ""
+    }
+
 def mention_user_html(user_id: int) -> str:
     info = state.setdefault("user_names", {}).get(str(user_id), {})
     name = info.get("first_name") or info.get("username") or str(user_id)
     return f'<a href="tg://user?id={user_id}">{name}</a>'
+
 def _issued_bucket(kind: str) -> Dict[str, dict]: return state.setdefault("issued", {}).setdefault(kind, {})
+
 def _set_issued(user_id: int, kind: str, value: str):
     _issued_bucket(kind)[str(user_id)] = {"value": value, "ts": datetime.now(TIMEZONE).isoformat()}
     save_state()
-def _get_issued(user_id: int, kind: str) -> Optional[str]: return _issued_bucket(kind).get(str(user_id), {}).get("value")
+
+def _get_issued(user_id: int, kind: str) -> Optional[str]:
+    return _issued_bucket(kind).get(str(user_id), {}).get("value")
+
 def _clear_issued(user_id: int, kind: str):
     _issued_bucket(kind).pop(str(user_id), None)
     save_state()
+
 def _value_in_text(value: Optional[str], text: str) -> bool:
     if not value: return False
     v = value.strip()
     if v.startswith("@"): return v.lower() in (text or "").lower()
     def norm(s): return re.sub(r"\D+", "", s or "")
     return norm(v) and (norm(v) in norm(text or ""))
+
 async def _deny_for_unreturned(msg, user_id: int, kind: str):
     pending = _get_issued(user_id, kind)
     label = "username" if kind == "username" else "WhatsApp"
@@ -437,15 +504,13 @@ async def _deny_for_unreturned(msg, user_id: int, kind: str):
         )
 
 # =============================
-# EXCEL DAILY REPORT (Reads from DB)
+# EXCEL (reads audit_log)
 # =============================
 def _logical_day_of(ts: datetime) -> date:
-    """Takes a timezone-aware datetime object."""
-    shifted = ts.astimezone(TIMEZONE) - timedelta(hours=5) # 05:00 boundary
+    shifted = ts.astimezone(TIMEZONE) - timedelta(hours=5)
     return shifted.date()
 
 def _read_log_rows() -> List[dict]:
-    """Reads all rows from the audit_log table."""
     conn = get_db_connection()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
@@ -457,7 +522,6 @@ def _read_log_rows() -> List[dict]:
     finally:
         conn.close()
 
-# ... (_compute_daily_summary, _style_and_save_excel, _parse_report_day remain mostly the same)
 def _compute_daily_summary(target_day: date) -> List[dict]:
     rows = _read_log_rows()
     day_rows = [r for r in rows if _logical_day_of(r["ts_local"]) == target_day]
@@ -489,6 +553,7 @@ def _compute_daily_summary(target_day: date) -> List[dict]:
         })
     out.sort(key=lambda r: r["User"].lower())
     return out
+
 def _style_and_save_excel(rows: List[dict], out_path: str):
     try:
         from openpyxl import Workbook
@@ -512,13 +577,15 @@ def _style_and_save_excel(rows: List[dict], out_path: str):
             if c.value: max_len = max(max_len, len(str(c.value)))
         ws.column_dimensions[letter].width = min(max_len + 2, 60)
     wb.save(out_path)
+
 def _send_daily_excel(update: Update, msg, target_day: date):
     rows = _compute_daily_summary(target_day)
     if not rows: return ("No data for that day.", None)
     fname = f"daily_summary_{target_day.isoformat()}.xlsx"
-    path = os.path.join(os.getcwd(), fname) # Temp storage is fine here
+    path = os.path.join(os.getcwd(), fname)
     _style_and_save_excel(rows, path)
     return (None, path)
+
 def _parse_report_day(arg: Optional[str]) -> date:
     now = datetime.now(TIMEZONE)
     if not arg or arg.lower() == "today": return (now - timedelta(hours=5)).date()
@@ -527,19 +594,14 @@ def _parse_report_day(arg: Optional[str]) -> date:
     except Exception: return (now - timedelta(hours=5)).date()
 
 # =============================
-# ADMIN COMMANDS (logic is unchanged, but calls _rebuild_pools)
+# ADMIN COMMANDS (subset; owners/usernames/numbers)
 # =============================
-# ... The entire `_handle_admin_command` function and its helpers can be copied here ...
 def _parse_duration(duration_str: str) -> Optional[timedelta]:
     m = re.match(r"(\d+)\s*(m|h|d|w)", (duration_str or "").strip().lower())
     if not m: return None
-    val, unit = m.groups()
-    val = int(val)
-    if unit == 'm': return timedelta(minutes=val)
-    if unit == 'h': return timedelta(hours=val)
-    if unit == 'd': return timedelta(days=val)
-    if unit == 'w': return timedelta(weeks=val)
-    return None
+    val, unit = m.groups(); val = int(val)
+    return {"m": timedelta(minutes=val), "h": timedelta(hours=val),
+            "d": timedelta(days=val), "w": timedelta(weeks=val)}[unit]
 
 def _find_owner_group(name: str) -> Optional[dict]:
     norm_name = _norm_owner_name(name)
@@ -548,66 +610,101 @@ def _find_owner_group(name: str) -> Optional[dict]:
     return None
 
 def _handle_admin_command(text: str) -> Optional[str]:
+    # stop/open owner|@username|+number
+    m = STOP_OPEN_RX.match(text)
+    if m:
+        action, target = m.groups()
+        is_stop = action.lower() == "stop"
+        target = target.strip()
+
+        # stop/open number
+        if target.startswith("+") or any(ch.isdigit() for ch in target):
+            norm_n = _norm_phone(target)
+            found = False
+            for owner in OWNER_DATA:
+                for w in owner.get("whatsapp", []):
+                    if _norm_phone(w.get("number")) == norm_n:
+                        w["disabled"] = is_stop
+                        found = True
+            if not found:
+                return f"WhatsApp number {target} not found."
+            _rebuild_pools_preserving_rotation()
+            return f"{'Stopped' if is_stop else 'Opened'} WhatsApp {target}."
+
+        # stop/open username
+        if target.startswith("@"):
+            norm_h = _norm_handle(target)
+            found = False
+            for owner in OWNER_DATA:
+                for e in owner.get("entries", []):
+                    if _norm_handle(e.get("telegram")) == norm_h:
+                        e["disabled"] = is_stop
+                        found = True
+            if not found:
+                return f"Username {target} not found."
+            _rebuild_pools_preserving_rotation()
+            return f"{'Stopped' if is_stop else 'Opened'} username {target}."
+
+        # stop/open owner
+        owner = _find_owner_group(target)
+        if not owner: return f"Owner '{target}' not found."
+        if is_stop:
+            owner["disabled"] = True; owner.pop("disabled_until", None)
+        else:
+            owner["disabled"] = False; owner.pop("disabled_until", None)
+        _rebuild_pools_preserving_rotation()
+        return f"{'Stopped' if is_stop else 'Opened'} owner {target}."
+
+    # add/delete/list commands (same as before)
     m = ADD_OWNER_RX.match(text)
     if m:
         name = _norm_owner_name(m.group(1))
         if _find_owner_group(name): return f"Owner '{name}' already exists."
         OWNER_DATA.append(_ensure_owner_shape({"owner": name}))
         _rebuild_pools_preserving_rotation(); return f"Owner '{name}' added."
+
     m = ADD_USERNAME_RX.match(text)
     if m:
         handle, owner_name = m.groups()
         owner = _find_owner_group(owner_name)
         if not owner: return f"Owner '{owner_name}' not found."
         norm_h = _norm_handle(handle)
-        if any(_norm_handle(e.get("telegram")) == norm_h for e in owner["entries"]): return f"@{handle} already exists for owner {owner_name}."
+        if any(_norm_handle(e.get("telegram")) == norm_h for e in owner["entries"]):
+            return f"@{handle} already exists for owner {owner_name}."
         owner["entries"].append({"telegram": handle, "phone": "", "disabled": False})
         _rebuild_pools_preserving_rotation(); return f"Added username @{handle} to {owner_name}."
+
     m = ADD_WHATSAPP_RX.match(text)
     if m:
         num, owner_name = m.groups()
         owner = _find_owner_group(owner_name)
         if not owner: return f"Owner '{owner_name}' not found."
         norm_n = _norm_phone(num)
-        if any(_norm_phone(w.get("number")) == norm_n for w in owner["whatsapp"]): return f"Number {num} already exists for owner {owner_name}."
+        if any(_norm_phone(w.get("number")) == norm_n for w in owner["whatsapp"]):
+            return f"Number {num} already exists for owner {owner_name}."
         owner["whatsapp"].append({"number": num, "disabled": False})
         _rebuild_pools_preserving_rotation(); return f"Added WhatsApp {num} to {owner_name}."
+
     m = DEL_USERNAME_RX.match(text)
     if m:
         handle = m.group(1); norm_h = _norm_handle(handle); found = False
         for owner in OWNER_DATA:
-            original_len = len(owner["entries"])
+            before = len(owner["entries"])
             owner["entries"] = [e for e in owner["entries"] if _norm_handle(e.get("telegram")) != norm_h]
-            if len(owner["entries"]) < original_len: found = True
+            if len(owner["entries"]) < before: found = True
         if not found: return f"Username @{handle} not found."
         _rebuild_pools_preserving_rotation(); return f"Deleted username @{handle} from all owners."
+
     m = DEL_WHATSAPP_RX.match(text)
     if m:
         num = m.group(1); norm_n = _norm_phone(num); found = False
         for owner in OWNER_DATA:
-            original_len = len(owner["whatsapp"])
+            before = len(owner["whatsapp"])
             owner["whatsapp"] = [w for w in owner["whatsapp"] if _norm_phone(w.get("number")) != norm_n]
-            if len(owner["whatsapp"]) < original_len: found = True
+            if len(owner["whatsapp"]) < before: found = True
         if not found: return f"WhatsApp number {num} not found."
         _rebuild_pools_preserving_rotation(); return f"Deleted WhatsApp number {num} from all owners."
-    m = STOP_OPEN_RX.match(text)
-    if m:
-        action, target = m.groups(); parts = target.split(); owner_name = parts[0]
-        duration_str = parts[1] if len(parts) > 1 else None
-        owner = _find_owner_group(owner_name)
-        if not owner: return f"Owner '{owner_name}' not found."
-        if action.lower() == "open":
-            owner["disabled"] = False; owner.pop("disabled_until", None)
-            _rebuild_pools_preserving_rotation(); return f"Opened (resumed) owner {owner_name}."
-        else:
-            duration = _parse_duration(duration_str)
-            if duration:
-                until = datetime.now(TIMEZONE) + duration
-                owner["disabled_until"] = until.isoformat(); owner["disabled"] = False
-                _rebuild_pools_preserving_rotation(); return f"Stopped (paused) owner {owner_name} until {until.strftime('%Y-%m-%d %H:%M:%S')}."
-            else:
-                owner["disabled"] = True; owner.pop("disabled_until", None)
-                _rebuild_pools_preserving_rotation(); return f"Stopped (paused) owner {owner_name} indefinitely."
+
     if LIST_OWNERS_RX.match(text):
         if not OWNER_DATA: return "No owners configured."
         lines = ["<b>Owner Roster:</b>"]
@@ -617,6 +714,7 @@ def _handle_admin_command(text: str) -> Optional[str]:
             w_count = len([w for w in o.get("whatsapp", []) if not w.get("disabled")])
             lines.append(f"- <code>{o['owner']}</code> ({status}): {u_count} usernames, {w_count} whatsapps")
         return "\n".join(lines)
+
     if LIST_DISABLED_RX.match(text):
         disabled = [o for o in OWNER_DATA if _owner_is_paused(o)]
         if not disabled: return "No owners are currently disabled/paused."
@@ -625,19 +723,29 @@ def _handle_admin_command(text: str) -> Optional[str]:
             reason = f" (until {o['disabled_until']})" if o.get("disabled_until") else ""
             lines.append(f"- <code>{o['owner']}</code>{reason}")
         return "\n".join(lines)
+
     m = LIST_OWNER_DETAIL_RX.match(text)
     if m:
         owner = _find_owner_group(m.group(1))
         if not owner: return f"Owner '{m.group(1)}' not found."
         lines = [f"<b>Details for {owner['owner']}:</b>"]
-        if owner.get("entries"): lines.extend(["<u>Usernames:</u>"] + [f"- @{e['telegram']}"] for e in owner["entries"])
-        if owner.get("whatsapp"): lines.extend(["<u>WhatsApp Numbers:</u>"] + [f"- {w['number']}"] for w in owner["whatsapp"])
-        if not owner.get("entries") and not owner.get("whatsapp"): lines.append("No entries found.")
+        if owner.get("entries"):
+            lines.append("<u>Usernames:</u>")
+            for e in owner["entries"]:
+                lines.append(f"- @{e['telegram']}")
+        if owner.get("whatsapp"):
+            lines.append("<u>WhatsApp Numbers:</u>")
+            for w in owner["whatsapp"]:
+                flag = " ⛔" if w.get("disabled") else ""
+                lines.append(f"- {w['number']}{flag}")
+        if len(lines) == 1:
+            lines.append("No entries found.")
         return "\n".join(lines)
+
     return None
 
 # =============================
-# MESSAGE HANDLER (Main logic loop)
+# MESSAGE HANDLER
 # =============================
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat or not update.effective_user or \
@@ -651,31 +759,32 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await db_lock.acquire()
     try:
-        # Admin: Report Generation
-        if _is_admin(update) and SEND_REPORT_RX.match(text):
-            m = SEND_REPORT_RX.match(text)
-            target_day = _parse_report_day(m.group(1))
+        # Admin: Report
+        mrep = SEND_REPORT_RX.match(text)
+        if _is_admin(update) and mrep:
+            target_day = _parse_report_day(mrep.group(1))
             err, path = _send_daily_excel(update, msg, target_day)
-            if err: await msg.chat.send_message(err, reply_to_message_id=msg.message_id)
+            if err:
+                await msg.chat.send_message(err, reply_to_message_id=msg.message_id)
             elif path:
                 try:
-                    await msg.chat.send_document(open(path, "rb"), filename=os.path.basename(path),
+                    await msg.chat.send_document(
+                        open(path, "rb"), filename=os.path.basename(path),
                         caption=f"Daily summary (logical day starting 05:00) — {target_day}",
-                        reply_to_message_id=msg.message_id)
-                except Exception as e:
-                    await msg.chat.send_message(f"Failed to send report: {e}", reply_to_message_id=msg.message_id)
+                        reply_to_message_id=msg.message_id
+                    )
                 finally:
                     if os.path.exists(path): os.remove(path)
             return
 
-        # Admin: Console Commands
+        # Admin: Console
         if _is_admin(update):
             admin_reply = _handle_admin_command(text)
             if admin_reply:
                 await msg.chat.send_message(admin_reply, reply_to_message_id=msg.message_id, parse_mode=ParseMode.HTML)
                 return
 
-        # Auto-clear holds
+        # Auto-clear holds on content match
         for kind in ("username", "whatsapp"):
             pending = _get_issued(uid, kind)
             if pending and _value_in_text(pending, text):
@@ -685,19 +794,35 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Feeders
         if NEED_USERNAME_RX.match(text):
-            if _get_issued(uid, "username"): await _deny_for_unreturned(msg, uid, "username"); return
+            if _get_issued(uid, "username"):
+                await _deny_for_unreturned(msg, uid, "username")
+                return
             rec = _next_from_username_pool()
             reply = "No available username." if not rec else f"@{rec['owner']}\n{rec['username']}"
             await msg.chat.send_message(reply, reply_to_message_id=msg.message_id)
-            if rec: _set_issued(uid, "username", rec["username"]); _log_event("username", "issued", update, rec["username"], owner=rec["owner"])
+            if rec:
+                _set_issued(uid, "username", rec["username"])
+                _log_event("username", "issued", update, rec["username"], owner=rec["owner"])
             return
 
         if NEED_WHATSAPP_RX.match(text):
-            if _get_issued(uid, "whatsapp"): await _deny_for_unreturned(msg, uid, "whatsapp"); return
+            if _get_issued(uid, "whatsapp"):
+                await _deny_for_unreturned(msg, uid, "whatsapp")
+                return
             rec = _next_from_whatsapp_pool()
-            reply = "No available WhatsApp." if not rec else f"@{rec['owner']}\n{rec['number']}"
+            if not rec:
+                await msg.chat.send_message("No available WhatsApp.", reply_to_message_id=msg.message_id)
+                return
+            # enforce and record quota
+            if _wa_quota_reached(rec["number"]):
+                await msg.chat.send_message("No available WhatsApp.", reply_to_message_id=msg.message_id)
+                return
+            _wa_inc_count(_norm_phone(rec["number"]), _logical_day_today())
+
+            reply = f"@{rec['owner']}\n{rec['number']}"
             await msg.chat.send_message(reply, reply_to_message_id=msg.message_id)
-            if rec: _set_issued(uid, "whatsapp", rec["number"]); _log_event("whatsapp", "issued", update, rec["number"], owner=rec["owner"])
+            _set_issued(uid, "whatsapp", rec["number"])
+            _log_event("whatsapp", "issued", update, rec["number"], owner=rec["owner"])
             return
 
         # Lookups
