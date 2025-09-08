@@ -419,7 +419,7 @@ def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
     return None
 
 # =============================
-# REGEXES
+# REGEXES & HELPERS
 # =============================
 WHO_USING_REGEX = re.compile(
     r"^\s*who(?:['\u2019]s| is)\s+using\s+(?:@?([A-Za-z0-9_\.]+)|(\+?\d[\d\s\-]{6,}\d))\s*$",
@@ -437,9 +437,36 @@ DEL_USERNAME_RX       = re.compile(r"^\s*delete\s+username\s+@([A-Za-z0-9_]{3,})
 DEL_WHATSAPP_RX       = re.compile(r"^\s*delete\s+whats?app\s+(\+?\d[\d\s\-]{6,}\d)\s*$", re.IGNORECASE)
 LIST_OWNERS_RX        = re.compile(r"^\s*list\s+owners\s*$", re.IGNORECASE)
 LIST_OWNER_DETAIL_RX  = re.compile(r"^\s*list\s+owner\s+@?(.+?)\s*$", re.IGNORECASE)
-LIST_OWNER_DETAIL_ALT_RX = re.compile(r"^\s*list\s+@?(.+?)\s*$", re.IGNORECASE)
 LIST_DISABLED_RX      = re.compile(r"^\s*list\s+disabled\s*$", re.IGNORECASE)
 SEND_REPORT_RX        = re.compile(r"^\s*(?:send\s+report|report)(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
+PHONE_LIKE_RX         = re.compile(r"^\+?\d[\d\s\-]{6,}\d$")
+LIST_OWNER_ALIAS_RX   = re.compile(r"^\s*list\s+@?(.+?)\s*$", re.IGNORECASE)
+
+def _looks_like_phone(s: str) -> bool:
+    return bool(PHONE_LIKE_RX.fullmatch((s or "").strip()))
+
+def _parse_stop_open_target(raw: str) -> Tuple[str, str]:
+    """
+    Returns ('username'|'phone'|'owner', value)
+    Accepts: '@handle', 'username @handle', '+123...', 'whatsapp +123...', 'Owner Name'
+    """
+    s = (raw or "").strip()
+    low = s.lower()
+    # explicit prefixes
+    for pref in ("username ", "user ", "handle "):
+        if low.startswith(pref):
+            t = s[len(pref):].strip()
+            if not t.startswith("@"): t = f"@{t}"
+            return ("username", t)
+    for pref in ("whatsapp ", "wa ", "phone ", "number ", "num "):
+        if low.startswith(pref):
+            return ("phone", s[len(pref):].strip())
+    # infer from syntax
+    if s.startswith("@"):
+        return ("username", s)
+    if _looks_like_phone(s):
+        return ("phone", s)
+    return ("owner", s)
 
 # =============================
 # AUDIT LOG (DB)
@@ -503,13 +530,28 @@ def _value_in_text(value: Optional[str], text: str) -> bool:
 
 async def _deny_for_unreturned(msg, user_id: int, kind: str):
     pending = _get_issued(user_id, kind)
-    label = "username" if kind == "username" else "WhatsApp"
-    if pending:
-        await msg.chat.send_message(
-            f"{mention_user_html(user_id)} please provide your previous {label} first: {pending}\n"
-            f"Just include it in your next profile message and I’ll accept it automatically.",
-            reply_to_message_id=msg.message_id, parse_mode=ParseMode.HTML,
+    if not pending:
+        return
+
+    if kind == "username":
+        # Example result: “… username @Hibiscus_1212 …”
+        text = (
+            f"{mention_user_html(user_id)} "
+            f"អ្នកមិនអាចយក username ផ្សេងទៀតបានទេ សូមផ្ញើព័ត៌មានអំពីអតិថិជនដែលអ្នកបានសុំ "
+            f"username {pending} ជាមុនសិន។"
         )
+    else:  # whatsapp
+        text = (
+            f"{mention_user_html(user_id)} "
+            f"អ្នកមិនអាចយក WhatsApp ផ្សេងទៀតបានទេ សូមផ្ញើព័ត៌មានអំពីអតិថិជនដែលអ្នកបានសុំ "
+            f"WhatsApp {pending} ជាមុនសិន។"
+        )
+
+    await msg.chat.send_message(
+        text,
+        reply_to_message_id=msg.message_id,
+        parse_mode=ParseMode.HTML,
+    )
 
 # =============================
 # EXCEL (reads audit_log)
@@ -627,16 +669,15 @@ def _find_owner_group(name: str) -> Optional[dict]:
     return None
 
 async def _handle_admin_command(text: str) -> Optional[str]:
-    # stop/open owner|@username|+number
+    # stop/open (owner | username | phone)
     m = STOP_OPEN_RX.match(text)
     if m:
-        action, target = m.groups()
+        action, target_raw = m.groups()
         is_stop = action.lower() == "stop"
-        target = target.strip()
+        kind, value = _parse_stop_open_target(target_raw)
 
-        # stop/open number
-        if target.startswith("+") or any(ch.isdigit() for ch in target):
-            norm_n = _norm_phone(target)
+        if kind == "phone":
+            norm_n = _norm_phone(value)
             found = False
             for owner in OWNER_DATA:
                 for w in owner.get("whatsapp", []):
@@ -644,13 +685,12 @@ async def _handle_admin_command(text: str) -> Optional[str]:
                         w["disabled"] = is_stop
                         found = True
             if not found:
-                return f"WhatsApp number {target} not found."
+                return f"WhatsApp number {value} not found."
             await _rebuild_pools_preserving_rotation()
-            return f"{'Stopped' if is_stop else 'Opened'} WhatsApp {target}."
+            return f"{'Stopped' if is_stop else 'Opened'} WhatsApp {value}."
 
-        # stop/open username
-        if target.startswith("@"):
-            norm_h = _norm_handle(target)
+        if kind == "username":
+            norm_h = _norm_handle(value)
             found = False
             for owner in OWNER_DATA:
                 for e in owner.get("entries", []):
@@ -658,61 +698,64 @@ async def _handle_admin_command(text: str) -> Optional[str]:
                         e["disabled"] = is_stop
                         found = True
             if not found:
-                return f"Username {target} not found."
+                return f"Username {value} not found."
             await _rebuild_pools_preserving_rotation()
-            return f"{'Stopped' if is_stop else 'Opened'} username {target}."
+            return f"{'Stopped' if is_stop else 'Opened'} username {value}."
 
-        # stop/open owner
-        owner = _find_owner_group(target)
-        if not owner: return f"Owner '{target}' not found."
-        if is_stop:
-            owner["disabled"] = True; owner.pop("disabled_until", None)
-        else:
-            owner["disabled"] = False; owner.pop("disabled_until", None)
+        # owner
+        owner = _find_owner_group(value)
+        if not owner:
+            return f"Owner '{value}' not found."
+        owner["disabled"] = bool(is_stop)
+        owner.pop("disabled_until", None)
         await _rebuild_pools_preserving_rotation()
-        return f"{'Stopped' if is_stop else 'Opened'} owner {target}."
+        return f"{'Stopped' if is_stop else 'Opened'} owner {value}."
 
-    # add commands
+    # add / delete / list
     m = ADD_OWNER_RX.match(text)
     if m:
         name = _norm_owner_name(m.group(1))
-        if _find_owner_group(name): return f"Owner '{name}' already exists."
+        if _find_owner_group(name):
+            return f"Owner '{name}' already exists."
         OWNER_DATA.append(_ensure_owner_shape({"owner": name}))
-        await _rebuild_pools_preserving_rotation(); return f"Owner '{name}' added."
+        await _rebuild_pools_preserving_rotation()
+        return f"Owner '{name}' added."
+
+    m = DEL_OWNER_RX.match(text)
+    if m:
+        name = _norm_owner_name(m.group(1))
+        before = len(OWNER_DATA)
+        OWNER_DATA[:] = [g for g in OWNER_DATA if _norm_owner_name(g.get("owner","")) != name]
+        if len(OWNER_DATA) == before:
+            return f"Owner '{name}' not found."
+        await _rebuild_pools_preserving_rotation()
+        return f"Owner '{name}' deleted."
 
     m = ADD_USERNAME_RX.match(text)
     if m:
         handle, owner_name = m.groups()
         owner = _find_owner_group(owner_name)
-        if not owner: return f"Owner '{owner_name}' not found."
+        if not owner:
+            return f"Owner '{owner_name}' not found."
         norm_h = _norm_handle(handle)
         if any(_norm_handle(e.get("telegram")) == norm_h for e in owner["entries"]):
             return f"@{handle} already exists for owner {owner_name}."
         owner["entries"].append({"telegram": handle, "phone": "", "disabled": False})
-        await _rebuild_pools_preserving_rotation(); return f"Added username @{handle} to {owner_name}."
+        await _rebuild_pools_preserving_rotation()
+        return f"Added username @{handle} to {owner_name}."
 
     m = ADD_WHATSAPP_RX.match(text)
     if m:
         num, owner_name = m.groups()
         owner = _find_owner_group(owner_name)
-        if not owner: return f"Owner '{owner_name}' not found."
+        if not owner:
+            return f"Owner '{owner_name}' not found."
         norm_n = _norm_phone(num)
         if any(_norm_phone(w.get("number")) == norm_n for w in owner["whatsapp"]):
             return f"Number {num} already exists for owner {owner_name}."
         owner["whatsapp"].append({"number": num, "disabled": False})
-        await _rebuild_pools_preserving_rotation(); return f"Added WhatsApp {num} to {owner_name}."
-    
-    # delete commands
-    m = DEL_OWNER_RX.match(text)
-    if m:
-        owner_name = m.group(1)
-        target_norm = _norm_owner_name(owner_name)
-        found = any(_norm_owner_name(g["owner"]) == target_norm for g in OWNER_DATA)
-        if not found:
-            return f"Owner '{owner_name}' not found."
-        OWNER_DATA[:] = [g for g in OWNER_DATA if _norm_owner_name(g["owner"]) != target_norm]
         await _rebuild_pools_preserving_rotation()
-        return f"Deleted owner {owner_name}."
+        return f"Added WhatsApp {num} to {owner_name}."
 
     m = DEL_USERNAME_RX.match(text)
     if m:
@@ -720,9 +763,12 @@ async def _handle_admin_command(text: str) -> Optional[str]:
         for owner in OWNER_DATA:
             before = len(owner["entries"])
             owner["entries"] = [e for e in owner["entries"] if _norm_handle(e.get("telegram")) != norm_h]
-            if len(owner["entries"]) < before: found = True
-        if not found: return f"Username @{handle} not found."
-        await _rebuild_pools_preserving_rotation(); return f"Deleted username @{handle} from all owners."
+            if len(owner["entries"]) < before:
+                found = True
+        if not found:
+            return f"Username @{handle} not found."
+        await _rebuild_pools_preserving_rotation()
+        return f"Deleted username @{handle} from all owners."
 
     m = DEL_WHATSAPP_RX.match(text)
     if m:
@@ -730,21 +776,14 @@ async def _handle_admin_command(text: str) -> Optional[str]:
         for owner in OWNER_DATA:
             before = len(owner["whatsapp"])
             owner["whatsapp"] = [w for w in owner["whatsapp"] if _norm_phone(w.get("number")) != norm_n]
-            if len(owner["whatsapp"]) < before: found = True
-        if not found: return f"WhatsApp number {num} not found."
-        await _rebuild_pools_preserving_rotation(); return f"Deleted WhatsApp number {num} from all owners."
+            if len(owner["whatsapp"]) < before:
+                found = True
+        if not found:
+            return f"WhatsApp number {num} not found."
+        await _rebuild_pools_preserving_rotation()
+        return f"Deleted WhatsApp number {num} from all owners."
 
-    # list commands
-    if LIST_DISABLED_RX.match(text):
-        disabled = [o for o in OWNER_DATA if _owner_is_paused(o)]
-        if not disabled:
-            return "No owners are currently disabled/paused."
-        lines = ["<b>Disabled/Paused Owners:</b>"]
-        for o in disabled:
-            reason = f" (until {o['disabled_until']})" if o.get("disabled_until") else ""
-            lines.append(f"- <code>{o['owner']}</code>{reason}")
-        return "\n".join(lines)
-
+    # lists
     if LIST_OWNERS_RX.match(text):
         if not OWNER_DATA:
             return "No owners configured."
@@ -755,27 +794,35 @@ async def _handle_admin_command(text: str) -> Optional[str]:
             w_count = len([w for w in o.get("whatsapp", []) if not w.get("disabled")])
             lines.append(f"- <code>{o['owner']}</code> ({status}): {u_count} usernames, {w_count} whatsapps")
         return "\n".join(lines)
-    
-    m = LIST_OWNER_DETAIL_RX.match(text)
-    if not m:
-        m_alt = LIST_OWNER_DETAIL_ALT_RX.match(text)
-        if m_alt:
-            cand = m_alt.group(1).strip()
-            if cand.lower() not in ("owners", "disabled"):
-                m = m_alt
+
+    if LIST_DISABLED_RX.match(text):
+        disabled = [o for o in OWNER_DATA if _owner_is_paused(o)]
+        if not disabled:
+            return "No owners are currently disabled/paused."
+        lines = ["<b>Disabled/Paused Owners:</b>"]
+        for o in disabled:
+            reason = f" (until {o['disabled_until']})" if o.get("disabled_until") else ""
+            lines.append(f"- <code>{o['owner']}</code>{reason}")
+        return "\n".join(lines)
+
+    # allow: "list @Owner" (alias)
+    m = LIST_OWNER_DETAIL_RX.match(text) or LIST_OWNER_ALIAS_RX.match(text)
     if m:
-        owner = _find_owner_group(m.group(1))
+        name = m.group(1).strip()
+        if name.lower() in ("owners", "disabled"):  # already handled above
+            return None
+        owner = _find_owner_group(name)
         if not owner:
-            return f"Owner '{m.group(1)}' not found."
+            return f"Owner '{name}' not found."
         lines = [f"<b>Details for {owner['owner']}:</b>"]
         if owner.get("entries"):
             lines.append("<u>Usernames:</u>")
             for e in owner["entries"]:
                 flag = " ⛔" if e.get("disabled") else ""
-                handle = e.get("telegram") or ""
-                if handle and not handle.startswith("@"):
-                    handle = f"@{handle}"
-                lines.append(f"- {handle}{flag}")
+                h = e.get("telegram") or ""
+                if h and not h.startswith("@"):
+                    h = "@" + h
+                lines.append(f"- {h}{flag}")
         if owner.get("whatsapp"):
             lines.append("<u>WhatsApp Numbers:</u>")
             for w in owner["whatsapp"]:
