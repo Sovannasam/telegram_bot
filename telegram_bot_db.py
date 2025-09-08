@@ -674,6 +674,32 @@ async def _handle_admin_command(text: str) -> Optional[str]:
     if m:
         action, target_raw = m.groups()
         is_stop = action.lower() == "stop"
+
+        # ---- new: stop/open ALL whatsapp ----
+        t = target_raw.lower()
+        if t in ("all whatsapp", "all whatsapps", "whatsapp all", "all wa", "wa all"):
+            total = changed = 0
+            for owner in OWNER_DATA:
+                for w in owner.get("whatsapp", []):
+                    total += 1
+                    if w.get("disabled") != is_stop:
+                        w["disabled"] = is_stop
+                        changed += 1
+            await _rebuild_pools_preserving_rotation()
+            return f"{'Stopped' if is_stop else 'Opened'} all WhatsApp numbers — changed {changed}/{total}."
+
+        # ---- new: stop/open ALL usernames ----
+        if t in ("all username", "all usernames", "username all", "usernames"):
+            total = changed = 0
+            for owner in OWNER_DATA:
+                for e in owner.get("entries", []):
+                    total += 1
+                    if e.get("disabled") != is_stop:
+                        e["disabled"] = is_stop
+                        changed += 1
+            await _rebuild_pools_preserving_rotation()
+            return f"{'Stopped' if is_stop else 'Opened'} all usernames — changed {changed}/{total}."
+        
         kind, value = _parse_stop_open_target(target_raw)
 
         if kind == "phone":
