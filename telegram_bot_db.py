@@ -15,7 +15,7 @@ import psycopg2
 import psycopg2.extras
 from telegram import Update
 from telegram.constants import ChatType, ParseMode
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, ContextTypes, MessageHandler, filters, JobQueue
 
 # =============================
 # LOGGING
@@ -42,6 +42,7 @@ BOT_TOKEN = get_env_variable("BOT_TOKEN")
 DATABASE_URL = get_env_variable("DATABASE_URL")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "excelmerge")  # telegram username (without @)
 WA_DAILY_LIMIT = int(os.getenv("WA_DAILY_LIMIT", "4"))      # max sends per number per logical day
+REMINDER_DELAY_MINUTES = int(os.getenv("REMINDER_DELAY_MINUTES", "30")) # Delay for reminders
 
 TIMEZONE = pytz.timezone("Asia/Phnom_Penh")
 
@@ -510,8 +511,12 @@ def mention_user_html(user_id: int) -> str:
 
 def _issued_bucket(kind: str) -> Dict[str, dict]: return state.setdefault("issued", {}).setdefault(kind, {})
 
-def _set_issued(user_id: int, kind: str, value: str):
-    _issued_bucket(kind)[str(user_id)] = {"value": value, "ts": datetime.now(TIMEZONE).isoformat()}
+def _set_issued(user_id: int, chat_id: int, kind: str, value: str):
+    _issued_bucket(kind)[str(user_id)] = {
+        "value": value, 
+        "ts": datetime.now(TIMEZONE).isoformat(),
+        "chat_id": chat_id
+    }
     save_state()
 
 def _get_issued(user_id: int, kind: str) -> Optional[str]:
@@ -527,6 +532,31 @@ def _value_in_text(value: Optional[str], text: str) -> bool:
     if v.startswith("@"): return v.lower() in (text or "").lower()
     def norm(s): return re.sub(r"\D+", "", s or "")
     return norm(v) and (norm(v) in norm(text or ""))
+
+async def _deny_for_unreturned(msg, user_id: int, kind: str):
+    pending = _get_issued(user_id, kind)
+    if not pending:
+        return
+
+    if kind == "username":
+        # Example result: “… username @Hibiscus_1212 …”
+        text = (
+            f"{mention_user_html(user_id)} "
+            f"អ្នកមិនអាចយក username ផ្សេងទៀតបានទេ សូមផ្ញើព័ត៌មានអំពីអតិថិជនដែលអ្នកបានសុំ "
+            f"username {pending} ជាមុនសិន។"
+        )
+    else:  # whatsapp
+        text = (
+            f"{mention_user_html(user_id)} "
+            f"អ្នកមិនអាចយក WhatsApp ផ្សេងទៀតបានទេ សូមផ្ញើព័ត៌មានអំពីអតិថិជនដែលអ្នកបានសុំ "
+            f"WhatsApp {pending} ជាមុនសិន។"
+        )
+
+    await msg.chat.send_message(
+        text,
+        reply_to_message_id=msg.message_id,
+        parse_mode=ParseMode.HTML,
+    )
 
 # =============================
 # EXCEL (reads audit_log)
@@ -836,6 +866,50 @@ async def _handle_admin_command(text: str) -> Optional[str]:
     return None
 
 # =============================
+# REMINDER TASK
+# =============================
+async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
+    await db_lock.acquire()
+    try:
+        now = datetime.now(TIMEZONE)
+        state_changed = False
+        
+        for kind in ("username", "whatsapp"):
+            bucket = _issued_bucket(kind)
+            for user_id_str, item in list(bucket.items()):
+                if item.get("reminder_sent"):
+                    continue
+
+                try:
+                    issue_ts = datetime.fromisoformat(item["ts"])
+                    if (now - issue_ts) > timedelta(minutes=REMINDER_DELAY_MINUTES):
+                        user_id = int(user_id_str)
+                        chat_id = item.get("chat_id")
+                        value = item.get("value")
+                        
+                        if chat_id and value:
+                            label = "username" if kind == "username" else "WhatsApp"
+                            reminder_text = (
+                                f"សូមរំលឹក: {mention_user_html(user_id)}, "
+                                f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ {label} {value} ដែលអ្នកបានស្នើសុំ។"
+                            )
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=reminder_text,
+                                parse_mode=ParseMode.HTML
+                            )
+                            item["reminder_sent"] = True
+                            state_changed = True
+                            log.info(f"Sent reminder to user {user_id} for {kind} in chat {chat_id}")
+                except Exception as e:
+                    log.error(f"Error processing reminder for user {user_id_str}: {e}")
+
+        if state_changed:
+            save_state()
+    finally:
+        db_lock.release()
+
+# =============================
 # MESSAGE HANDLER
 # =============================
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -846,6 +920,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     text = (msg.text or msg.caption or "").strip()
     uid = update.effective_user.id
+    chat_id = msg.chat_id
     cache_user_info(update.effective_user)
 
     await db_lock.acquire()
@@ -898,7 +973,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply = "No available username." if not rec else f"@{rec['owner']}\n{rec['username']}"
             await msg.chat.send_message(reply, reply_to_message_id=msg.message_id)
             if rec:
-                _set_issued(uid, "username", rec["username"])
+                _set_issued(uid, chat_id, "username", rec["username"])
                 _log_event("username", "issued", update, rec["username"], owner=rec["owner"])
             return
 
@@ -918,7 +993,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             reply = f"@{rec['owner']}\n{rec['number']}"
             await msg.chat.send_message(reply, reply_to_message_id=msg.message_id)
-            _set_issued(uid, "whatsapp", rec["number"])
+            _set_issued(uid, chat_id, "whatsapp", rec["number"])
             _log_event("whatsapp", "issued", update, rec["number"], owner=rec["owner"])
             return
 
@@ -950,6 +1025,11 @@ if __name__ == "__main__":
     load_owner_directory()
 
     app = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add the reminder job to the queue
+    if app.job_queue:
+        app.job_queue.run_repeating(check_reminders, interval=60, first=60)
+
     app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.ALL, on_message))
 
     log.info("Bot is starting...")
