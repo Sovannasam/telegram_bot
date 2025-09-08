@@ -4,10 +4,9 @@ import json
 import csv
 import asyncio
 import logging
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time
 from typing import Dict, Optional, List, Tuple
 import re
-import time
 import io
 
 import pytz
@@ -281,7 +280,7 @@ def load_owner_directory():
 # =============================
 def _logical_day_today() -> date:
     now = datetime.now(TIMEZONE)
-    return (now - timedelta(hours=5)).date()  # 05:00 boundary
+    return (now - timedelta(hours=5, minutes=30)).date()
 
 def _wa_get_count(number_norm: str, day: date) -> int:
     conn = get_db_connection()
@@ -537,7 +536,7 @@ def _value_in_text(value: Optional[str], text: str) -> bool:
 # EXCEL (reads audit_log)
 # =============================
 def _logical_day_of(ts: datetime) -> date:
-    shifted = ts.astimezone(TIMEZONE) - timedelta(hours=5)
+    shifted = ts.astimezone(TIMEZONE) - timedelta(hours=5, minutes=30)
     return shifted.date()
 
 def _read_log_rows() -> List[dict]:
@@ -627,10 +626,10 @@ def _get_daily_excel_report(target_day: date) -> Tuple[Optional[str], Optional[i
 
 def _parse_report_day(arg: Optional[str]) -> date:
     now = datetime.now(TIMEZONE)
-    if not arg or arg.lower() == "today": return (now - timedelta(hours=5)).date()
-    if arg.lower() == "yesterday": return (now - timedelta(hours=5, days=1)).date()
+    if not arg or arg.lower() == "today": return (now - timedelta(hours=5, minutes=30)).date()
+    if arg.lower() == "yesterday": return (now - timedelta(hours=5, minutes=30, days=1)).date()
     try: return datetime.strptime(arg, "%Y-%m-%d").date()
-    except Exception: return (now - timedelta(hours=5)).date()
+    except Exception: return (now - timedelta(hours=5, minutes=30)).date()
 
 # =============================
 # ADMIN COMMANDS (subset; owners/usernames/numbers)
@@ -841,7 +840,7 @@ async def _handle_admin_command(text: str) -> Optional[str]:
     return None
 
 # =============================
-# REMINDER TASK
+# REMINDER & RESET TASKS
 # =============================
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     await db_lock.acquire()
@@ -884,6 +883,36 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     finally:
         db_lock.release()
 
+async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
+    """Clears daily WhatsApp quotas and the 'issued' state for a new day."""
+    log.info("Performing daily reset...")
+    await db_lock.acquire()
+    try:
+        # Clear the daily WhatsApp usage table in the database
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM wa_daily_usage;")
+                conn.commit()
+                log.info("Cleared daily WhatsApp usage quotas.")
+        except Exception as e:
+            log.error(f"Failed to clear wa_daily_usage table: {e}")
+        finally:
+            conn.close()
+
+        # Clear the in-memory 'issued' state
+        if "issued" in state:
+            state["issued"]["username"].clear()
+            state["issued"]["whatsapp"].clear()
+        
+        save_state()
+        log.info("Daily reset complete. Cleared issued items.")
+
+    except Exception as e:
+        log.error(f"An error occurred during daily reset: {e}")
+    finally:
+        db_lock.release()
+
 # =============================
 # MESSAGE HANDLER
 # =============================
@@ -912,7 +941,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.chat.send_document(
                     document=excel_buffer,
                     filename=file_name,
-                    caption=f"Daily summary (logical day starting 05:00) — {target_day}",
+                    caption=f"Daily summary (logical day starting 05:30) — {target_day}",
                     reply_to_message_id=msg.message_id
                 )
             return
@@ -995,9 +1024,14 @@ if __name__ == "__main__":
 
     app = Application.builder().token(BOT_TOKEN).build()
     
-    # Add the reminder job to the queue
+    # Add the scheduled tasks to the queue
     if app.job_queue:
         app.job_queue.run_repeating(check_reminders, interval=60, first=60)
+        
+        # Schedule the daily reset at 05:31 Phnom Penh time
+        reset_time = time(hour=5, minute=31, tzinfo=TIMEZONE)
+        app.job_queue.run_daily(daily_reset, time=reset_time)
+
 
     app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.ALL, on_message))
 
