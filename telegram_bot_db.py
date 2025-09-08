@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, date
 from typing import Dict, Optional, List, Tuple
 import re
 import time
+import io
 
 import pytz
 import psycopg2
@@ -342,33 +343,29 @@ def _preserve_entry_indices(rr_map: Dict[str, int], new_pool: List[Dict], list_k
         if sz <= 0: rr_map.pop(owner, None)
         else: rr_map[owner] = rr_map.get(owner, 0) % sz
 
-def _rebuild_pools_preserving_rotation():
-    asyncio.run(db_lock.acquire())
-    try:
-        old_user_owner_list = _owner_list_from_pool(USERNAME_POOL)
-        old_wa_owner_list   = _owner_list_from_pool(WHATSAPP_POOL)
-        rr = state.setdefault("rr", {})
-        old_user_owner_idx = rr.get("username_owner_idx", 0)
-        old_wa_owner_idx   = rr.get("wa_owner_idx", 0)
-        old_user_entry_idx = dict(rr.get("username_entry_idx", {}))
-        old_wa_entry_idx   = dict(rr.get("wa_entry_idx", {}))
+async def _rebuild_pools_preserving_rotation():
+    old_user_owner_list = _owner_list_from_pool(USERNAME_POOL)
+    old_wa_owner_list   = _owner_list_from_pool(WHATSAPP_POOL)
+    rr = state.setdefault("rr", {})
+    old_user_owner_idx = rr.get("username_owner_idx", 0)
+    old_wa_owner_idx   = rr.get("wa_owner_idx", 0)
+    old_user_entry_idx = dict(rr.get("username_entry_idx", {}))
+    old_wa_entry_idx   = dict(rr.get("wa_entry_idx", {}))
 
-        load_owner_directory()
-        save_owner_directory()
+    load_owner_directory()
+    save_owner_directory()
 
-        new_user_owner_list = _owner_list_from_pool(USERNAME_POOL)
-        new_wa_owner_list   = _owner_list_from_pool(WHATSAPP_POOL)
+    new_user_owner_list = _owner_list_from_pool(USERNAME_POOL)
+    new_wa_owner_list   = _owner_list_from_pool(WHATSAPP_POOL)
 
-        rr["username_owner_idx"] = _preserve_owner_pointer(old_user_owner_list, new_user_owner_list, old_user_owner_idx)
-        rr["wa_owner_idx"] = _preserve_owner_pointer(old_wa_owner_list, new_wa_owner_list, old_wa_owner_idx)
+    rr["username_owner_idx"] = _preserve_owner_pointer(old_user_owner_list, new_user_owner_list, old_user_owner_idx)
+    rr["wa_owner_idx"] = _preserve_owner_pointer(old_wa_owner_list, new_wa_owner_list, old_wa_owner_idx)
 
-        rr.setdefault("username_entry_idx", old_user_entry_idx)
-        rr.setdefault("wa_entry_idx", old_wa_entry_idx)
-        _preserve_entry_indices(rr["username_entry_idx"], USERNAME_POOL, "usernames")
-        _preserve_entry_indices(rr["wa_entry_idx"], WHATSAPP_POOL, "numbers")
-        save_state()
-    finally:
-        db_lock.release()
+    rr.setdefault("username_entry_idx", old_user_entry_idx)
+    rr.setdefault("wa_entry_idx", old_wa_entry_idx)
+    _preserve_entry_indices(rr["username_entry_idx"], USERNAME_POOL, "usernames")
+    _preserve_entry_indices(rr["wa_entry_idx"], WHATSAPP_POOL, "numbers")
+    save_state()
 
 def _next_from_username_pool() -> Optional[Dict[str, str]]:
     if not USERNAME_POOL: return None
@@ -422,16 +419,16 @@ WHO_USING_REGEX = re.compile(
 NEED_USERNAME_RX = re.compile(r"^\s*i\s*need\s*(?:user\s*name|username)\s*$", re.IGNORECASE)
 NEED_WHATSAPP_RX = re.compile(r"^\s*i\s*need\s*(?:id\s*)?whats?app\s*$", re.IGNORECASE)
 
-STOP_OPEN_RX        = re.compile(r"^\s*(stop|open)\s+(.+?)\s*$", re.IGNORECASE)
-ADD_OWNER_RX        = re.compile(r"^\s*add\s+owner\s+@?(.+?)\s*$", re.IGNORECASE)
-ADD_USERNAME_RX     = re.compile(r"^\s*add\s+username\s+@([A-Za-z0-9_]{3,})\s+to\s+@?(.+?)\s*$", re.IGNORECASE)
-ADD_WHATSAPP_RX     = re.compile(r"^\s*add\s+whats?app\s+(\+?\d[\d\s\-]{6,}\d)\s+to\s+@?(.+?)\s*$", re.IGNORECASE)
-DEL_USERNAME_RX     = re.compile(r"^\s*delete\s+username\s+@([A-Za-z0-9_]{3,})\s*$", re.IGNORECASE)
-DEL_WHATSAPP_RX     = re.compile(r"^\s*delete\s+whats?app\s+(\+?\d[\d\s\-]{6,}\d)\s*$", re.IGNORECASE)
-LIST_OWNERS_RX      = re.compile(r"^\s*list\s+owners\s*$", re.IGNORECASE)
+STOP_OPEN_RX          = re.compile(r"^\s*(stop|open)\s+(.+?)\s*$", re.IGNORECASE)
+ADD_OWNER_RX          = re.compile(r"^\s*add\s+owner\s+@?(.+?)\s*$", re.IGNORECASE)
+ADD_USERNAME_RX       = re.compile(r"^\s*add\s+username\s+@([A-Za-z0-9_]{3,})\s+to\s+@?(.+?)\s*$", re.IGNORECASE)
+ADD_WHATSAPP_RX       = re.compile(r"^\s*add\s+whats?app\s+(\+?\d[\d\s\-]{6,}\d)\s+to\s+@?(.+?)\s*$", re.IGNORECASE)
+DEL_USERNAME_RX       = re.compile(r"^\s*delete\s+username\s+@([A-Za-z0-9_]{3,})\s*$", re.IGNORECASE)
+DEL_WHATSAPP_RX       = re.compile(r"^\s*delete\s+whats?app\s+(\+?\d[\d\s\-]{6,}\d)\s*$", re.IGNORECASE)
+LIST_OWNERS_RX        = re.compile(r"^\s*list\s+owners\s*$", re.IGNORECASE)
 LIST_OWNER_DETAIL_RX= re.compile(r"^\s*list\s+owner\s+@?(.+?)\s*$", re.IGNORECASE)
-LIST_DISABLED_RX    = re.compile(r"^\s*list\s+disabled\s*$", re.IGNORECASE)
-SEND_REPORT_RX      = re.compile(r"^\s*(?:send\s+report|report)(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
+LIST_DISABLED_RX      = re.compile(r"^\s*list\s+disabled\s*$", re.IGNORECASE)
+SEND_REPORT_RX        = re.compile(r"^\s*(?:send\s+report|report)(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 
 # =============================
 # AUDIT LOG (DB)
@@ -554,12 +551,13 @@ def _compute_daily_summary(target_day: date) -> List[dict]:
     out.sort(key=lambda r: r["User"].lower())
     return out
 
-def _style_and_save_excel(rows: List[dict], out_path: str):
+def _style_and_save_excel(rows: List[dict]) -> io.BytesIO:
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
     except ImportError:
         raise RuntimeError("openpyxl not installed. Please add it to requirements.txt")
+
     headers = ["Day","User","Total username receive","Total whatsapp receive","Total username provide back","Total whatsapp provide back", "Username not provide back","Owner of username","Whatsapp not provide back","Owner of whatsapp"]
     wb = Workbook(); ws = wb.active; ws.title = "Summary"; ws.append(headers)
     for r in rows: ws.append([r.get(h, "") for h in headers])
@@ -576,15 +574,23 @@ def _style_and_save_excel(rows: List[dict], out_path: str):
         for c in col:
             if c.value: max_len = max(max_len, len(str(c.value)))
         ws.column_dimensions[letter].width = min(max_len + 2, 60)
-    wb.save(out_path)
+    
+    excel_buffer = io.BytesIO()
+    wb.save(excel_buffer)
+    excel_buffer.seek(0)
+    return excel_buffer
 
-def _send_daily_excel(update: Update, msg, target_day: date):
+def _get_daily_excel_report(target_day: date) -> Tuple[Optional[str], Optional[io.BytesIO]]:
     rows = _compute_daily_summary(target_day)
     if not rows: return ("No data for that day.", None)
-    fname = f"daily_summary_{target_day.isoformat()}.xlsx"
-    path = os.path.join(os.getcwd(), fname)
-    _style_and_save_excel(rows, path)
-    return (None, path)
+    
+    try:
+        excel_buffer = _style_and_save_excel(rows)
+        return (None, excel_buffer)
+    except Exception as e:
+        log.error("Failed to generate Excel report in memory: %s", e)
+        return (f"Failed to generate report: {e}", None)
+
 
 def _parse_report_day(arg: Optional[str]) -> date:
     now = datetime.now(TIMEZONE)
@@ -609,7 +615,7 @@ def _find_owner_group(name: str) -> Optional[dict]:
         if _norm_owner_name(group["owner"]) == norm_name: return group
     return None
 
-def _handle_admin_command(text: str) -> Optional[str]:
+async def _handle_admin_command(text: str) -> Optional[str]:
     # stop/open owner|@username|+number
     m = STOP_OPEN_RX.match(text)
     if m:
@@ -628,7 +634,7 @@ def _handle_admin_command(text: str) -> Optional[str]:
                         found = True
             if not found:
                 return f"WhatsApp number {target} not found."
-            _rebuild_pools_preserving_rotation()
+            await _rebuild_pools_preserving_rotation()
             return f"{'Stopped' if is_stop else 'Opened'} WhatsApp {target}."
 
         # stop/open username
@@ -642,7 +648,7 @@ def _handle_admin_command(text: str) -> Optional[str]:
                         found = True
             if not found:
                 return f"Username {target} not found."
-            _rebuild_pools_preserving_rotation()
+            await _rebuild_pools_preserving_rotation()
             return f"{'Stopped' if is_stop else 'Opened'} username {target}."
 
         # stop/open owner
@@ -652,7 +658,7 @@ def _handle_admin_command(text: str) -> Optional[str]:
             owner["disabled"] = True; owner.pop("disabled_until", None)
         else:
             owner["disabled"] = False; owner.pop("disabled_until", None)
-        _rebuild_pools_preserving_rotation()
+        await _rebuild_pools_preserving_rotation()
         return f"{'Stopped' if is_stop else 'Opened'} owner {target}."
 
     # add/delete/list commands (same as before)
@@ -661,7 +667,7 @@ def _handle_admin_command(text: str) -> Optional[str]:
         name = _norm_owner_name(m.group(1))
         if _find_owner_group(name): return f"Owner '{name}' already exists."
         OWNER_DATA.append(_ensure_owner_shape({"owner": name}))
-        _rebuild_pools_preserving_rotation(); return f"Owner '{name}' added."
+        await _rebuild_pools_preserving_rotation(); return f"Owner '{name}' added."
 
     m = ADD_USERNAME_RX.match(text)
     if m:
@@ -672,7 +678,7 @@ def _handle_admin_command(text: str) -> Optional[str]:
         if any(_norm_handle(e.get("telegram")) == norm_h for e in owner["entries"]):
             return f"@{handle} already exists for owner {owner_name}."
         owner["entries"].append({"telegram": handle, "phone": "", "disabled": False})
-        _rebuild_pools_preserving_rotation(); return f"Added username @{handle} to {owner_name}."
+        await _rebuild_pools_preserving_rotation(); return f"Added username @{handle} to {owner_name}."
 
     m = ADD_WHATSAPP_RX.match(text)
     if m:
@@ -683,7 +689,7 @@ def _handle_admin_command(text: str) -> Optional[str]:
         if any(_norm_phone(w.get("number")) == norm_n for w in owner["whatsapp"]):
             return f"Number {num} already exists for owner {owner_name}."
         owner["whatsapp"].append({"number": num, "disabled": False})
-        _rebuild_pools_preserving_rotation(); return f"Added WhatsApp {num} to {owner_name}."
+        await _rebuild_pools_preserving_rotation(); return f"Added WhatsApp {num} to {owner_name}."
 
     m = DEL_USERNAME_RX.match(text)
     if m:
@@ -693,7 +699,7 @@ def _handle_admin_command(text: str) -> Optional[str]:
             owner["entries"] = [e for e in owner["entries"] if _norm_handle(e.get("telegram")) != norm_h]
             if len(owner["entries"]) < before: found = True
         if not found: return f"Username @{handle} not found."
-        _rebuild_pools_preserving_rotation(); return f"Deleted username @{handle} from all owners."
+        await _rebuild_pools_preserving_rotation(); return f"Deleted username @{handle} from all owners."
 
     m = DEL_WHATSAPP_RX.match(text)
     if m:
@@ -703,7 +709,7 @@ def _handle_admin_command(text: str) -> Optional[str]:
             owner["whatsapp"] = [w for w in owner["whatsapp"] if _norm_phone(w.get("number")) != norm_n]
             if len(owner["whatsapp"]) < before: found = True
         if not found: return f"WhatsApp number {num} not found."
-        _rebuild_pools_preserving_rotation(); return f"Deleted WhatsApp number {num} from all owners."
+        await _rebuild_pools_preserving_rotation(); return f"Deleted WhatsApp number {num} from all owners."
 
     if LIST_OWNERS_RX.match(text):
         if not OWNER_DATA: return "No owners configured."
@@ -732,7 +738,8 @@ def _handle_admin_command(text: str) -> Optional[str]:
         if owner.get("entries"):
             lines.append("<u>Usernames:</u>")
             for e in owner["entries"]:
-                lines.append(f"- @{e['telegram']}")
+                flag = " ⛔" if e.get("disabled") else ""
+                lines.append(f"- @{e['telegram']}{flag}")
         if owner.get("whatsapp"):
             lines.append("<u>WhatsApp Numbers:</u>")
             for w in owner["whatsapp"]:
@@ -763,23 +770,22 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mrep = SEND_REPORT_RX.match(text)
         if _is_admin(update) and mrep:
             target_day = _parse_report_day(mrep.group(1))
-            err, path = _send_daily_excel(update, msg, target_day)
+            err, excel_buffer = _get_daily_excel_report(target_day)
             if err:
                 await msg.chat.send_message(err, reply_to_message_id=msg.message_id)
-            elif path:
-                try:
-                    await msg.chat.send_document(
-                        open(path, "rb"), filename=os.path.basename(path),
-                        caption=f"Daily summary (logical day starting 05:00) — {target_day}",
-                        reply_to_message_id=msg.message_id
-                    )
-                finally:
-                    if os.path.exists(path): os.remove(path)
+            elif excel_buffer:
+                file_name = f"daily_summary_{target_day.isoformat()}.xlsx"
+                await msg.chat.send_document(
+                    document=excel_buffer,
+                    filename=file_name,
+                    caption=f"Daily summary (logical day starting 05:00) — {target_day}",
+                    reply_to_message_id=msg.message_id
+                )
             return
 
         # Admin: Console
         if _is_admin(update):
-            admin_reply = _handle_admin_command(text)
+            admin_reply = await _handle_admin_command(text)
             if admin_reply:
                 await msg.chat.send_message(admin_reply, reply_to_message_id=msg.message_id, parse_mode=ParseMode.HTML)
                 return
@@ -815,7 +821,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             # enforce and record quota
             if _wa_quota_reached(rec["number"]):
-                await msg.chat.send_message("No available WhatsApp.", reply_to_message_id=msg.message_id)
+                await msg.chat.send_message("No available WhatsApp (daily limit may be reached).", reply_to_message_id=msg.message_id)
                 return
             _wa_inc_count(_norm_phone(rec["number"]), _logical_day_today())
 
@@ -857,3 +863,4 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
