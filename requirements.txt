@@ -1,4 +1,4 @@
-python-telegram-bot
-pytz
-openpyxl
-psycopg2-binary
+python-telegram-bot>=20.7,<21
+pytz>=2024.1
+openpyxl>=3.1.2
+psycopg2-binary>=2.9.9
