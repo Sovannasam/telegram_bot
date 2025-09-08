@@ -533,31 +533,6 @@ def _value_in_text(value: Optional[str], text: str) -> bool:
     def norm(s): return re.sub(r"\D+", "", s or "")
     return norm(v) and (norm(v) in norm(text or ""))
 
-async def _deny_for_unreturned(msg, user_id: int, kind: str):
-    pending = _get_issued(user_id, kind)
-    if not pending:
-        return
-
-    if kind == "username":
-        # Example result: “… username @Hibiscus_1212 …”
-        text = (
-            f"{mention_user_html(user_id)} "
-            f"អ្នកមិនអាចយក username ផ្សេងទៀតបានទេ សូមផ្ញើព័ត៌មានអំពីអតិថិជនដែលអ្នកបានសុំ "
-            f"username {pending} ជាមុនសិន។"
-        )
-    else:  # whatsapp
-        text = (
-            f"{mention_user_html(user_id)} "
-            f"អ្នកមិនអាចយក WhatsApp ផ្សេងទៀតបានទេ សូមផ្ញើព័ត៌មានអំពីអតិថិជនដែលអ្នកបានសុំ "
-            f"WhatsApp {pending} ជាមុនសិន។"
-        )
-
-    await msg.chat.send_message(
-        text,
-        reply_to_message_id=msg.message_id,
-        parse_mode=ParseMode.HTML,
-    )
-
 # =============================
 # EXCEL (reads audit_log)
 # =============================
@@ -966,9 +941,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Feeders
         if NEED_USERNAME_RX.match(text):
-            if _get_issued(uid, "username"):
-                await _deny_for_unreturned(msg, uid, "username")
-                return
             rec = _next_from_username_pool()
             reply = "No available username." if not rec else f"@{rec['owner']}\n{rec['username']}"
             await msg.chat.send_message(reply, reply_to_message_id=msg.message_id)
@@ -978,9 +950,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if NEED_WHATSAPP_RX.match(text):
-            if _get_issued(uid, "whatsapp"):
-                await _deny_for_unreturned(msg, uid, "whatsapp")
-                return
             rec = _next_from_whatsapp_pool()
             if not rec:
                 await msg.chat.send_message("No available WhatsApp.", reply_to_message_id=msg.message_id)
