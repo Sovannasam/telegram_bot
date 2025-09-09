@@ -40,7 +40,7 @@ def get_env_variable(var_name: str) -> str:
 BOT_TOKEN = get_env_variable("BOT_TOKEN")
 DATABASE_URL = get_env_variable("DATABASE_URL")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "excelmerge")  # telegram username (without @)
-WA_DAILY_LIMIT = int(os.getenv("WA_DAILY_LIMIT", "2"))      # max sends per number per logical day
+WA_DAILY_LIMIT = int(os.getenv("WA_DAILY_LIMIT", "4"))      # max sends per number per logical day
 REMINDER_DELAY_MINUTES = int(os.getenv("REMINDER_DELAY_MINUTES", "30")) # Delay for reminders
 
 TIMEZONE = pytz.timezone("Asia/Phnom_Penh")
@@ -762,7 +762,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE) -
     # take customer command
     m = TAKE_CUSTOMER_RX.match(text)
     if m:
-        count_str, owner_name, and_stop = m.groups()
+        count_str, owner_name, and_stop_str = m.groups()
         count = int(count_str)
         owner_norm = _norm_owner_name(owner_name)
         
@@ -777,14 +777,14 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE) -
             "active": True,
             "owner": owner_norm,
             "remaining": count,
-            "stop_after": bool(and_stop),
+            "stop_after": "and stop" in text.lower(),
             "saved_rr_indices": {
                 "username_owner_idx": state["rr"]["username_owner_idx"],
                 "wa_owner_idx": state["rr"]["wa_owner_idx"],
             }
         }
         save_state()
-        stop_msg = " and will be stopped" if and_stop else ""
+        stop_msg = " and will be stopped" if state["priority_queue"]["stop_after"] else ""
         return f"Priority queue activated: Next {count} customers will be directed to {owner_name}{stop_msg}."
 
 
