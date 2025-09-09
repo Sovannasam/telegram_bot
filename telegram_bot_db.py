@@ -526,11 +526,27 @@ def _clear_issued(user_id: int, kind: str):
     save_state()
 
 def _value_in_text(value: Optional[str], text: str) -> bool:
-    if not value: return False
-    v = value.strip()
-    if v.startswith("@"): return v.lower() in (text or "").lower()
-    def norm(s): return re.sub(r"\D+", "", s or "")
-    return norm(v) and (norm(v) in norm(text or ""))
+    if not value:
+        return False
+    
+    v_norm = value.strip()
+    text_norm = text or ""
+
+    if v_norm.startswith('@'):
+        # For usernames, extract all potential usernames from the message
+        # and check for an exact, case-insensitive match.
+        potential_matches = re.findall(r'@([A-Za-z0-9_]+)', text_norm)
+        normalized_value = v_norm.lstrip('@').lower()
+        for match in potential_matches:
+            if match.lower() == normalized_value:
+                return True
+        return False
+    else:
+        # For phone numbers/IDs, normalize both by removing non-digits
+        # and check for inclusion. This is robust against formatting.
+        v_digits = re.sub(r'\D', '', v_norm)
+        text_digits = re.sub(r'\D', '', text_norm)
+        return v_digits and v_digits in text_digits
 
 # =============================
 # EXCEL (reads audit_log)
@@ -807,7 +823,7 @@ async def _handle_admin_command(text: str) -> Optional[str]:
         lines = ["<b>Disabled/Paused Owners:</b>"]
         for o in disabled:
             reason = f" (until {o['disabled_until']})" if o.get("disabled_until") else ""
-            lines.append(f"- <code>{o['owner']}</code>{reason}")
+            lines.append(f"- code>{o['owner']}</code>{reason}")
         return "\n".join(lines)
 
     # allow: "list @Owner" (alias)
