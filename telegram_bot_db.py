@@ -992,8 +992,9 @@ async def _send_all_pending_reminders(context: ContextTypes.DEFAULT_TYPE) -> str
     """Manually sends reminders for ALL currently issued items."""
     total_reminders_sent = 0
     reminded_users = set()
-
-    await db_lock.acquire()
+    
+    # This function is called from within on_message, which already has the lock.
+    # No need to acquire db_lock here.
     try:
         # No state change, just reading and sending messages
         for kind in ("username", "whatsapp"):
@@ -1020,8 +1021,9 @@ async def _send_all_pending_reminders(context: ContextTypes.DEFAULT_TYPE) -> str
                             reminded_users.add(user_id)
                     except Exception as e:
                         log.error(f"Error sending manual reminder for user {user_id_str}: {e}")
-    finally:
-        db_lock.release()
+    except Exception as e:
+        log.error(f"Error in _send_all_pending_reminders: {e}")
+
 
     if total_reminders_sent == 0:
         return "No pending items found to send reminders for."
