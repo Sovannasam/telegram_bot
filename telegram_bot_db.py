@@ -40,7 +40,7 @@ def get_env_variable(var_name: str) -> str:
 BOT_TOKEN = get_env_variable("BOT_TOKEN")
 DATABASE_URL = get_env_variable("DATABASE_URL")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "excelmerge")  # telegram username (without @)
-WA_DAILY_LIMIT = int(os.getenv("WA_DAILY_LIMIT", "4"))      # max sends per number per logical day
+WA_DAILY_LIMIT = int(os.getenv("WA_DAILY_LIMIT", "2"))      # max sends per number per logical day
 REMINDER_DELAY_MINUTES = int(os.getenv("REMINDER_DELAY_MINUTES", "30")) # Delay for reminders
 
 TIMEZONE = pytz.timezone("Asia/Phnom_Penh")
@@ -111,6 +111,13 @@ BASE_STATE = {
         "wa_owner_idx": 0, "wa_entry_idx": {},
     },
     "issued": {"username": {}, "whatsapp": {}},
+    "priority_queue": {
+        "active": False,
+        "owner": None,
+        "remaining": 0,
+        "stop_after": False,
+        "saved_rr_indices": {}
+    }
 }
 state: Dict = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
 
@@ -137,6 +144,8 @@ def load_state():
     state["rr"].setdefault("wa_entry_idx", {})
     state.setdefault("issued", {}).setdefault("username", {})
     state["issued"].setdefault("whatsapp", {})
+    state.setdefault("priority_queue", BASE_STATE["priority_queue"])
+
 
 def save_state():
     conn = get_db_connection()
@@ -153,6 +162,25 @@ def save_state():
         log.warning("Failed to save state to DB: %s", e)
     finally:
         conn.close()
+
+def _migrate_state_if_needed():
+    """Ensure the 'issued' structure uses lists for multi-item tracking."""
+    log.info("Checking state structure for migration...")
+    state_was_changed = False
+    issued = state.setdefault("issued", {})
+    for kind in ("username", "whatsapp"):
+        bucket = issued.setdefault(kind, {})
+        for user_id, item_or_list in bucket.items():
+            if isinstance(item_or_list, dict):
+                bucket[user_id] = [item_or_list]
+                state_was_changed = True
+                log.info(f"Migrated user {user_id}'s '{kind}' data to new list format.")
+    
+    if state_was_changed:
+        log.info("State structure was migrated. Saving new format to database.")
+        save_state()
+    else:
+        log.info("State structure is already up-to-date.")
 
 # =============================
 # OWNER DIRECTORY (DB-backed)
@@ -376,7 +404,52 @@ async def _rebuild_pools_preserving_rotation():
 
     save_state()
 
-def _next_from_username_pool() -> Optional[Dict[str, str]]:
+async def _decrement_priority_and_end_if_needed():
+    pq = state.get("priority_queue", {})
+    if not pq.get("active"):
+        return
+
+    pq["remaining"] -= 1
+    
+    if pq["remaining"] <= 0:
+        log.info(f"Priority queue for owner {pq['owner']} completed.")
+        saved_indices = pq.get("saved_rr_indices", {})
+        state["rr"]["username_owner_idx"] = saved_indices.get("username_owner_idx", 0)
+        state["rr"]["wa_owner_idx"] = saved_indices.get("wa_owner_idx", 0)
+
+        stop_after = pq.get("stop_after", False)
+        owner_to_stop = pq.get("owner")
+
+        # Reset priority queue state
+        state["priority_queue"] = BASE_STATE["priority_queue"]
+
+        if stop_after and owner_to_stop:
+            log.info(f"Auto-stopping owner {owner_to_stop} after priority queue completion.")
+            owner_group = _find_owner_group(owner_to_stop)
+            if owner_group:
+                owner_group["disabled"] = True
+            await _rebuild_pools_preserving_rotation() # This saves owner_data and reloads pools
+        else:
+            save_state()
+    else:
+        save_state()
+
+async def _next_from_username_pool() -> Optional[Dict[str, str]]:
+    pq = state.get("priority_queue", {})
+    if pq.get("active"):
+        priority_owner = pq.get("owner")
+        for block in USERNAME_POOL:
+            if block["owner"] == priority_owner:
+                arr = block.get("usernames", [])
+                if arr:
+                    ei = state["rr"]["username_entry_idx"].get(priority_owner, 0) % len(arr)
+                    result = {"owner": priority_owner, "username": arr[ei]}
+                    state["rr"]["username_entry_idx"][priority_owner] = (ei + 1) % len(arr)
+                    await _decrement_priority_and_end_if_needed()
+                    return result
+        log.warning(f"Priority owner {priority_owner} not found in USERNAME_POOL or has no usernames.")
+        return None
+
     if not USERNAME_POOL: return None
     rr = state["rr"]
     idx = rr.get("username_owner_idx", 0) % len(USERNAME_POOL)
@@ -393,24 +466,37 @@ def _next_from_username_pool() -> Optional[Dict[str, str]]:
         idx = (idx + 1) % len(USERNAME_POOL)
     return None
 
-def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
-    """Owner-rotating WhatsApp with per-number daily quota."""
+async def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
+    pq = state.get("priority_queue", {})
+    if pq.get("active"):
+        priority_owner = pq.get("owner")
+        for block in WHATSAPP_POOL:
+            if block["owner"] == priority_owner:
+                numbers = block.get("numbers", []) or []
+                if numbers:
+                    start = state["rr"]["wa_entry_idx"].get(priority_owner, 0) % len(numbers)
+                    for step in range(len(numbers)):
+                        cand = numbers[(start + step) % len(numbers)]
+                        if not _wa_quota_reached(cand):
+                            state["rr"]["wa_entry_idx"][priority_owner] = ((start + step) + 1) % len(numbers)
+                            await _decrement_priority_and_end_if_needed()
+                            return {"owner": priority_owner, "number": cand}
+        log.warning(f"Priority owner {priority_owner} not found in WHATSAPP_POOL or has no available numbers.")
+        return None
+
     if not WHATSAPP_POOL: return None
     rr = state["rr"]
     owner_idx = rr.get("wa_owner_idx", 0) % len(WHATSAPP_POOL)
-
-    for _ in range(len(WHATSAPP_POOL)):  # loop owners
+    for _ in range(len(WHATSAPP_POOL)):
         block = WHATSAPP_POOL[owner_idx]
         owner = block["owner"]
         numbers = block.get("numbers", []) or []
         if numbers:
             start = rr["wa_entry_idx"].get(owner, 0) % len(numbers)
-            # try each number once for this owner to find one under quota
             for step in range(len(numbers)):
                 cand = numbers[(start + step) % len(numbers)]
                 if _wa_quota_reached(cand):
                     continue
-                # choose this number
                 rr["wa_entry_idx"][owner] = ((start + step) + 1) % len(numbers)
                 rr["wa_owner_idx"] = (owner_idx + 1) % len(WHATSAPP_POOL)
                 save_state()
@@ -441,6 +527,9 @@ LIST_DISABLED_RX      = re.compile(r"^\s*list\s+disabled\s*$", re.IGNORECASE)
 SEND_REPORT_RX        = re.compile(r"^\s*(?:send\s+report|report)(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 PHONE_LIKE_RX         = re.compile(r"^\+?\d[\d\s\-]{6,}\d$")
 LIST_OWNER_ALIAS_RX   = re.compile(r"^\s*list\s+@?(.+?)\s*$", re.IGNORECASE)
+REMIND_ALL_RX         = re.compile(r"^\s*remind\s+user\s*$", re.IGNORECASE)
+TAKE_CUSTOMER_RX      = re.compile(r"^\s*take\s+(\d+)\s+customer(?:s)?\s+to\s+owner\s+@?(.+?)(?:\s+and\s+stop)?\s*$", re.IGNORECASE)
+
 
 def _looks_like_phone(s: str) -> bool:
     return bool(PHONE_LIKE_RX.fullmatch((s or "").strip()))
@@ -508,22 +597,32 @@ def mention_user_html(user_id: int) -> str:
     name = info.get("first_name") or info.get("username") or str(user_id)
     return f'<a href="tg://user?id={user_id}">{name}</a>'
 
-def _issued_bucket(kind: str) -> Dict[str, dict]: return state.setdefault("issued", {}).setdefault(kind, {})
+def _issued_bucket(kind: str) -> Dict[str, list]: 
+    return state.setdefault("issued", {}).setdefault(kind, {})
 
 def _set_issued(user_id: int, chat_id: int, kind: str, value: str):
-    _issued_bucket(kind)[str(user_id)] = {
+    bucket = _issued_bucket(kind)
+    user_id_str = str(user_id)
+    if user_id_str not in bucket:
+        bucket[user_id_str] = []
+    
+    bucket[user_id_str].append({
         "value": value, 
         "ts": datetime.now(TIMEZONE).isoformat(),
         "chat_id": chat_id
-    }
+    })
     save_state()
 
-def _get_issued(user_id: int, kind: str) -> Optional[str]:
-    return _issued_bucket(kind).get(str(user_id), {}).get("value")
-
-def _clear_issued(user_id: int, kind: str):
-    _issued_bucket(kind).pop(str(user_id), None)
-    save_state()
+def _clear_issued(user_id: int, kind: str, value_to_clear: str):
+    bucket = _issued_bucket(kind)
+    user_id_str = str(user_id)
+    if user_id_str in bucket:
+        bucket[user_id_str] = [
+            item for item in bucket[user_id_str] if item.get("value") != value_to_clear
+        ]
+        if not bucket[user_id_str]: # remove user if list is empty
+            del bucket[user_id_str]
+        save_state()
 
 def _value_in_text(value: Optional[str], text: str) -> bool:
     if not value:
@@ -533,8 +632,6 @@ def _value_in_text(value: Optional[str], text: str) -> bool:
     text_norm = text or ""
 
     if v_norm.startswith('@'):
-        # For usernames, extract all potential usernames from the message
-        # and check for an exact, case-insensitive match.
         potential_matches = re.findall(r'@([A-Za-z0-9_]+)', text_norm)
         normalized_value = v_norm.lstrip('@').lower()
         for match in potential_matches:
@@ -542,8 +639,6 @@ def _value_in_text(value: Optional[str], text: str) -> bool:
                 return True
         return False
     else:
-        # For phone numbers/IDs, normalize both by removing non-digits
-        # and check for inclusion. This is robust against formatting.
         v_digits = re.sub(r'\D', '', v_norm)
         text_digits = re.sub(r'\D', '', text_norm)
         return v_digits and v_digits in text_digits
@@ -663,7 +758,36 @@ def _find_owner_group(name: str) -> Optional[dict]:
         if _norm_owner_name(group["owner"]) == norm_name: return group
     return None
 
-async def _handle_admin_command(text: str) -> Optional[str]:
+async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+    # take customer command
+    m = TAKE_CUSTOMER_RX.match(text)
+    if m:
+        count_str, owner_name, and_stop = m.groups()
+        count = int(count_str)
+        owner_norm = _norm_owner_name(owner_name)
+        
+        owner_group = _find_owner_group(owner_norm)
+        if not owner_group:
+            return f"Owner '{owner_name}' not found."
+        
+        if _owner_is_paused(owner_group):
+            return f"Owner '{owner_name}' is currently paused and cannot take customers."
+
+        state["priority_queue"] = {
+            "active": True,
+            "owner": owner_norm,
+            "remaining": count,
+            "stop_after": bool(and_stop),
+            "saved_rr_indices": {
+                "username_owner_idx": state["rr"]["username_owner_idx"],
+                "wa_owner_idx": state["rr"]["wa_owner_idx"],
+            }
+        }
+        save_state()
+        stop_msg = " and will be stopped" if and_stop else ""
+        return f"Priority queue activated: Next {count} customers will be directed to {owner_name}{stop_msg}."
+
+
     # stop/open (owner | username | phone)
     m = STOP_OPEN_RX.match(text)
     if m:
@@ -823,7 +947,7 @@ async def _handle_admin_command(text: str) -> Optional[str]:
         lines = ["<b>Disabled/Paused Owners:</b>"]
         for o in disabled:
             reason = f" (until {o['disabled_until']})" if o.get("disabled_until") else ""
-            lines.append(f"- code>{o['owner']}</code>{reason}")
+            lines.append(f"- <code>{o['owner']}</code>{reason}")
         return "\n".join(lines)
 
     # allow: "list @Owner" (alias)
@@ -835,7 +959,9 @@ async def _handle_admin_command(text: str) -> Optional[str]:
         owner = _find_owner_group(name)
         if not owner:
             return f"Owner '{name}' not found."
-        lines = [f"<b>Details for {owner['owner']}:</b>"]
+        
+        owner_status_flag = " ⛔" if _owner_is_paused(owner) else ""
+        lines = [f"<b>Details for {owner['owner']}{owner_status_flag}:</b>"]
         if owner.get("entries"):
             lines.append("<u>Usernames:</u>")
             for e in owner["entries"]:
@@ -853,26 +979,28 @@ async def _handle_admin_command(text: str) -> Optional[str]:
             lines.append("No entries found.")
         return "\n".join(lines)
 
+    m = REMIND_ALL_RX.match(text)
+    if m:
+        return await _send_all_pending_reminders(context)
+
     return None
 
 # =============================
 # REMINDER & RESET TASKS
 # =============================
-async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
+async def _send_all_pending_reminders(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Manually sends reminders for ALL currently issued items."""
+    total_reminders_sent = 0
+    reminded_users = set()
+
     await db_lock.acquire()
     try:
-        now = datetime.now(TIMEZONE)
-        state_changed = False
-        
+        # No state change, just reading and sending messages
         for kind in ("username", "whatsapp"):
             bucket = _issued_bucket(kind)
-            for user_id_str, item in list(bucket.items()):
-                if item.get("reminder_sent"):
-                    continue
-
-                try:
-                    issue_ts = datetime.fromisoformat(item["ts"])
-                    if (now - issue_ts) > timedelta(minutes=REMINDER_DELAY_MINUTES):
+            for user_id_str, items in bucket.items():
+                for item in items:
+                    try:
                         user_id = int(user_id_str)
                         chat_id = item.get("chat_id")
                         value = item.get("value")
@@ -888,11 +1016,54 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                                 text=reminder_text,
                                 parse_mode=ParseMode.HTML
                             )
-                            item["reminder_sent"] = True
-                            state_changed = True
-                            log.info(f"Sent reminder to user {user_id} for {kind} in chat {chat_id}")
-                except Exception as e:
-                    log.error(f"Error processing reminder for user {user_id_str}: {e}")
+                            total_reminders_sent += 1
+                            reminded_users.add(user_id)
+                    except Exception as e:
+                        log.error(f"Error sending manual reminder for user {user_id_str}: {e}")
+    finally:
+        db_lock.release()
+
+    if total_reminders_sent == 0:
+        return "No pending items found to send reminders for."
+    else:
+        return f"Successfully sent {total_reminders_sent} reminder(s) to {len(reminded_users)} user(s)."
+
+async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
+    await db_lock.acquire()
+    try:
+        now = datetime.now(TIMEZONE)
+        state_changed = False
+        
+        for kind in ("username", "whatsapp"):
+            bucket = _issued_bucket(kind)
+            for user_id_str, items in list(bucket.items()):
+                for item in list(items): # Iterate over a copy
+                    if item.get("reminder_sent"):
+                        continue
+
+                    try:
+                        issue_ts = datetime.fromisoformat(item["ts"])
+                        if (now - issue_ts) > timedelta(minutes=REMINDER_DELAY_MINUTES):
+                            user_id = int(user_id_str)
+                            chat_id = item.get("chat_id")
+                            value = item.get("value")
+                            
+                            if chat_id and value:
+                                label = "username" if kind == "username" else "WhatsApp"
+                                reminder_text = (
+                                    f"សូមរំលឹក: {mention_user_html(user_id)}, "
+                                    f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ {label} {value} ដែលអ្នកបានស្នើសុំ។"
+                                )
+                                await context.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=reminder_text,
+                                    parse_mode=ParseMode.HTML
+                                )
+                                item["reminder_sent"] = True
+                                state_changed = True
+                                log.info(f"Sent reminder to user {user_id} for {kind} in chat {chat_id}")
+                    except Exception as e:
+                        log.error(f"Error processing reminder for user {user_id_str}: {e}")
 
         if state_changed:
             save_state()
@@ -964,11 +1135,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Admin: Console
         if _is_admin(update):
-            admin_reply = await _handle_admin_command(text)
+            admin_reply = await _handle_admin_command(text, context)
             if admin_reply:
                 await msg.chat.send_message(admin_reply, reply_to_message_id=msg.message_id, parse_mode=ParseMode.HTML)
                 return
-            elif any(text.lower().startswith(cmd) for cmd in ['add ', 'delete ', 'list ', 'stop ', 'open ']):
+            elif any(text.lower().startswith(cmd) for cmd in ['add ', 'delete ', 'list ', 'stop ', 'open ', 'remind ', 'take ']):
                 await msg.chat.send_message(
                     "I don't recognize that command. Please check the syntax or use `list owners` to see available commands.",
                     reply_to_message_id=msg.message_id
@@ -978,15 +1149,23 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Auto-clear holds on content match
         for kind in ("username", "whatsapp"):
-            pending = _get_issued(uid, kind)
-            if pending and _value_in_text(pending, text):
-                _clear_issued(uid, kind)
-                _log_event(kind, "cleared", update, pending, owner="")
-                log.info("Cleared pending %s for user %s.", kind, uid)
+            bucket = _issued_bucket(kind)
+            user_id_str = str(uid)
+            if user_id_str in bucket:
+                items_to_clear = []
+                for item in bucket[user_id_str]:
+                    if _value_in_text(item.get("value"), text):
+                        items_to_clear.append(item.get("value"))
+                
+                for value in items_to_clear:
+                    _clear_issued(uid, kind, value)
+                    _log_event(kind, "cleared", update, value, owner="")
+                    log.info(f"Cleared pending {kind} for user {uid}: {value}")
+
 
         # Feeders
         if NEED_USERNAME_RX.match(text):
-            rec = _next_from_username_pool()
+            rec = await _next_from_username_pool()
             reply = "No available username." if not rec else f"@{rec['owner']}\n{rec['username']}"
             await msg.chat.send_message(reply, reply_to_message_id=msg.message_id)
             if rec:
@@ -995,7 +1174,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if NEED_WHATSAPP_RX.match(text):
-            rec = _next_from_whatsapp_pool()
+            rec = await _next_from_whatsapp_pool()
             if not rec:
                 await msg.chat.send_message("No available WhatsApp.", reply_to_message_id=msg.message_id)
                 return
@@ -1036,6 +1215,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == "__main__":
     setup_database()
     load_state()
+    _migrate_state_if_needed()
     load_owner_directory()
 
     app = Application.builder().token(BOT_TOKEN).build()
