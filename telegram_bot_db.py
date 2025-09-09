@@ -404,7 +404,7 @@ async def _rebuild_pools_preserving_rotation():
 
     save_state()
 
-async def _decrement_priority_and_end_if_needed():
+async def _decrement_priority_and_end_if_needed(context: ContextTypes.DEFAULT_TYPE):
     pq = state.get("priority_queue", {})
     if not pq.get("active"):
         return
@@ -428,13 +428,13 @@ async def _decrement_priority_and_end_if_needed():
             owner_group = _find_owner_group(owner_to_stop)
             if owner_group:
                 owner_group["disabled"] = True
-            await _rebuild_pools_preserving_rotation() # This saves owner_data and reloads pools
+            await _rebuild_pools_preserving_rotation()
         else:
             save_state()
     else:
         save_state()
 
-async def _next_from_username_pool() -> Optional[Dict[str, str]]:
+async def _next_from_username_pool(context: ContextTypes.DEFAULT_TYPE) -> Optional[Dict[str, str]]:
     pq = state.get("priority_queue", {})
     if pq.get("active"):
         priority_owner = pq.get("owner")
@@ -445,9 +445,12 @@ async def _next_from_username_pool() -> Optional[Dict[str, str]]:
                     ei = state["rr"]["username_entry_idx"].get(priority_owner, 0) % len(arr)
                     result = {"owner": priority_owner, "username": arr[ei]}
                     state["rr"]["username_entry_idx"][priority_owner] = (ei + 1) % len(arr)
-                    await _decrement_priority_and_end_if_needed()
+                    await _decrement_priority_and_end_if_needed(context)
                     return result
         log.warning(f"Priority owner {priority_owner} not found in USERNAME_POOL or has no usernames.")
+        await context.bot.send_message(chat_id=context._chat_id, text=f"Warning: Priority owner {priority_owner} has no available usernames. Cancelling priority queue.")
+        state["priority_queue"] = BASE_STATE["priority_queue"]
+        save_state()
         return None
 
     if not USERNAME_POOL: return None
@@ -466,7 +469,7 @@ async def _next_from_username_pool() -> Optional[Dict[str, str]]:
         idx = (idx + 1) % len(USERNAME_POOL)
     return None
 
-async def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
+async def _next_from_whatsapp_pool(context: ContextTypes.DEFAULT_TYPE) -> Optional[Dict[str, str]]:
     pq = state.get("priority_queue", {})
     if pq.get("active"):
         priority_owner = pq.get("owner")
@@ -479,9 +482,12 @@ async def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
                         cand = numbers[(start + step) % len(numbers)]
                         if not _wa_quota_reached(cand):
                             state["rr"]["wa_entry_idx"][priority_owner] = ((start + step) + 1) % len(numbers)
-                            await _decrement_priority_and_end_if_needed()
+                            await _decrement_priority_and_end_if_needed(context)
                             return {"owner": priority_owner, "number": cand}
         log.warning(f"Priority owner {priority_owner} not found in WHATSAPP_POOL or has no available numbers.")
+        await context.bot.send_message(chat_id=context._chat_id, text=f"Warning: Priority owner {priority_owner} has no available WhatsApp numbers. Cancelling priority queue.")
+        state["priority_queue"] = BASE_STATE["priority_queue"]
+        save_state()
         return None
 
     if not WHATSAPP_POOL: return None
@@ -993,42 +999,44 @@ async def _send_all_pending_reminders(context: ContextTypes.DEFAULT_TYPE) -> str
     total_reminders_sent = 0
     reminded_users = set()
     
-    # This function is called from within on_message, which already has the lock.
-    # No need to acquire db_lock here.
+    reminders_to_send = []
+    # Acquire lock only to read data, not while sending messages
+    await db_lock.acquire()
     try:
-        # No state change, just reading and sending messages
         for kind in ("username", "whatsapp"):
             bucket = _issued_bucket(kind)
             for user_id_str, items in bucket.items():
                 for item in items:
-                    try:
-                        user_id = int(user_id_str)
-                        chat_id = item.get("chat_id")
-                        value = item.get("value")
-                        
-                        if chat_id and value:
-                            label = "username" if kind == "username" else "WhatsApp"
-                            reminder_text = (
-                                f"សូមរំលឹក: {mention_user_html(user_id)}, "
-                                f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ {label} {value} ដែលអ្នកបានស្នើសុំ។"
-                            )
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=reminder_text,
-                                parse_mode=ParseMode.HTML
-                            )
-                            total_reminders_sent += 1
-                            reminded_users.add(user_id)
-                    except Exception as e:
-                        log.error(f"Error sending manual reminder for user {user_id_str}: {e}")
-    except Exception as e:
-        log.error(f"Error in _send_all_pending_reminders: {e}")
+                    user_id = int(user_id_str)
+                    chat_id = item.get("chat_id")
+                    value = item.get("value")
+                    if chat_id and value:
+                        label = "username" if kind == "username" else "WhatsApp"
+                        reminder_text = (
+                            f"សូមរំលឹក: {mention_user_html(user_id)}, "
+                            f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ {label} {value} ដែលអ្នកបានស្នើសុំ។"
+                        )
+                        reminders_to_send.append({'chat_id': chat_id, 'text': reminder_text, 'user_id': user_id})
+    finally:
+        db_lock.release()
 
-
-    if total_reminders_sent == 0:
+    if not reminders_to_send:
         return "No pending items found to send reminders for."
-    else:
-        return f"Successfully sent {total_reminders_sent} reminder(s) to {len(reminded_users)} user(s)."
+
+    for r in reminders_to_send:
+        try:
+            await context.bot.send_message(
+                chat_id=r['chat_id'],
+                text=r['text'],
+                parse_mode=ParseMode.HTML
+            )
+            total_reminders_sent += 1
+            reminded_users.add(r['user_id'])
+        except Exception as e:
+            log.error(f"Error sending manual reminder for user {r['user_id']}: {e}")
+
+    return f"Successfully sent {total_reminders_sent} reminder(s) to {len(reminded_users)} user(s)."
+
 
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     await db_lock.acquire()
@@ -1167,7 +1175,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Feeders
         if NEED_USERNAME_RX.match(text):
-            rec = await _next_from_username_pool()
+            rec = await _next_from_username_pool(context)
             reply = "No available username." if not rec else f"@{rec['owner']}\n{rec['username']}"
             await msg.chat.send_message(reply, reply_to_message_id=msg.message_id)
             if rec:
@@ -1176,7 +1184,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if NEED_WHATSAPP_RX.match(text):
-            rec = await _next_from_whatsapp_pool()
+            rec = await _next_from_whatsapp_pool(context)
             if not rec:
                 await msg.chat.send_message("No available WhatsApp.", reply_to_message_id=msg.message_id)
                 return
