@@ -534,7 +534,7 @@ SEND_REPORT_RX        = re.compile(r"^\s*(?:send\s+report|report)(?:\s+(yesterda
 PHONE_LIKE_RX         = re.compile(r"^\+?\d[\d\s\-]{6,}\d$")
 LIST_OWNER_ALIAS_RX   = re.compile(r"^\s*list\s+@?(.+?)\s*$", re.IGNORECASE)
 REMIND_ALL_RX         = re.compile(r"^\s*remind\s+user\s*$", re.IGNORECASE)
-TAKE_CUSTOMER_RX      = re.compile(r"^\s*take\s+(\d+)\s+customer(?:s)?\s+to\s+owner\s+@?(.+?)(?:\s+and\s+stop)?\s*$", re.IGNORECASE)
+TAKE_CUSTOMER_RX      = re.compile(r"^\s*take\s+(\d+)\s+customer(?:s)?\s+to\s+owner\s+@?(.+?)(?:\s+(and\s+stop))?\s*$", re.IGNORECASE)
 
 
 def _looks_like_phone(s: str) -> bool:
@@ -783,7 +783,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE) -
             "active": True,
             "owner": owner_norm,
             "remaining": count,
-            "stop_after": "and stop" in text.lower(),
+            "stop_after": bool(and_stop_str),
             "saved_rr_indices": {
                 "username_owner_idx": state["rr"]["username_owner_idx"],
                 "wa_owner_idx": state["rr"]["wa_owner_idx"],
@@ -1000,25 +1000,22 @@ async def _send_all_pending_reminders(context: ContextTypes.DEFAULT_TYPE) -> str
     reminded_users = set()
     
     reminders_to_send = []
-    # Acquire lock only to read data, not while sending messages
-    await db_lock.acquire()
-    try:
-        for kind in ("username", "whatsapp"):
-            bucket = _issued_bucket(kind)
-            for user_id_str, items in bucket.items():
-                for item in items:
-                    user_id = int(user_id_str)
-                    chat_id = item.get("chat_id")
-                    value = item.get("value")
-                    if chat_id and value:
-                        label = "username" if kind == "username" else "WhatsApp"
-                        reminder_text = (
-                            f"សូមរំលឹក: {mention_user_html(user_id)}, "
-                            f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ {label} {value} ដែលអ្នកបានស្នើសុំ។"
-                        )
-                        reminders_to_send.append({'chat_id': chat_id, 'text': reminder_text, 'user_id': user_id})
-    finally:
-        db_lock.release()
+    # This function is called from within on_message, which already has the lock.
+    # We can read the state directly.
+    for kind in ("username", "whatsapp"):
+        bucket = _issued_bucket(kind)
+        for user_id_str, items in bucket.items():
+            for item in items:
+                user_id = int(user_id_str)
+                chat_id = item.get("chat_id")
+                value = item.get("value")
+                if chat_id and value:
+                    label = "username" if kind == "username" else "WhatsApp"
+                    reminder_text = (
+                        f"សូមរំលឹក: {mention_user_html(user_id)}, "
+                        f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ {label} {value} ដែលអ្នកបានស្នើសុំ។"
+                    )
+                    reminders_to_send.append({'chat_id': chat_id, 'text': reminder_text, 'user_id': user_id})
 
     if not reminders_to_send:
         return "No pending items found to send reminders for."
@@ -1044,41 +1041,45 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
         now = datetime.now(TIMEZONE)
         state_changed = False
         
+        reminders_to_send = []
+        # First, collect all reminders that need to be sent
         for kind in ("username", "whatsapp"):
             bucket = _issued_bucket(kind)
             for user_id_str, items in list(bucket.items()):
-                for item in list(items): # Iterate over a copy
+                for item in list(items):
                     if item.get("reminder_sent"):
                         continue
-
                     try:
                         issue_ts = datetime.fromisoformat(item["ts"])
                         if (now - issue_ts) > timedelta(minutes=REMINDER_DELAY_MINUTES):
                             user_id = int(user_id_str)
                             chat_id = item.get("chat_id")
                             value = item.get("value")
-                            
                             if chat_id and value:
                                 label = "username" if kind == "username" else "WhatsApp"
                                 reminder_text = (
                                     f"សូមរំលឹក: {mention_user_html(user_id)}, "
                                     f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ {label} {value} ដែលអ្នកបានស្នើសុំ។"
                                 )
-                                await context.bot.send_message(
-                                    chat_id=chat_id,
-                                    text=reminder_text,
-                                    parse_mode=ParseMode.HTML
-                                )
+                                reminders_to_send.append({'chat_id': chat_id, 'text': reminder_text})
                                 item["reminder_sent"] = True
                                 state_changed = True
-                                log.info(f"Sent reminder to user {user_id} for {kind} in chat {chat_id}")
+                                log.info(f"Queued reminder for user {user_id} for {kind} in chat {chat_id}")
                     except Exception as e:
                         log.error(f"Error processing reminder for user {user_id_str}: {e}")
-
+        
         if state_changed:
             save_state()
     finally:
         db_lock.release()
+
+    # Send messages outside the lock
+    for r in reminders_to_send:
+        try:
+            await context.bot.send_message(chat_id=r['chat_id'], text=r['text'], parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.error(f"Failed to send reminder to chat {r['chat_id']}: {e}")
+
 
 async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
     """Clears daily WhatsApp quotas and the 'issued' state for a new day."""
@@ -1123,6 +1124,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     chat_id = msg.chat_id
     cache_user_info(update.effective_user)
+    
+    # Pass the chat_id into the context for potential use in priority queue warnings
+    context._chat_id = chat_id
 
     await db_lock.acquire()
     try:
@@ -1131,6 +1135,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if _is_admin(update) and mrep:
             target_day = _parse_report_day(mrep.group(1))
             err, excel_buffer = _get_daily_excel_report(target_day)
+            db_lock.release() # Release lock before sending file
             if err:
                 await msg.chat.send_message(err, reply_to_message_id=msg.message_id)
             elif excel_buffer:
@@ -1147,9 +1152,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if _is_admin(update):
             admin_reply = await _handle_admin_command(text, context)
             if admin_reply:
+                db_lock.release() # Release lock before sending message
                 await msg.chat.send_message(admin_reply, reply_to_message_id=msg.message_id, parse_mode=ParseMode.HTML)
                 return
             elif any(text.lower().startswith(cmd) for cmd in ['add ', 'delete ', 'list ', 'stop ', 'open ', 'remind ', 'take ']):
+                db_lock.release() # Release lock before sending message
                 await msg.chat.send_message(
                     "I don't recognize that command. Please check the syntax or use `list owners` to see available commands.",
                     reply_to_message_id=msg.message_id
@@ -1177,27 +1184,34 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if NEED_USERNAME_RX.match(text):
             rec = await _next_from_username_pool(context)
             reply = "No available username." if not rec else f"@{rec['owner']}\n{rec['username']}"
+            db_lock.release() # Release lock before sending message
             await msg.chat.send_message(reply, reply_to_message_id=msg.message_id)
             if rec:
+                await db_lock.acquire() # Re-acquire lock to modify state
                 _set_issued(uid, chat_id, "username", rec["username"])
                 _log_event("username", "issued", update, rec["username"], owner=rec["owner"])
+                db_lock.release()
             return
 
         if NEED_WHATSAPP_RX.match(text):
             rec = await _next_from_whatsapp_pool(context)
-            if not rec:
-                await msg.chat.send_message("No available WhatsApp.", reply_to_message_id=msg.message_id)
-                return
-            # enforce and record quota
-            if _wa_quota_reached(rec["number"]):
-                await msg.chat.send_message("No available WhatsApp (daily limit may be reached).", reply_to_message_id=msg.message_id)
-                return
-            _wa_inc_count(_norm_phone(rec["number"]), _logical_day_today())
+            reply = "No available WhatsApp."
+            if rec:
+                 if _wa_quota_reached(rec["number"]):
+                     reply = "No available WhatsApp (daily limit may be reached)."
+                     rec = None # Don't issue it
+                 else:
+                     reply = f"@{rec['owner']}\n{rec['number']}"
 
-            reply = f"@{rec['owner']}\n{rec['number']}"
+            db_lock.release() # Release lock before sending message
             await msg.chat.send_message(reply, reply_to_message_id=msg.message_id)
-            _set_issued(uid, chat_id, "whatsapp", rec["number"])
-            _log_event("whatsapp", "issued", update, rec["number"], owner=rec["owner"])
+
+            if rec:
+                await db_lock.acquire() # Re-acquire lock to modify state
+                _wa_inc_count(_norm_phone(rec["number"]), _logical_day_today())
+                _set_issued(uid, chat_id, "whatsapp", rec["number"])
+                _log_event("whatsapp", "issued", update, rec["number"], owner=rec["owner"])
+                db_lock.release()
             return
 
         # Lookups
@@ -1213,11 +1227,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if rec and rec.get("channel") == "whatsapp": reply = f"Owner of WhatsApp {phone} → @{rec['owner']}"
                 elif rec: reply = f"Owner of number {phone} → @{rec['owner']} (@{rec.get('telegram') or '-'})"
                 else: reply = f"Owner of number {phone} → not found"
+            db_lock.release() # Release lock before sending message
             await msg.chat.send_message(reply, reply_to_message_id=msg.message_id)
             return
 
     finally:
-        db_lock.release()
+        if db_lock.locked():
+            db_lock.release()
 
 # =============================
 # MAIN
