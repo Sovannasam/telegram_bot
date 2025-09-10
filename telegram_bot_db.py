@@ -96,6 +96,12 @@ def setup_database():
                     PRIMARY KEY (day, number_norm)
                 );
             """)
+            # NEW: Table for WhatsApp bans
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS whatsapp_bans (
+                    user_id BIGINT PRIMARY KEY
+                );
+            """)
             conn.commit()
         log.info("Database schema is ready.")
     finally:
@@ -120,6 +126,22 @@ BASE_STATE = {
     }
 }
 state: Dict = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
+WHATSAPP_BANNED_USERS: set[int] = set()
+
+def load_whatsapp_bans():
+    global WHATSAPP_BANNED_USERS
+    WHATSAPP_BANNED_USERS = set()
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM whatsapp_bans")
+            for row in cur.fetchall():
+                WHATSAPP_BANNED_USERS.add(row[0])
+        log.info(f"Loaded {len(WHATSAPP_BANNED_USERS)} WhatsApp bans from database.")
+    except Exception as e:
+        log.error(f"Failed to load WhatsApp bans from DB: {e}")
+    finally:
+        conn.close()
 
 def load_state():
     global state
@@ -528,7 +550,9 @@ LIST_OWNER_ALIAS_RX   = re.compile(r"^\s*list\s+@?(.+?)\s*$", re.IGNORECASE)
 REMIND_ALL_RX         = re.compile(r"^\s*remind\s+user\s*$", re.IGNORECASE)
 TAKE_CUSTOMER_RX      = re.compile(r"^\s*take\s+(\d+)\s+customer(?:s)?\s+to\s+owner\s+@?(.+?)(?:\s+(and\s+stop))?\s*$", re.IGNORECASE)
 CLEAR_PENDING_RX      = re.compile(r"^\s*clear\s+pending\s+(\S+)\s*$", re.IGNORECASE)
-CLEAR_SPECIFIC_PENDING_RX = re.compile(r"^\s*clear\s+pending\s+(\S+)\s+for\s+@?(\S+)\s*$", re.IGNORECASE)
+BAN_WHATSAPP_RX       = re.compile(r"^\s*ban\s+whatsapp\s+@?(\S+)\s*$", re.IGNORECASE)
+UNBAN_WHATSAPP_RX     = re.compile(r"^\s*unban\s+whatsapp\s+@?(\S+)\s*$", re.IGNORECASE)
+LIST_BANNED_RX        = re.compile(r"^\s*list\s+banned\s*$", re.IGNORECASE)
 
 
 def _looks_like_phone(s: str) -> bool:
@@ -789,8 +813,8 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE) -
             "saved_rr_indices": { "username_owner_idx": state["rr"]["username_owner_idx"], "wa_owner_idx": state["rr"]["wa_owner_idx"] }
         }
         save_state()
-        stop_msg = " and will be stopped" if state["priority_queue"]["stop_after"] else ""
-        return f"Priority queue activated: Next {count} customers will be directed to {owner_name}{stop_msg}."
+        stop_msg = " ហើយនឹងត្រូវបានបញ្ឈប់" if state["priority_queue"]["stop_after"] else ""
+        return f"ជួរអាទិភាពត្រូវបានដំណើរការ៖ អតិថិជន {count} នាក់បន្ទាប់នឹងត្រូវបានបញ្ជូនទៅ {owner_name}{stop_msg}។"
 
     # stop/open (owner | username | phone)
     m = STOP_OPEN_RX.match(text)
@@ -1174,6 +1198,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if NEED_WHATSAPP_RX.match(text):
+            if uid in WHATSAPP_BANNED_USERS:
+                db_lock.release()
+                await msg.chat.send_message("អ្នកត្រូវបានហាមឃាត់ពីការស្នើសុំលេខ WhatsApp ។", reply_to_message_id=msg.message_id)
+                return
+
             rec = await _next_from_whatsapp_pool()
             reply = "No available WhatsApp."
             if rec:
@@ -1221,6 +1250,7 @@ if __name__ == "__main__":
     load_state()
     _migrate_state_if_needed()
     load_owner_directory()
+    load_whatsapp_bans()
 
     app = Application.builder().token(BOT_TOKEN).build()
     
