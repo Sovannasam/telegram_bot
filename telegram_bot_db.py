@@ -42,6 +42,8 @@ DATABASE_URL = get_env_variable("DATABASE_URL")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "excelmerge")  # telegram username (without @)
 WA_DAILY_LIMIT = int(os.getenv("WA_DAILY_LIMIT", "2"))      # max sends per number per logical day
 REMINDER_DELAY_MINUTES = int(os.getenv("REMINDER_DELAY_MINUTES", "30")) # Delay for reminders
+USER_WHATSAPP_LIMIT = int(os.getenv("USER_WHATSAPP_LIMIT", "10"))
+USERNAME_THRESHOLD_FOR_BONUS = int(os.getenv("USERNAME_THRESHOLD_FOR_BONUS", "35"))
 
 TIMEZONE = pytz.timezone("Asia/Phnom_Penh")
 
@@ -96,7 +98,17 @@ def setup_database():
                     PRIMARY KEY (day, number_norm)
                 );
             """)
-            # NEW: Table for WhatsApp bans
+            # Per-user daily request counts
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_daily_activity (
+                    day DATE NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    username_requests INTEGER DEFAULT 0,
+                    whatsapp_requests INTEGER DEFAULT 0,
+                    PRIMARY KEY (day, user_id)
+                );
+            """)
+            # Table for WhatsApp bans
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS whatsapp_bans (
                     user_id BIGINT PRIMARY KEY
@@ -326,11 +338,49 @@ def load_owner_directory():
              len(USERNAME_POOL), len(WHATSAPP_POOL), len(HANDLE_INDEX), len(PHONE_INDEX))
 
 # =============================
-# QUOTA: per-number per-day
+# QUOTA & USER ACTIVITY
 # =============================
 def _logical_day_today() -> date:
     now = datetime.now(TIMEZONE)
     return (now - timedelta(hours=5, minutes=30)).date()
+
+def _get_user_activity(user_id: int) -> Tuple[int, int]:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT username_requests, whatsapp_requests FROM user_daily_activity WHERE day=%s AND user_id=%s",
+                        (_logical_day_today(), user_id))
+            row = cur.fetchone()
+            return (row[0], row[1]) if row else (0, 0)
+    except Exception as e:
+        log.warning(f"User activity read failed for {user_id}: {e}")
+        return (0, 0)
+    finally:
+        conn.close()
+
+def _increment_user_activity(user_id: int, kind: str):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            if kind == "username":
+                cur.execute("""
+                    INSERT INTO user_daily_activity (day, user_id, username_requests)
+                    VALUES (%s, %s, 1)
+                    ON CONFLICT (day, user_id) DO UPDATE
+                    SET username_requests = user_daily_activity.username_requests + 1;
+                """, (_logical_day_today(), user_id))
+            elif kind == "whatsapp":
+                cur.execute("""
+                    INSERT INTO user_daily_activity (day, user_id, whatsapp_requests)
+                    VALUES (%s, %s, 1)
+                    ON CONFLICT (day, user_id) DO UPDATE
+                    SET whatsapp_requests = user_daily_activity.whatsapp_requests + 1;
+                """, (_logical_day_today(), user_id))
+            conn.commit()
+    except Exception as e:
+        log.warning(f"User activity write failed for {user_id}: {e}")
+    finally:
+        conn.close()
 
 def _wa_get_count(number_norm: str, day: date) -> int:
     conn = get_db_connection()
@@ -813,8 +863,8 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE) -
             "saved_rr_indices": { "username_owner_idx": state["rr"]["username_owner_idx"], "wa_owner_idx": state["rr"]["wa_owner_idx"] }
         }
         save_state()
-        stop_msg = " ហើយនឹងត្រូវបានបញ្ឈប់" if state["priority_queue"]["stop_after"] else ""
-        return f"ជួរអាទិភាពត្រូវបានដំណើរការ៖ អតិថិជន {count} នាក់បន្ទាប់នឹងត្រូវបានបញ្ជូនទៅ {owner_name}{stop_msg}។"
+        stop_msg = " and will be stopped" if state["priority_queue"]["stop_after"] else ""
+        return f"Priority queue activated: Next {count} customers will be directed to {owner_name}{stop_msg}."
 
     # stop/open (owner | username | phone)
     m = STOP_OPEN_RX.match(text)
@@ -999,7 +1049,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE) -
             return f"Cleared pending item '{item_to_clear}' for user {user_name_cleared}."
         else:
             return f"Could not find any user with the pending item '{item_to_clear}'."
-
+            
     m = BAN_WHATSAPP_RX.match(text)
     if m:
         target_name = m.group(1)
@@ -1146,10 +1196,11 @@ async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
         try:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM wa_daily_usage;")
+                cur.execute("DELETE FROM user_daily_activity;")
                 conn.commit()
-                log.info("Cleared daily WhatsApp usage quotas.")
+                log.info("Cleared daily WhatsApp and user activity quotas.")
         except Exception as e:
-            log.error(f"Failed to clear wa_daily_usage table: {e}")
+            log.error(f"Failed to clear daily tables: {e}")
         finally:
             conn.close()
 
@@ -1231,6 +1282,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await db_lock.acquire()
                 _set_issued(uid, chat_id, "username", rec["username"])
                 _log_event("username", "issued", update, rec["username"], owner=rec["owner"])
+                _increment_user_activity(uid, "username")
                 db_lock.release()
             return
 
@@ -1238,6 +1290,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if uid in WHATSAPP_BANNED_USERS:
                 db_lock.release()
                 await msg.chat.send_message("អ្នកត្រូវបានហាមឃាត់ពីការស្នើសុំលេខ WhatsApp ។", reply_to_message_id=msg.message_id)
+                return
+
+            username_count, whatsapp_count = _get_user_activity(uid)
+            has_bonus = username_count > USERNAME_THRESHOLD_FOR_BONUS
+
+            if not has_bonus and whatsapp_count >= USER_WHATSAPP_LIMIT:
+                db_lock.release()
+                await msg.chat.send_message(f"អ្នកបានស្នើសុំ WhatsApp គ្រប់ចំនួនកំណត់សម្រាប់ថ្ងៃនេះហើយ។\nសូមស្នើសុំ username ឱ្យលើសពី {USERNAME_THRESHOLD_FOR_BONUS} ដើម្បីទទួលបានការស្នើសុំ WhatsApp បន្ថែមទៀតដោយគ្មានដែនកំណត់។", reply_to_message_id=msg.message_id)
                 return
 
             rec = await _next_from_whatsapp_pool()
@@ -1255,6 +1315,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _wa_inc_count(_norm_phone(rec["number"]), _logical_day_today())
                 _set_issued(uid, chat_id, "whatsapp", rec["number"])
                 _log_event("whatsapp", "issued", update, rec["number"], owner=rec["owner"])
+                _increment_user_activity(uid, "whatsapp")
                 db_lock.release()
             return
 
