@@ -977,9 +977,17 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE) -
             bucket = _issued_bucket(kind)
             for user_id_str, items in bucket.items():
                 for item in items:
-                    if item.get("value") == item_to_clear:
+                    # Normalize both the item from the user and the stored value for comparison
+                    item_value_norm = item.get("value", "").lower()
+                    if item_to_clear.startswith('@'):
+                        item_to_clear_norm = item_to_clear.lower()
+                    else: # It's a number/ID
+                        item_value_norm = _norm_phone(item_value_norm)
+                        item_to_clear_norm = _norm_phone(item_to_clear)
+
+                    if item_value_norm == item_to_clear_norm:
                         user_id = int(user_id_str)
-                        if _clear_issued(user_id, kind, item_to_clear):
+                        if _clear_issued(user_id, kind, item.get("value")):
                             user_info = state.get("user_names", {}).get(user_id_str, {})
                             user_name_cleared = user_info.get("username") or user_info.get("first_name") or user_id_str
                             cleared = True
@@ -992,23 +1000,52 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE) -
         else:
             return f"Could not find any user with the pending item '{item_to_clear}'."
 
-    m = CLEAR_SPECIFIC_PENDING_RX.match(text)
+    m = BAN_WHATSAPP_RX.match(text)
     if m:
-        item_to_clear, target_name = m.groups()
-        user_id_to_clear = _find_user_id_by_name(target_name)
-        if not user_id_to_clear:
+        target_name = m.group(1)
+        user_id_to_ban = _find_user_id_by_name(target_name)
+        if not user_id_to_ban:
+            return f"User '{target_name}' not found."
+        
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO whatsapp_bans (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id_to_ban,))
+                conn.commit()
+        finally:
+            conn.close()
+        
+        WHATSAPP_BANNED_USERS.add(user_id_to_ban)
+        return f"User {target_name} has been banned from requesting WhatsApp numbers."
+
+    m = UNBAN_WHATSAPP_RX.match(text)
+    if m:
+        target_name = m.group(1)
+        user_id_to_unban = _find_user_id_by_name(target_name)
+        if not user_id_to_unban:
             return f"User '{target_name}' not found."
 
-        cleared = False
-        for kind in ("username", "whatsapp"):
-            if _clear_issued(user_id_to_clear, kind, item_to_clear):
-                cleared = True
-                break
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM whatsapp_bans WHERE user_id = %s", (user_id_to_unban,))
+                conn.commit()
+        finally:
+            conn.close()
+
+        WHATSAPP_BANNED_USERS.discard(user_id_to_unban)
+        return f"User {target_name} has been unbanned from requesting WhatsApp numbers."
+
+    if LIST_BANNED_RX.match(text):
+        if not WHATSAPP_BANNED_USERS:
+            return "No users are currently banned from requesting WhatsApp numbers."
         
-        if cleared:
-            return f"Cleared pending item '{item_to_clear}' for user {target_name}."
-        else:
-            return f"Could not find pending item '{item_to_clear}' for user {target_name}."
+        lines = ["<b>WhatsApp Banned Users:</b>"]
+        for user_id in WHATSAPP_BANNED_USERS:
+            user_info = state.get("user_names", {}).get(str(user_id), {})
+            user_display = user_info.get('username') or user_info.get('first_name') or f"ID: {user_id}"
+            lines.append(f"- {user_display}")
+        return "\n".join(lines)
 
 
     return None
@@ -1168,7 +1205,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 db_lock.release()
                 await msg.chat.send_message(admin_reply, reply_to_message_id=msg.message_id, parse_mode=ParseMode.HTML)
                 return
-            elif any(text.lower().startswith(cmd) for cmd in ['add ', 'delete ', 'list ', 'stop ', 'open ', 'remind ', 'take ', 'clear ']):
+            elif any(text.lower().startswith(cmd) for cmd in ['add ', 'delete ', 'list ', 'stop ', 'open ', 'remind ', 'take ', 'clear ', 'ban ', 'unban ']):
                 db_lock.release()
                 await msg.chat.send_message("I don't recognize that command.", reply_to_message_id=msg.message_id)
                 return
