@@ -527,7 +527,7 @@ PHONE_LIKE_RX         = re.compile(r"^\+?\d[\d\s\-]{6,}\d$")
 LIST_OWNER_ALIAS_RX   = re.compile(r"^\s*list\s+@?(.+?)\s*$", re.IGNORECASE)
 REMIND_ALL_RX         = re.compile(r"^\s*remind\s+user\s*$", re.IGNORECASE)
 TAKE_CUSTOMER_RX      = re.compile(r"^\s*take\s+(\d+)\s+customer(?:s)?\s+to\s+owner\s+@?(.+?)(?:\s+(and\s+stop))?\s*$", re.IGNORECASE)
-CLEAR_PENDING_RX      = re.compile(r"^\s*clear\s+pending\s+@?(\S+)\s*$", re.IGNORECASE)
+CLEAR_PENDING_RX      = re.compile(r"^\s*clear\s+pending\s+(\S+)\s*$", re.IGNORECASE)
 CLEAR_SPECIFIC_PENDING_RX = re.compile(r"^\s*clear\s+pending\s+(\S+)\s+for\s+@?(\S+)\s*$", re.IGNORECASE)
 
 
@@ -945,26 +945,28 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE) -
     
     m = CLEAR_PENDING_RX.match(text)
     if m:
-        target_name = m.group(1)
-        user_id_to_clear = _find_user_id_by_name(target_name)
-        if not user_id_to_clear:
-            return f"User '{target_name}' not found in my records."
-        
-        cleared_count = 0
-        user_id_str = str(user_id_to_clear)
-        if user_id_str in state["issued"]["username"]:
-            cleared_count += len(state["issued"]["username"][user_id_str])
-            state["issued"]["username"].pop(user_id_str, None)
+        item_to_clear = m.group(1)
+        cleared = False
+        user_name_cleared = "unknown user"
 
-        if user_id_str in state["issued"]["whatsapp"]:
-            cleared_count += len(state["issued"]["whatsapp"][user_id_str])
-            state["issued"]["whatsapp"].pop(user_id_str, None)
+        for kind in ("username", "whatsapp"):
+            bucket = _issued_bucket(kind)
+            for user_id_str, items in bucket.items():
+                for item in items:
+                    if item.get("value") == item_to_clear:
+                        user_id = int(user_id_str)
+                        if _clear_issued(user_id, kind, item_to_clear):
+                            user_info = state.get("user_names", {}).get(user_id_str, {})
+                            user_name_cleared = user_info.get("username") or user_info.get("first_name") or user_id_str
+                            cleared = True
+                            break
+            if cleared:
+                break
         
-        if cleared_count > 0:
-            save_state()
-            return f"Cleared {cleared_count} pending items for user {target_name}."
+        if cleared:
+            return f"Cleared pending item '{item_to_clear}' for user {user_name_cleared}."
         else:
-            return f"User {target_name} has no pending items to clear."
+            return f"Could not find any user with the pending item '{item_to_clear}'."
 
     m = CLEAR_SPECIFIC_PENDING_RX.match(text)
     if m:
