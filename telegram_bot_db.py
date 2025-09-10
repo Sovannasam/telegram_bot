@@ -434,7 +434,7 @@ async def _decrement_priority_and_end_if_needed():
     else:
         save_state()
 
-async def _next_from_username_pool(context: ContextTypes.DEFAULT_TYPE) -> Optional[Dict[str, str]]:
+async def _next_from_username_pool() -> Optional[Dict[str, str]]:
     pq = state.get("priority_queue", {})
     if pq.get("active"):
         priority_owner = pq.get("owner")
@@ -447,11 +447,7 @@ async def _next_from_username_pool(context: ContextTypes.DEFAULT_TYPE) -> Option
                     state["rr"]["username_entry_idx"][priority_owner] = (ei + 1) % len(arr)
                     await _decrement_priority_and_end_if_needed()
                     return result
-        log.warning(f"Priority owner {priority_owner} not found in USERNAME_POOL or has no usernames.")
-        await context.bot.send_message(chat_id=context._chat_id, text=f"Warning: Priority owner {priority_owner} has no available usernames. Cancelling priority queue.")
-        state["priority_queue"] = BASE_STATE["priority_queue"]
-        save_state()
-        return None
+        log.warning(f"Priority owner {priority_owner} has no available usernames. Falling back to normal rotation for this request.")
 
     if not USERNAME_POOL: return None
     rr = state["rr"]
@@ -469,7 +465,7 @@ async def _next_from_username_pool(context: ContextTypes.DEFAULT_TYPE) -> Option
         idx = (idx + 1) % len(USERNAME_POOL)
     return None
 
-async def _next_from_whatsapp_pool(context: ContextTypes.DEFAULT_TYPE) -> Optional[Dict[str, str]]:
+async def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
     pq = state.get("priority_queue", {})
     if pq.get("active"):
         priority_owner = pq.get("owner")
@@ -484,11 +480,7 @@ async def _next_from_whatsapp_pool(context: ContextTypes.DEFAULT_TYPE) -> Option
                             state["rr"]["wa_entry_idx"][priority_owner] = ((start + step) + 1) % len(numbers)
                             await _decrement_priority_and_end_if_needed()
                             return {"owner": priority_owner, "number": cand}
-        log.warning(f"Priority owner {priority_owner} not found in WHATSAPP_POOL or has no available numbers.")
-        await context.bot.send_message(chat_id=context._chat_id, text=f"Warning: Priority owner {priority_owner} has no available WhatsApp numbers. Cancelling priority queue.")
-        state["priority_queue"] = BASE_STATE["priority_queue"]
-        save_state()
-        return None
+        log.warning(f"Priority owner {priority_owner} has no available WhatsApp numbers. Falling back to normal rotation for this request.")
 
     if not WHATSAPP_POOL: return None
     rr = state["rr"]
@@ -535,9 +527,8 @@ PHONE_LIKE_RX         = re.compile(r"^\+?\d[\d\s\-]{6,}\d$")
 LIST_OWNER_ALIAS_RX   = re.compile(r"^\s*list\s+@?(.+?)\s*$", re.IGNORECASE)
 REMIND_ALL_RX         = re.compile(r"^\s*remind\s+user\s*$", re.IGNORECASE)
 TAKE_CUSTOMER_RX      = re.compile(r"^\s*take\s+(\d+)\s+customer(?:s)?\s+to\s+owner\s+@?(.+?)(?:\s+(and\s+stop))?\s*$", re.IGNORECASE)
-ADD_CUSTOM_COMMAND_RX = re.compile(r"^\s*add\s+command\s+(!?\S+)\s+(.+)", re.DOTALL)
-DEL_CUSTOM_COMMAND_RX = re.compile(r"^\s*delete\s+command\s+(!?\S+)\s*$")
-LIST_CUSTOM_COMMAND_RX= re.compile(r"^\s*list\s+commands\s*$")
+CLEAR_PENDING_RX      = re.compile(r"^\s*clear\s+pending\s+@?(\S+)\s*$", re.IGNORECASE)
+CLEAR_SPECIFIC_PENDING_RX = re.compile(r"^\s*clear\s+pending\s+(\S+)\s+for\s+@?(\S+)\s*$", re.IGNORECASE)
 
 
 def _looks_like_phone(s: str) -> bool:
@@ -622,16 +613,21 @@ def _set_issued(user_id: int, chat_id: int, kind: str, value: str):
     })
     save_state()
 
-def _clear_issued(user_id: int, kind: str, value_to_clear: str):
+def _clear_issued(user_id: int, kind: str, value_to_clear: str) -> bool:
     bucket = _issued_bucket(kind)
     user_id_str = str(user_id)
     if user_id_str in bucket:
+        original_len = len(bucket[user_id_str])
         bucket[user_id_str] = [
             item for item in bucket[user_id_str] if item.get("value") != value_to_clear
         ]
-        if not bucket[user_id_str]: # remove user if list is empty
+        if not bucket[user_id_str]:
             del bucket[user_id_str]
-        save_state()
+        
+        if len(bucket.get(user_id_str, [])) < original_len:
+            save_state()
+            return True
+    return False
 
 def _value_in_text(value: Optional[str], text: str) -> bool:
     if not value:
@@ -765,6 +761,14 @@ def _find_owner_group(name: str) -> Optional[dict]:
     norm_name = _norm_owner_name(name)
     for group in OWNER_DATA:
         if _norm_owner_name(group["owner"]) == norm_name: return group
+    return None
+
+def _find_user_id_by_name(name: str) -> Optional[int]:
+    norm_name = name.lower().lstrip('@')
+    user_names = state.get("user_names", {})
+    for uid, data in user_names.items():
+        if data.get("username", "").lower() == norm_name or data.get("first_name", "").lower() == norm_name:
+            return int(uid)
     return None
 
 async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
@@ -938,37 +942,48 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE) -
 
     m = REMIND_ALL_RX.match(text)
     if m: return await _send_all_pending_reminders(context)
-
-    m = ADD_CUSTOM_COMMAND_RX.match(text)
+    
+    m = CLEAR_PENDING_RX.match(text)
     if m:
-        trigger, response = m.groups()
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("INSERT INTO custom_commands (trigger, response) VALUES (%s, %s) ON CONFLICT (trigger) DO UPDATE SET response = EXCLUDED.response", (trigger, response))
-                conn.commit()
-        finally: conn.close()
-        CUSTOM_COMMANDS[trigger] = response
-        return f"Command '{trigger}' saved."
+        target_name = m.group(1)
+        user_id_to_clear = _find_user_id_by_name(target_name)
+        if not user_id_to_clear:
+            return f"User '{target_name}' not found in my records."
+        
+        cleared_count = 0
+        user_id_str = str(user_id_to_clear)
+        if user_id_str in state["issued"]["username"]:
+            cleared_count += len(state["issued"]["username"][user_id_str])
+            state["issued"]["username"].pop(user_id_str, None)
 
-    m = DEL_CUSTOM_COMMAND_RX.match(text)
+        if user_id_str in state["issued"]["whatsapp"]:
+            cleared_count += len(state["issued"]["whatsapp"][user_id_str])
+            state["issued"]["whatsapp"].pop(user_id_str, None)
+        
+        if cleared_count > 0:
+            save_state()
+            return f"Cleared {cleared_count} pending items for user {target_name}."
+        else:
+            return f"User {target_name} has no pending items to clear."
+
+    m = CLEAR_SPECIFIC_PENDING_RX.match(text)
     if m:
-        trigger = m.group(1)
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM custom_commands WHERE trigger = %s", (trigger,))
-                conn.commit()
-        finally: conn.close()
-        CUSTOM_COMMANDS.pop(trigger, None)
-        return f"Command '{trigger}' deleted."
+        item_to_clear, target_name = m.groups()
+        user_id_to_clear = _find_user_id_by_name(target_name)
+        if not user_id_to_clear:
+            return f"User '{target_name}' not found."
 
-    if LIST_CUSTOM_COMMAND_RX.match(text):
-        if not CUSTOM_COMMANDS: return "No custom commands configured."
-        lines = ["<b>Custom Commands:</b>"]
-        for trigger, response in CUSTOM_COMMANDS.items():
-            lines.append(f"- <code>{trigger}</code> → {response[:50]}...")
-        return "\n".join(lines)
+        cleared = False
+        for kind in ("username", "whatsapp"):
+            if _clear_issued(user_id_to_clear, kind, item_to_clear):
+                cleared = True
+                break
+        
+        if cleared:
+            return f"Cleared pending item '{item_to_clear}' for user {target_name}."
+        else:
+            return f"Could not find pending item '{item_to_clear}' for user {target_name}."
+
 
     return None
 
@@ -1102,14 +1117,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cache_user_info(update.effective_user)
     
     context._chat_id = chat_id
-    
-    # Check for custom command first, as it's the most common
-    if not _is_admin(update):
-        trigger = text.split(" ")[0]
-        if trigger in CUSTOM_COMMANDS:
-            response = CUSTOM_COMMANDS[trigger]
-            await msg.chat.send_message(response, reply_to_message_id=msg.message_id)
-            return
 
     await db_lock.acquire()
     try:
@@ -1135,7 +1142,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 db_lock.release()
                 await msg.chat.send_message(admin_reply, reply_to_message_id=msg.message_id, parse_mode=ParseMode.HTML)
                 return
-            elif any(text.lower().startswith(cmd) for cmd in ['add ', 'delete ', 'list ', 'stop ', 'open ', 'remind ', 'take ']):
+            elif any(text.lower().startswith(cmd) for cmd in ['add ', 'delete ', 'list ', 'stop ', 'open ', 'remind ', 'take ', 'clear ']):
                 db_lock.release()
                 await msg.chat.send_message("I don't recognize that command.", reply_to_message_id=msg.message_id)
                 return
@@ -1153,7 +1160,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Feeders
         if NEED_USERNAME_RX.match(text):
-            rec = await _next_from_username_pool(context)
+            rec = await _next_from_username_pool()
             reply = "No available username." if not rec else f"@{rec['owner']}\n{rec['username']}"
             db_lock.release()
             await msg.chat.send_message(reply, reply_to_message_id=msg.message_id)
@@ -1165,7 +1172,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if NEED_WHATSAPP_RX.match(text):
-            rec = await _next_from_whatsapp_pool(context)
+            rec = await _next_from_whatsapp_pool()
             reply = "No available WhatsApp."
             if rec:
                  if _wa_quota_reached(rec["number"]):
@@ -1212,7 +1219,6 @@ if __name__ == "__main__":
     load_state()
     _migrate_state_if_needed()
     load_owner_directory()
-    load_custom_commands()
 
     app = Application.builder().token(BOT_TOKEN).build()
     
