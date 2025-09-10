@@ -434,7 +434,7 @@ async def _decrement_priority_and_end_if_needed():
     else:
         save_state()
 
-async def _next_from_username_pool() -> Optional[Dict[str, str]]:
+async def _next_from_username_pool(context: ContextTypes.DEFAULT_TYPE) -> Optional[Dict[str, str]]:
     pq = state.get("priority_queue", {})
     if pq.get("active"):
         priority_owner = pq.get("owner")
@@ -447,7 +447,12 @@ async def _next_from_username_pool() -> Optional[Dict[str, str]]:
                     state["rr"]["username_entry_idx"][priority_owner] = (ei + 1) % len(arr)
                     await _decrement_priority_and_end_if_needed()
                     return result
-    
+        log.warning(f"Priority owner {priority_owner} not found in USERNAME_POOL or has no usernames.")
+        await context.bot.send_message(chat_id=context._chat_id, text=f"Warning: Priority owner {priority_owner} has no available usernames. Cancelling priority queue.")
+        state["priority_queue"] = BASE_STATE["priority_queue"]
+        save_state()
+        return None
+
     if not USERNAME_POOL: return None
     rr = state["rr"]
     idx = rr.get("username_owner_idx", 0) % len(USERNAME_POOL)
@@ -464,7 +469,7 @@ async def _next_from_username_pool() -> Optional[Dict[str, str]]:
         idx = (idx + 1) % len(USERNAME_POOL)
     return None
 
-async def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
+async def _next_from_whatsapp_pool(context: ContextTypes.DEFAULT_TYPE) -> Optional[Dict[str, str]]:
     pq = state.get("priority_queue", {})
     if pq.get("active"):
         priority_owner = pq.get("owner")
@@ -479,7 +484,12 @@ async def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
                             state["rr"]["wa_entry_idx"][priority_owner] = ((start + step) + 1) % len(numbers)
                             await _decrement_priority_and_end_if_needed()
                             return {"owner": priority_owner, "number": cand}
-    
+        log.warning(f"Priority owner {priority_owner} not found in WHATSAPP_POOL or has no available numbers.")
+        await context.bot.send_message(chat_id=context._chat_id, text=f"Warning: Priority owner {priority_owner} has no available WhatsApp numbers. Cancelling priority queue.")
+        state["priority_queue"] = BASE_STATE["priority_queue"]
+        save_state()
+        return None
+
     if not WHATSAPP_POOL: return None
     rr = state["rr"]
     owner_idx = rr.get("wa_owner_idx", 0) % len(WHATSAPP_POOL)
@@ -525,6 +535,9 @@ PHONE_LIKE_RX         = re.compile(r"^\+?\d[\d\s\-]{6,}\d$")
 LIST_OWNER_ALIAS_RX   = re.compile(r"^\s*list\s+@?(.+?)\s*$", re.IGNORECASE)
 REMIND_ALL_RX         = re.compile(r"^\s*remind\s+user\s*$", re.IGNORECASE)
 TAKE_CUSTOMER_RX      = re.compile(r"^\s*take\s+(\d+)\s+customer(?:s)?\s+to\s+owner\s+@?(.+?)(?:\s+(and\s+stop))?\s*$", re.IGNORECASE)
+ADD_CUSTOM_COMMAND_RX = re.compile(r"^\s*add\s+command\s+(!?\S+)\s+(.+)", re.DOTALL)
+DEL_CUSTOM_COMMAND_RX = re.compile(r"^\s*delete\s+command\s+(!?\S+)\s*$")
+LIST_CUSTOM_COMMAND_RX= re.compile(r"^\s*list\s+commands\s*$")
 
 
 def _looks_like_phone(s: str) -> bool:
@@ -926,7 +939,6 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE) -
     m = REMIND_ALL_RX.match(text)
     if m: return await _send_all_pending_reminders(context)
 
-    # Custom commands
     m = ADD_CUSTOM_COMMAND_RX.match(text)
     if m:
         trigger, response = m.groups()
