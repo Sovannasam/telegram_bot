@@ -603,7 +603,8 @@ CLEAR_PENDING_RX      = re.compile(r"^\s*clear\s+pending\s+(.+)\s*$", re.IGNOREC
 BAN_WHATSAPP_RX       = re.compile(r"^\s*ban\s+whatsapp\s+@?(\S+)\s*$", re.IGNORECASE)
 UNBAN_WHATSAPP_RX     = re.compile(r"^\s*unban\s+whatsapp\s+@?(\S+)\s*$", re.IGNORECASE)
 LIST_BANNED_RX        = re.compile(r"^\s*list\s+banned\s*$", re.IGNORECASE)
-
+OWNER_REPORT_RX       = re.compile(r"^\s*owner\s+report(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
+COMMANDS_RX           = re.compile(r"^\s*commands\s*$", re.IGNORECASE)
 
 def _looks_like_phone(s: str) -> bool:
     return bool(PHONE_LIKE_RX.fullmatch((s or "").strip()))
@@ -741,21 +742,42 @@ def _read_log_rows() -> List[dict]:
     finally:
         conn.close()
 
-def _compute_daily_summary(target_day: date) -> List[dict]:
+def _compute_daily_summary(target_day: date) -> Tuple[List[dict], List[dict]]:
+    """
+    Returns:
+      - per-user rows (Summary sheet)
+      - per-owner rows (Owners sheet)
+    """
     rows = _read_log_rows()
     day_rows = [r for r in rows if _logical_day_of(r["ts_local"]) == target_day]
+
     users: Dict[str, dict] = {}
+    owner_stats: Dict[str, dict] = {}
+
     for r in day_rows:
         user_key = r.get("user_first") or r.get("user_username") or str(r.get("user_id"))
         d = users.setdefault(user_key, {"username_issued": [], "username_cleared": [], "wa_issued": [], "wa_cleared": []})
-        kind, action, value, owner = r["kind"], r["action"], r["value"], r.get("owner","")
+        kind, action, value, owner = r["kind"], r["action"], r["value"], (r.get("owner","") or "").lower()
+
         if kind == "username":
-            if action == "issued": d["username_issued"].append((value, owner))
+            if action == "issued": 
+                d["username_issued"].append((value, owner))
+                if owner:
+                    s = owner_stats.setdefault(owner, {"total": 0, "tg": 0, "wa": 0})
+                    s["total"] += 1
+                    s["tg"] += 1
             if action == "cleared": d["username_cleared"].append(value)
         elif kind == "whatsapp":
-            if action == "issued": d["wa_issued"].append((value, owner))
+            if action == "issued": 
+                d["wa_issued"].append((value, owner))
+                if owner:
+                    s = owner_stats.setdefault(owner, {"total": 0, "tg": 0, "wa": 0})
+                    s["total"] += 1
+                    s["wa"] += 1
             if action == "cleared": d["wa_cleared"].append(value)
-    out = []
+
+    # per-user output
+    out_users = []
     for user, d in users.items():
         issued_user_pairs = d["username_issued"]; issued_wa_pairs = d["wa_issued"]
         issued_user_vals  = [v for v, _ in issued_user_pairs]; issued_wa_vals = [v for v, _ in issued_wa_pairs]
@@ -763,26 +785,44 @@ def _compute_daily_summary(target_day: date) -> List[dict]:
         notback_wa = [v for v in issued_wa_vals if v not in d["wa_cleared"]]
         owners_user = sorted({own for (v, own) in issued_user_pairs if v in notback_user and own})
         owners_wa = sorted({own for (v, own) in issued_wa_pairs if v in notback_wa and own})
-        out.append({
+        out_users.append({
             "Day": target_day.isoformat(), "User": str(user),
             "Total username receive": len(issued_user_vals), "Total whatsapp receive": len(issued_wa_vals),
             "Total username provide back": len(d["username_cleared"]), "Total whatsapp provide back": len(d["wa_cleared"]),
-            "Username not provide back": ", ".join(notback_user), "Owner of username": ", ".join(owners_user),
-            "Whatsapp not provide back": ", ".join(notback_wa), "Owner of whatsapp": ", ".join(owners_wa),
+            "Username not provide back": ", ".join(notback_user), "Owner of username": ", ".join(('@'+o) for o in owners_user),
+            "Whatsapp not provide back": ", ".join(notback_wa), "Owner of whatsapp": ", ".join(('@'+o) for o in owners_wa),
         })
-    out.sort(key=lambda r: r["User"].lower())
-    return out
+    out_users.sort(key=lambda r: r["User"].lower())
 
-def _style_and_save_excel(rows: List[dict]) -> io.BytesIO:
+    # per-owner output
+    out_owners = []
+    for owner, s in sorted(owner_stats.items(), key=lambda kv: kv[0]):
+        out_owners.append({
+            "Day": target_day.isoformat(),
+            "Owner": f"@{owner}",
+            "Customers total": s["total"],
+            "Customers via Telegram": s["tg"],
+            "Customers via WhatsApp": s["wa"],
+        })
+    return out_users, out_owners
+
+def _style_and_save_excel(user_rows: List[dict], owner_rows: List[dict]) -> io.BytesIO:
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
     except ImportError:
         raise RuntimeError("openpyxl not installed. Please add it to requirements.txt")
 
-    headers = ["Day","User","Total username receive","Total whatsapp receive","Total username provide back","Total whatsapp provide back", "Username not provide back","Owner of username","Whatsapp not provide back","Owner of whatsapp"]
-    wb = Workbook(); ws = wb.active; ws.title = "Summary"; ws.append(headers)
-    for r in rows: ws.append([r.get(h, "") for h in headers])
+    wb = Workbook()
+
+    # Sheet 1: Summary
+    ws = wb.active; ws.title = "Summary"
+    headers = ["Day","User","Total username receive","Total whatsapp receive","Total username provide back",
+               "Total whatsapp provide back","Username not provide back","Owner of username",
+               "Whatsapp not provide back","Owner of whatsapp"]
+    ws.append(headers)
+    for r in user_rows: ws.append([r.get(h, "") for h in headers])
+
     header_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True, size=11)
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -796,18 +836,33 @@ def _style_and_save_excel(rows: List[dict]) -> io.BytesIO:
         for c in col:
             if c.value: max_len = max(max_len, len(str(c.value)))
         ws.column_dimensions[letter].width = min(max_len + 2, 60)
-    
+
+    # Sheet 2: Owners
+    ws2 = wb.create_sheet("Owners")
+    headers2 = ["Day","Owner","Customers total","Customers via Telegram","Customers via WhatsApp"]
+    ws2.append(headers2)
+    for r in owner_rows: ws2.append([r.get(h, "") for h in headers2])
+    for cell in ws2[1]: cell.fill = header_fill; cell.font = header_font; cell.alignment = center; cell.border = border
+    for i, row in enumerate(ws2.iter_rows(min_row=2, max_row=ws2.max_row, max_col=ws2.max_column), start=2):
+        fill = PatternFill(start_color="F2F2F2" if i % 2 == 0 else "FFFFFF", fill_type="solid")
+        for cell in row: cell.alignment = center; cell.border = border; cell.fill = fill
+    for col in ws2.columns:
+        max_len = 0; letter = col[0].column_letter
+        for c in col:
+            if c.value: max_len = max(max_len, len(str(c.value)))
+        ws2.column_dimensions[letter].width = min(max_len + 2, 40)
+
     excel_buffer = io.BytesIO()
     wb.save(excel_buffer)
     excel_buffer.seek(0)
     return excel_buffer
 
 def _get_daily_excel_report(target_day: date) -> Tuple[Optional[str], Optional[io.BytesIO]]:
-    rows = _compute_daily_summary(target_day)
-    if not rows: return ("No data for that day.", None)
-    
+    user_rows, owner_rows = _compute_daily_summary(target_day)
+    if not user_rows and not owner_rows:
+        return ("No data for that day.", None)
     try:
-        excel_buffer = _style_and_save_excel(rows)
+        excel_buffer = _style_and_save_excel(user_rows, owner_rows)
         return (None, excel_buffer)
     except Exception as e:
         log.error("Failed to generate Excel report in memory: %s", e)
@@ -845,7 +900,7 @@ def _find_user_id_by_name(name: str) -> Optional[int]:
             return int(uid)
     return None
 
-async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, update: Update) -> Optional[str]:
     # take customer command
     m = TAKE_CUSTOMER_RX.match(text)
     if m:
@@ -1096,6 +1151,18 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE) -
             user_display = user_info.get('username') or user_info.get('first_name') or f"ID: {user_id}"
             lines.append(f"- {user_display}")
         return "\n".join(lines)
+    
+    m = OWNER_REPORT_RX.match(text)
+    if m:
+        target_day = _parse_report_day(m.group(1))
+        _, owner_rows = _compute_daily_summary(target_day)
+        if not owner_rows:
+            return f"No owner activity found for {target_day.isoformat()}."
+        
+        lines = [f"<b>Owner Performance for {target_day.isoformat()}:</b>"]
+        for row in owner_rows:
+            lines.append(f"- <b>{row['Owner']}</b>: {row['Customers total']} total ({row['Customers via Telegram']} usernames, {row['Customers via WhatsApp']} whatsapps)")
+        return "\n".join(lines)
 
 
     return None
@@ -1251,12 +1318,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Admin: Console
         if _is_admin(update):
-            admin_reply = await _handle_admin_command(text, context)
+            admin_reply = await _handle_admin_command(text, context, update)
             if admin_reply:
                 db_lock.release()
                 await msg.chat.send_message(admin_reply, reply_to_message_id=msg.message_id, parse_mode=ParseMode.HTML)
                 return
-            elif any(text.lower().startswith(cmd) for cmd in ['add ', 'delete ', 'list ', 'stop ', 'open ', 'remind ', 'take ', 'clear ', 'ban ', 'unban ']):
+            elif any(text.lower().startswith(cmd) for cmd in ['add ', 'delete ', 'list ', 'stop ', 'open ', 'remind ', 'take ', 'clear ', 'ban ', 'unban ', '+']):
                 db_lock.release()
                 await msg.chat.send_message("I don't recognize that command.", reply_to_message_id=msg.message_id)
                 return
