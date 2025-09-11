@@ -603,6 +603,7 @@ CLEAR_PENDING_RX      = re.compile(r"^\s*clear\s+pending\s+(.+)\s*$", re.IGNOREC
 BAN_WHATSAPP_RX       = re.compile(r"^\s*ban\s+whatsapp\s+@?(\S+)\s*$", re.IGNORECASE)
 UNBAN_WHATSAPP_RX     = re.compile(r"^\s*unban\s+whatsapp\s+@?(\S+)\s*$", re.IGNORECASE)
 LIST_BANNED_RX        = re.compile(r"^\s*list\s+banned\s*$", re.IGNORECASE)
+OWNER_REPORT_RX       = re.compile(r"^\s*owner\s+report(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 COMMANDS_RX           = re.compile(r"^\s*commands\s*$", re.IGNORECASE)
 
 def _looks_like_phone(s: str) -> bool:
@@ -1209,16 +1210,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     if COMMANDS_RX.match(text):
         command_list_text = _get_commands_text()
-        try:
-            await context.bot.send_message(
-                chat_id=update.effective_user.id,
-                text=command_list_text,
-                parse_mode=ParseMode.HTML
-            )
-            return "A list of all commands has been sent to your private chat."
-        except Exception as e:
-            log.error(f"Failed to send command list to admin: {e}")
-            return "I couldn't send you a private message. Have you started a chat with me?"
+        return command_list_text # Return text to be sent by on_message
 
 
     return None
