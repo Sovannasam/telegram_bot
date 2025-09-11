@@ -151,7 +151,7 @@ def load_whatsapp_bans():
                 WHATSAPP_BANNED_USERS.add(row[0])
         log.info(f"Loaded {len(WHATSAPP_BANNED_USERS)} WhatsApp bans from database.")
     except Exception as e:
-        log.error(f"Failed to load WhatsApp bans from DB: {e}")
+        log.error(f"Failed to load WhatsApp bans from DB: %s", e)
     finally:
         conn.close()
 
@@ -603,7 +603,6 @@ CLEAR_PENDING_RX      = re.compile(r"^\s*clear\s+pending\s+(.+)\s*$", re.IGNOREC
 BAN_WHATSAPP_RX       = re.compile(r"^\s*ban\s+whatsapp\s+@?(\S+)\s*$", re.IGNORECASE)
 UNBAN_WHATSAPP_RX     = re.compile(r"^\s*unban\s+whatsapp\s+@?(\S+)\s*$", re.IGNORECASE)
 LIST_BANNED_RX        = re.compile(r"^\s*list\s+banned\s*$", re.IGNORECASE)
-OWNER_REPORT_RX       = re.compile(r"^\s*owner\s+report(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 COMMANDS_RX           = re.compile(r"^\s*commands\s*$", re.IGNORECASE)
 
 def _looks_like_phone(s: str) -> bool:
@@ -899,6 +898,50 @@ def _find_user_id_by_name(name: str) -> Optional[int]:
         if data.get("username", "").lower() == norm_name or data.get("first_name", "").lower() == norm_name:
             return int(uid)
     return None
+    
+def _get_commands_text() -> str:
+    return """
+<b>Bot Command List</b>
+
+<b>--- User Commands ---</b>
+<code>i need username</code> - Request a username.
+<code>i need whatsapp</code> - Request a WhatsApp number.
+<code>who's using @item</code> - Check the owner of an item.
+
+<b>--- Admin: Owner & Item Management ---</b>
+<code>add owner @owner</code>
+<code>delete owner @owner</code>
+<code>add username @user to @owner</code>
+<code>delete username @user</code>
+<code>add whatsapp +123... to @owner</code>
+<code>delete whatsapp +123...</code>
+
+<b>--- Admin: Availability Control ---</b>
+<code>stop @owner/@user/+123...</code>
+<code>open @owner/@user/+123...</code>
+<code>stop all usernames</code>
+<code>open all usernames</code>
+<code>stop all whatsapp</code>
+<code>open all whatsapp</code>
+
+<b>--- Admin: Priority & User Management ---</b>
+<code>take 5 customer to owner @owner</code>
+<code>take 5 customer to owner @owner and stop</code>
+<code>ban whatsapp @user</code>
+<code>unban whatsapp @user</code>
+<code>list banned</code>
+
+<b>--- Admin: Reports & Manual Actions ---</b>
+<code>report [today|yesterday|YYYY-MM-DD]</code>
+<code>owner report [today|yesterday|YYYY-MM-DD]</code>
+<code>remind user</code>
+<code>clear pending @item_or_number</code>
+
+<b>--- Admin: Viewing Information ---</b>
+<code>list owners</code>
+<code>list disabled</code>
+<code>list @owner</code>
+"""
 
 async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, update: Update) -> Optional[str]:
     # take customer command
@@ -1164,6 +1207,19 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
             lines.append(f"- <b>{row['Owner']}</b>: {row['Customers total']} total ({row['Customers via Telegram']} usernames, {row['Customers via WhatsApp']} whatsapps)")
         return "\n".join(lines)
 
+    if COMMANDS_RX.match(text):
+        command_list_text = _get_commands_text()
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=command_list_text,
+                parse_mode=ParseMode.HTML
+            )
+            return "A list of all commands has been sent to your private chat."
+        except Exception as e:
+            log.error(f"Failed to send command list to admin: {e}")
+            return "I couldn't send you a private message. Have you started a chat with me?"
+
 
     return None
 
@@ -1323,7 +1379,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 db_lock.release()
                 await msg.chat.send_message(admin_reply, reply_to_message_id=msg.message_id, parse_mode=ParseMode.HTML)
                 return
-            elif any(text.lower().startswith(cmd) for cmd in ['add ', 'delete ', 'list ', 'stop ', 'open ', 'remind ', 'take ', 'clear ', 'ban ', 'unban ', '+']):
+            elif any(text.lower().startswith(cmd) for cmd in ['add ', 'delete ', 'list ', 'stop ', 'open ', 'remind ', 'take ', 'clear ', 'ban ', 'unban ', '+', 'owner report', 'commands']):
                 db_lock.release()
                 await msg.chat.send_message("I don't recognize that command.", reply_to_message_id=msg.message_id)
                 return
