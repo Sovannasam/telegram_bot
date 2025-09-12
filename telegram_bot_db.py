@@ -40,7 +40,7 @@ BOT_TOKEN = get_env_variable("BOT_TOKEN")
 DATABASE_URL = get_env_variable("DATABASE_URL")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "excelmerge")  # telegram username (without @)
 WA_DAILY_LIMIT = int(os.getenv("WA_DAILY_LIMIT", "2"))      # max sends per number per logical day
-REMINDER_DELAY_MINUTES = int(os.getenv("REMINDER_DELAY_MINUTES", "30")) # Delay for reminders
+REMINDER_DELAY_MINUTES = int(os.getenv("REMINDER_DELAY_MINUTES", "15")) # Delay for reminders
 USER_WHATSAPP_LIMIT = int(os.getenv("USER_WHATSAPP_LIMIT", "10"))
 USERNAME_THRESHOLD_FOR_BONUS = int(os.getenv("USERNAME_THRESHOLD_FOR_BONUS", "35"))
 
@@ -1233,11 +1233,18 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             bucket = _issued_bucket(kind)
             for user_id_str, items in list(bucket.items()):
                 for item in list(items): # Iterate over a copy
-                    if item.get("reminder_sent"):
-                        continue
                     try:
-                        issue_ts = datetime.fromisoformat(item["ts"])
-                        if (now - issue_ts) > timedelta(minutes=REMINDER_DELAY_MINUTES):
+                        # Determine the base timestamp for the next reminder check
+                        last_reminder_ts_str = item.get("last_reminder_ts")
+                        
+                        # The base time is the last reminder time, or the initial issue time if no reminder has been sent yet.
+                        if last_reminder_ts_str:
+                            base_ts = datetime.fromisoformat(last_reminder_ts_str)
+                        else:
+                            base_ts = datetime.fromisoformat(item["ts"])
+
+                        # Check if the configured delay has passed since the last event (issue or reminder)
+                        if (now - base_ts) > timedelta(minutes=REMINDER_DELAY_MINUTES):
                             user_id = int(user_id_str)
                             chat_id = item.get("chat_id")
                             value = item.get("value")
@@ -1248,11 +1255,15 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                                     f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ {label} {value} ដែលអ្នកបានស្នើសុំ។"
                                 )
                                 reminders_to_send.append({'chat_id': chat_id, 'text': reminder_text})
-                                item["reminder_sent"] = True
+                                
+                                # Update the timestamp of the last reminder sent to now
+                                item["last_reminder_ts"] = now.isoformat()
+                                # We no longer need the old flag, so remove it for cleanup
+                                item.pop("reminder_sent", None) 
                                 state_changed = True
-                                log.info(f"Queued reminder for user {user_id} for {kind} in chat {chat_id}")
+                                log.info(f"Queued recurring reminder for user {user_id} for {kind} '{value}' in chat {chat_id}")
                     except Exception as e:
-                        log.error(f"Error processing reminder for user {user_id_str}: {e}")
+                        log.error(f"Error processing recurring reminder for user {user_id_str}: {e}")
         
         if state_changed:
             await save_state()
@@ -1261,7 +1272,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(chat_id=r['chat_id'], text=r['text'], parse_mode=ParseMode.HTML)
         except Exception as e:
-            log.error(f"Failed to send reminder to chat {r['chat_id']}: {e}")
+            log.error(f"Failed to send recurring reminder to chat {r['chat_id']}: {e}")
 
 
 async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
@@ -1427,3 +1438,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
