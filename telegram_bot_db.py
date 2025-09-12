@@ -45,6 +45,7 @@ USER_WHATSAPP_LIMIT = int(os.getenv("USER_WHATSAPP_LIMIT", "10"))
 USERNAME_THRESHOLD_FOR_BONUS = int(os.getenv("USERNAME_THRESHOLD_FOR_BONUS", "35"))
 REQUEST_GROUP_ID = int(os.getenv("REQUEST_GROUP_ID", "-1002438185636")) # Group for 'i need ...' commands
 CLEARING_GROUP_ID = int(os.getenv("CLEARING_GROUP_ID", "-1002624324856")) # Group for auto-clearing pendings
+OWNER_CONFIRM_GROUP_ID = int(os.getenv("OWNER_CONFIRM_GROUP_ID", "-1002694540582")) # Group for owner +1 confirmations
 
 # Whitelist of allowed countries (lowercase for case-insensitive matching)
 ALLOWED_COUNTRIES = {
@@ -132,6 +133,11 @@ async def setup_database():
                 whatsapp_requests INTEGER DEFAULT 0,
                 PRIMARY KEY (day, user_id)
             );
+        """)
+        # Add the new column for tracking successful adds if it doesn't exist
+        await conn.execute("""
+            ALTER TABLE user_daily_activity
+            ADD COLUMN IF NOT EXISTS successful_adds INTEGER DEFAULT 0;
         """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS whatsapp_bans (
@@ -363,18 +369,18 @@ def _logical_day_today() -> date:
     now = datetime.now(TIMEZONE)
     return (now - timedelta(hours=5, minutes=30)).date()
 
-async def _get_user_activity(user_id: int) -> Tuple[int, int]:
+async def _get_user_activity(user_id: int) -> Tuple[int, int, int]:
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT username_requests, whatsapp_requests FROM user_daily_activity WHERE day=$1 AND user_id=$2",
+                "SELECT username_requests, whatsapp_requests, successful_adds FROM user_daily_activity WHERE day=$1 AND user_id=$2",
                 _logical_day_today(), user_id
             )
-            return (row['username_requests'], row['whatsapp_requests']) if row else (0, 0)
+            return (row['username_requests'], row['whatsapp_requests'], row['successful_adds']) if row else (0, 0, 0)
     except Exception as e:
         log.warning(f"User activity read failed for {user_id}: {e}")
-        return (0, 0)
+        return (0, 0, 0)
 
 async def _increment_user_activity(user_id: int, kind: str):
     try:
@@ -396,6 +402,21 @@ async def _increment_user_activity(user_id: int, kind: str):
                 """, _logical_day_today(), user_id)
     except Exception as e:
         log.warning(f"User activity write failed for {user_id}: {e}")
+
+async def _increment_successful_adds(user_id: int):
+    """Increments the successful_adds counter for a user for the current day."""
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO user_daily_activity (day, user_id, successful_adds)
+                VALUES ($1, $2, 1)
+                ON CONFLICT (day, user_id) DO UPDATE
+                SET successful_adds = user_daily_activity.successful_adds + 1;
+            """, _logical_day_today(), user_id)
+        log.info(f"Incremented successful adds for user {user_id}")
+    except Exception as e:
+        log.warning(f"Successful adds write failed for user {user_id}: {e}")
 
 async def _wa_get_count(number_norm: str, day: date) -> int:
     try:
@@ -618,6 +639,7 @@ OWNER_REPORT_RX       = re.compile(r"^\s*owner\s+report(?:\s+(yesterday|today|\d
 COMMANDS_RX           = re.compile(r"^\s*commands\s*$", re.IGNORECASE)
 MY_DETAIL_RX          = re.compile(r"^\s*my\s+detail\s*$", re.IGNORECASE)
 DETAIL_USER_RX        = re.compile(r"^\s*detail\s+@?(\S+)\s*$", re.IGNORECASE)
+OWNER_CONFIRMATION_RX = re.compile(r"(.+?)\s*\+1\s*@(\S+)", re.IGNORECASE)
 
 
 def _looks_like_phone(s: str) -> bool:
@@ -804,7 +826,7 @@ async def _get_user_detail_text(user_id: int) -> str:
         user_display = f"@{user_display}"
 
     # Get today's request counts from the database
-    username_reqs, whatsapp_reqs = await _get_user_activity(user_id)
+    username_reqs, whatsapp_reqs, successful_adds = await _get_user_activity(user_id)
 
     # Get pending items from the current state
     pending_usernames = [item['value'] for item in _issued_bucket("username").get(str(user_id), [])]
@@ -812,8 +834,9 @@ async def _get_user_detail_text(user_id: int) -> str:
 
     # Build the response message
     lines = [f"<b>📊 Daily Detail for {user_display}</b>"]
-    lines.append(f"<b>- Usernames Received Today:</b> {username_reqs}")
-    lines.append(f"<b>- WhatsApps Received Today:</b> {whatsapp_reqs}")
+    lines.append(f"<b>- Usernames Received:</b> {username_reqs}")
+    lines.append(f"<b>- WhatsApps Received:</b> {whatsapp_reqs}")
+    lines.append(f"<b>- Customers Added Successfully:</b> {successful_adds}")
     lines.append("") # Spacer
 
     if pending_usernames:
@@ -1001,10 +1024,15 @@ def _find_owner_group(name: str) -> Optional[dict]:
     return None
 
 def _find_user_id_by_name(name: str) -> Optional[int]:
-    norm_name = name.lower().lstrip('@')
+    # Normalize name: remove leading @, lowercase, and strip whitespace
+    norm_name = name.lower().lstrip('@').strip()
     user_names = state.get("user_names", {})
     for uid, data in user_names.items():
-        if data.get("username", "").lower() == norm_name or data.get("first_name", "").lower() == norm_name:
+        # Check against stored username (if it exists)
+        if data.get("username", "").lower() == norm_name:
+            return int(uid)
+        # Check against stored first name
+        if data.get("first_name", "").lower() == norm_name:
             return int(uid)
     return None
     
@@ -1500,7 +1528,22 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if _value_in_text(pending_value, text):
                         values_found_in_message.add(pending_value)
 
-        # If the message is in the clearing group and contains a pending item, apply filters.
+        # OWNER CONFIRMATION LOGIC - Only in the owner confirmation group
+        if chat_id == OWNER_CONFIRM_GROUP_ID:
+            owner_confirm_match = OWNER_CONFIRMATION_RX.match(text)
+            sender_username = (update.effective_user.username or "").lower()
+            all_owners = {_norm_owner_name(o['owner']) for o in OWNER_DATA}
+
+            if sender_username in all_owners and owner_confirm_match:
+                customer_name, customer_id_str = owner_confirm_match.groups()
+                customer_user_id = _find_user_id_by_name(customer_name)
+                if customer_user_id:
+                    await _increment_successful_adds(customer_user_id)
+                else:
+                    log.warning(f"Owner {sender_username} confirmed customer '{customer_name}', but user could not be found.")
+                return # End processing for this group
+
+        # USER AUTO-CLEARING LOGIC - Only in the clearing group
         if chat_id == CLEARING_GROUP_ID and values_found_in_message:
             found_country, country_status = _find_country_in_text(text)
             age = _find_age_in_text(text)
@@ -1521,29 +1564,23 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         rejection_reason = f"Age {age} for India is not allowed (must be > 30)."
             
             if not is_allowed:
-                # Get the first item that triggered the check to use in the reply
                 first_offending_value = next(iter(values_found_in_message))
                 item_type = "username" if first_offending_value.startswith('@') else "whatsapp"
-
-                # Construct the detailed rejection message
                 mention = mention_user_html(uid)
                 reply_text = (
                     f"{mention}, this country is not allowed. Please use that {item_type} "
                     f"(<code>{first_offending_value}</code>) to give to another customer."
                 )
-
                 await msg.reply_html(reply_text)
                 log.warning(f"Rejected post from user {uid}. Reason: {rejection_reason}. Told user to reuse item.")
-                return # Stop processing, do not clear the item.
+                return
             else:
                 # If allowed, proceed to clear
                 for kind in ("username", "whatsapp"):
-                    # The value_to_clear must come from the set we already identified
                     for value_to_clear in values_found_in_message:
                          if await _clear_one_issued(uid, kind, value_to_clear):
                             await _log_event(kind, "cleared", update, value_to_clear, owner="")
                             log.info(f"Auto-cleared ONE pending {kind} for user {uid}: {value_to_clear}")
-
 
         # Feeders - ONLY in the designated request group
         if chat_id == REQUEST_GROUP_ID:
@@ -1562,7 +1599,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await msg.reply_text("អ្នកត្រូវបានហាមឃាត់ពីការស្នើសុំលេខ WhatsApp ។")
                     return
 
-                username_count, whatsapp_count = await _get_user_activity(uid)
+                username_count, whatsapp_count, _ = await _get_user_activity(uid)
                 has_bonus = username_count > USERNAME_THRESHOLD_FOR_BONUS
 
                 if not has_bonus and whatsapp_count >= USER_WHATSAPP_LIMIT:
