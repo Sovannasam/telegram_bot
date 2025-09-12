@@ -10,8 +10,7 @@ import re
 import io
 
 import pytz
-import psycopg2
-import psycopg2.extras
+import asyncpg
 from telegram import Update
 from telegram.constants import ChatType, ParseMode
 from telegram.ext import Application, ContextTypes, MessageHandler, filters, JobQueue
@@ -51,73 +50,72 @@ TIMEZONE = pytz.timezone("Asia/Phnom_Penh")
 # DATABASE SETUP & HELPERS
 # =============================
 db_lock = asyncio.Lock()
+DB_POOL: Optional[asyncpg.Pool] = None
 
-def get_db_connection():
-    try:
-        return psycopg2.connect(DATABASE_URL)
-    except psycopg2.OperationalError as e:
-        log.error("Could not connect to database: %s", e)
-        raise
+async def get_db_pool() -> asyncpg.Pool:
+    global DB_POOL
+    if DB_POOL is None:
+        try:
+            DB_POOL = await asyncpg.create_pool(dsn=DATABASE_URL)
+            if DB_POOL is None: # create_pool can return None on failure
+                 raise ConnectionError("Database pool initialization failed.")
+            log.info("Database connection pool established.")
+        except Exception as e:
+            log.error(f"Could not create database connection pool: {e}")
+            raise
+    return DB_POOL
 
-def setup_database():
+async def setup_database():
     log.info("Setting up database schema...")
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            # KV store
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS kv_storage (
-                    key TEXT PRIMARY KEY,
-                    data JSONB NOT NULL,
-                    updated_at TIMESTAMPTZ DEFAULT NOW()
-                );
-            """)
-            # Audit log
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS audit_log (
-                    id SERIAL PRIMARY KEY,
-                    ts_local TIMESTAMPTZ NOT NULL,
-                    chat_id BIGINT,
-                    message_id BIGINT,
-                    user_id BIGINT,
-                    user_first TEXT,
-                    user_username TEXT,
-                    kind TEXT,
-                    action TEXT,
-                    value TEXT,
-                    owner TEXT
-                );
-            """)
-            # Daily quota per WhatsApp number
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS wa_daily_usage (
-                    day DATE NOT NULL,
-                    number_norm TEXT NOT NULL,
-                    sent_count INTEGER NOT NULL DEFAULT 0,
-                    last_sent TIMESTAMPTZ,
-                    PRIMARY KEY (day, number_norm)
-                );
-            """)
-            # Per-user daily request counts
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS user_daily_activity (
-                    day DATE NOT NULL,
-                    user_id BIGINT NOT NULL,
-                    username_requests INTEGER DEFAULT 0,
-                    whatsapp_requests INTEGER DEFAULT 0,
-                    PRIMARY KEY (day, user_id)
-                );
-            """)
-            # Table for WhatsApp bans
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS whatsapp_bans (
-                    user_id BIGINT PRIMARY KEY
-                );
-            """)
-            conn.commit()
-        log.info("Database schema is ready.")
-    finally:
-        conn.close()
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS kv_storage (
+                key TEXT PRIMARY KEY,
+                data JSONB NOT NULL,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id SERIAL PRIMARY KEY,
+                ts_local TIMESTAMPTZ NOT NULL,
+                chat_id BIGINT,
+                message_id BIGINT,
+                user_id BIGINT,
+                user_first TEXT,
+                user_username TEXT,
+                kind TEXT,
+                action TEXT,
+                value TEXT,
+                owner TEXT
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS wa_daily_usage (
+                day DATE NOT NULL,
+                number_norm TEXT NOT NULL,
+                sent_count INTEGER NOT NULL DEFAULT 0,
+                last_sent TIMESTAMPTZ,
+                PRIMARY KEY (day, number_norm)
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_daily_activity (
+                day DATE NOT NULL,
+                user_id BIGINT NOT NULL,
+                username_requests INTEGER DEFAULT 0,
+                whatsapp_requests INTEGER DEFAULT 0,
+                PRIMARY KEY (day, user_id)
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS whatsapp_bans (
+                user_id BIGINT PRIMARY KEY
+            );
+        """)
+    log.info("Database schema is ready.")
+
 
 # =============================
 # STATE (DB-backed)
@@ -140,39 +138,34 @@ BASE_STATE = {
 state: Dict = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
 WHATSAPP_BANNED_USERS: set[int] = set()
 
-def load_whatsapp_bans():
+async def load_whatsapp_bans():
     global WHATSAPP_BANNED_USERS
     WHATSAPP_BANNED_USERS = set()
-    conn = get_db_connection()
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT user_id FROM whatsapp_bans")
-            for row in cur.fetchall():
-                WHATSAPP_BANNED_USERS.add(row[0])
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT user_id FROM whatsapp_bans")
+            for row in rows:
+                WHATSAPP_BANNED_USERS.add(row['user_id'])
         log.info(f"Loaded {len(WHATSAPP_BANNED_USERS)} WhatsApp bans from database.")
     except Exception as e:
         log.error(f"Failed to load WhatsApp bans from DB: %s", e)
-    finally:
-        conn.close()
 
-def load_state():
+async def load_state():
     global state
-    conn = get_db_connection()
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT data FROM kv_storage WHERE key = 'state'")
-            result = cur.fetchone()
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            result = await conn.fetchval("SELECT data FROM kv_storage WHERE key = 'state'")
             if result:
-                loaded = result[0]
+                loaded = dict(result)
                 state = {**BASE_STATE, **loaded}
                 log.info("Bot state loaded from database.")
             else:
                 state = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
-                save_state()
+                await save_state()
     except Exception as e:
         log.warning("Failed to load state from DB: %s", e)
-    finally:
-        conn.close()
 
     state.setdefault("rr", {}).setdefault("username_entry_idx", {})
     state["rr"].setdefault("wa_entry_idx", {})
@@ -181,23 +174,21 @@ def load_state():
     state.setdefault("priority_queue", BASE_STATE["priority_queue"])
 
 
-def save_state():
-    conn = get_db_connection()
+async def save_state():
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
                 INSERT INTO kv_storage (key, data)
-                VALUES ('state', %s)
+                VALUES ('state', $1)
                 ON CONFLICT (key) DO UPDATE
                 SET data = EXCLUDED.data, updated_at = NOW();
-            """, (json.dumps(state),))
-            conn.commit()
+            """, json.dumps(state))
     except Exception as e:
         log.warning("Failed to save state to DB: %s", e)
-    finally:
-        conn.close()
 
-def _migrate_state_if_needed():
+
+async def _migrate_state_if_needed():
     """Ensure the 'issued' structure uses lists for multi-item tracking."""
     log.info("Checking state structure for migration...")
     state_was_changed = False
@@ -212,7 +203,7 @@ def _migrate_state_if_needed():
     
     if state_was_changed:
         log.info("State structure was migrated. Saving new format to database.")
-        save_state()
+        await save_state()
     else:
         log.info("State structure is already up-to-date.")
 
@@ -272,38 +263,32 @@ def _ensure_owner_shape(g: dict) -> dict:
     g["whatsapp"] = norm_wa
     return g
 
-def save_owner_directory():
-    conn = get_db_connection()
+async def save_owner_directory():
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
                 INSERT INTO kv_storage (key, data)
-                VALUES ('owners', %s)
+                VALUES ('owners', $1)
                 ON CONFLICT (key) DO UPDATE
                 SET data = EXCLUDED.data, updated_at = NOW();
-            """, (json.dumps(OWNER_DATA),))
-            conn.commit()
+            """, json.dumps(OWNER_DATA))
     except Exception as e:
         log.error("Failed to save owner directory to DB: %s", e)
-    finally:
-        conn.close()
 
-def load_owner_directory():
+async def load_owner_directory():
     global OWNER_DATA, HANDLE_INDEX, PHONE_INDEX, USERNAME_POOL, WHATSAPP_POOL
     OWNER_DATA, HANDLE_INDEX, PHONE_INDEX = [], {}, {}
     USERNAME_POOL, WHATSAPP_POOL = [], []
 
-    conn = get_db_connection()
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT data FROM kv_storage WHERE key = 'owners'")
-            result = cur.fetchone()
-            OWNER_DATA = (result[0] or []) if result else []
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            result = await conn.fetchval("SELECT data FROM kv_storage WHERE key = 'owners'")
+            OWNER_DATA = (dict(result) or []) if result else []
     except Exception as e:
         log.error("Failed to load owners from DB: %s", e)
         OWNER_DATA = []
-    finally:
-        conn.close()
 
     OWNER_DATA = [_ensure_owner_shape(dict(g)) for g in OWNER_DATA]
 
@@ -344,78 +329,70 @@ def _logical_day_today() -> date:
     now = datetime.now(TIMEZONE)
     return (now - timedelta(hours=5, minutes=30)).date()
 
-def _get_user_activity(user_id: int) -> Tuple[int, int]:
-    conn = get_db_connection()
+async def _get_user_activity(user_id: int) -> Tuple[int, int]:
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT username_requests, whatsapp_requests FROM user_daily_activity WHERE day=%s AND user_id=%s",
-                        (_logical_day_today(), user_id))
-            row = cur.fetchone()
-            return (row[0], row[1]) if row else (0, 0)
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT username_requests, whatsapp_requests FROM user_daily_activity WHERE day=$1 AND user_id=$2",
+                _logical_day_today(), user_id
+            )
+            return (row['username_requests'], row['whatsapp_requests']) if row else (0, 0)
     except Exception as e:
         log.warning(f"User activity read failed for {user_id}: {e}")
         return (0, 0)
-    finally:
-        conn.close()
 
-def _increment_user_activity(user_id: int, kind: str):
-    conn = get_db_connection()
+async def _increment_user_activity(user_id: int, kind: str):
     try:
-        with conn.cursor() as cur:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
             if kind == "username":
-                cur.execute("""
+                await conn.execute("""
                     INSERT INTO user_daily_activity (day, user_id, username_requests)
-                    VALUES (%s, %s, 1)
+                    VALUES ($1, $2, 1)
                     ON CONFLICT (day, user_id) DO UPDATE
                     SET username_requests = user_daily_activity.username_requests + 1;
-                """, (_logical_day_today(), user_id))
+                """, _logical_day_today(), user_id)
             elif kind == "whatsapp":
-                cur.execute("""
+                await conn.execute("""
                     INSERT INTO user_daily_activity (day, user_id, whatsapp_requests)
-                    VALUES (%s, %s, 1)
+                    VALUES ($1, $2, 1)
                     ON CONFLICT (day, user_id) DO UPDATE
                     SET whatsapp_requests = user_daily_activity.whatsapp_requests + 1;
-                """, (_logical_day_today(), user_id))
-            conn.commit()
+                """, _logical_day_today(), user_id)
     except Exception as e:
         log.warning(f"User activity write failed for {user_id}: {e}")
-    finally:
-        conn.close()
 
-def _wa_get_count(number_norm: str, day: date) -> int:
-    conn = get_db_connection()
+async def _wa_get_count(number_norm: str, day: date) -> int:
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT sent_count FROM wa_daily_usage WHERE day=%s AND number_norm=%s",
-                        (day, number_norm))
-            row = cur.fetchone()
-            return int(row[0]) if row else 0
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            count = await conn.fetchval(
+                "SELECT sent_count FROM wa_daily_usage WHERE day=$1 AND number_norm=$2",
+                day, number_norm
+            )
+            return int(count) if count is not None else 0
     except Exception as e:
         log.warning("Quota read failed: %s", e)
         return 0
-    finally:
-        conn.close()
 
-def _wa_inc_count(number_norm: str, day: date):
-    conn = get_db_connection()
+async def _wa_inc_count(number_norm: str, day: date):
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
                 INSERT INTO wa_daily_usage (day, number_norm, sent_count, last_sent)
-                VALUES (%s, %s, 1, %s)
+                VALUES ($1, $2, 1, $3)
                 ON CONFLICT (day, number_norm)
                 DO UPDATE SET sent_count = wa_daily_usage.sent_count + 1,
                               last_sent = EXCLUDED.last_sent
-            """, (day, number_norm, datetime.now(TIMEZONE)))
-            conn.commit()
+            """, day, number_norm, datetime.now(TIMEZONE))
     except Exception as e:
         log.warning("Quota write failed: %s", e)
-    finally:
-        conn.close()
 
-def _wa_quota_reached(number_raw: str) -> bool:
+async def _wa_quota_reached(number_raw: str) -> bool:
     n = _norm_phone(number_raw)
-    cnt = _wa_get_count(n, _logical_day_today())
+    cnt = await _wa_get_count(n, _logical_day_today())
     return cnt >= WA_DAILY_LIMIT
 
 # =============================
@@ -455,9 +432,9 @@ async def _rebuild_pools_preserving_rotation():
     old_wa_entry_idx   = dict(rr.get("wa_entry_idx", {}))
 
     # IMPORTANT: save first so in-memory edits aren’t lost
-    save_owner_directory()
+    await save_owner_directory()
     # then reload + rebuild indexes/pools from DB snapshot
-    load_owner_directory()
+    await load_owner_directory()
 
     new_user_owner_list = _owner_list_from_pool(USERNAME_POOL)
     new_wa_owner_list   = _owner_list_from_pool(WHATSAPP_POOL)
@@ -474,7 +451,7 @@ async def _rebuild_pools_preserving_rotation():
     _preserve_entry_indices(rr["username_entry_idx"], USERNAME_POOL, "usernames")
     _preserve_entry_indices(rr["wa_entry_idx"], WHATSAPP_POOL, "numbers")
 
-    save_state()
+    await save_state()
 
 async def _decrement_priority_and_end_if_needed():
     pq = state.get("priority_queue", {})
@@ -502,9 +479,9 @@ async def _decrement_priority_and_end_if_needed():
                 owner_group["disabled"] = True
             await _rebuild_pools_preserving_rotation()
         else:
-            save_state()
+            await save_state()
     else:
-        save_state()
+        await save_state()
 
 async def _next_from_username_pool() -> Optional[Dict[str, str]]:
     pq = state.get("priority_queue", {})
@@ -532,7 +509,7 @@ async def _next_from_username_pool() -> Optional[Dict[str, str]]:
             result = {"owner": block["owner"], "username": arr[ei]}
             rr["username_entry_idx"][block["owner"]] = (ei + 1) % len(arr)
             rr["username_owner_idx"] = (idx + 1) % len(USERNAME_POOL)
-            save_state()
+            await save_state()
             return result
         idx = (idx + 1) % len(USERNAME_POOL)
     return None
@@ -548,7 +525,7 @@ async def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
                     start = state["rr"]["wa_entry_idx"].get(priority_owner, 0) % len(numbers)
                     for step in range(len(numbers)):
                         cand = numbers[(start + step) % len(numbers)]
-                        if not _wa_quota_reached(cand):
+                        if not await _wa_quota_reached(cand):
                             state["rr"]["wa_entry_idx"][priority_owner] = ((start + step) + 1) % len(numbers)
                             await _decrement_priority_and_end_if_needed()
                             return {"owner": priority_owner, "number": cand}
@@ -565,11 +542,11 @@ async def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
             start = rr["wa_entry_idx"].get(owner, 0) % len(numbers)
             for step in range(len(numbers)):
                 cand = numbers[(start + step) % len(numbers)]
-                if _wa_quota_reached(cand):
+                if await _wa_quota_reached(cand):
                     continue
                 rr["wa_entry_idx"][owner] = ((start + step) + 1) % len(numbers)
                 rr["wa_owner_idx"] = (owner_idx + 1) % len(WHATSAPP_POOL)
-                save_state()
+                await save_state()
                 return {"owner": owner, "number": cand}
         owner_idx = (owner_idx + 1) % len(WHATSAPP_POOL)
     return None
@@ -635,28 +612,25 @@ def _parse_stop_open_target(raw: str) -> Tuple[str, str]:
 # =============================
 # AUDIT LOG (DB)
 # =============================
-def _log_event(kind: str, action: str, update: Update, value: str, owner: str = ""):
-    conn = get_db_connection()
+async def _log_event(kind: str, action: str, update: Update, value: str, owner: str = ""):
     try:
         u = update.effective_user
         m = update.effective_message
         c = update.effective_chat
-        with conn.cursor() as cur:
-            cur.execute("""
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
                 INSERT INTO audit_log (
                     ts_local, chat_id, message_id, user_id, user_first,
                     user_username, kind, action, value, owner
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            """,
                 datetime.now(TIMEZONE), c.id if c else None, m.message_id if m else None,
                 u.id if u else None, u.first_name if u else None, u.username if u else None,
                 kind, action, value, owner or ""
-            ))
-            conn.commit()
+            )
     except Exception as e:
         log.warning("Log write to DB failed: %s", e)
-    finally:
-        conn.close()
 
 # =============================
 # UTIL
@@ -672,23 +646,23 @@ def mention_user_html(user_id: int) -> str:
     name = info.get("first_name") or info.get("username") or str(user_id)
     return f'<a href="tg://user?id={user_id}">{name}</a>'
 
-def _issued_bucket(kind: str) -> Dict[str, list]: 
+def _issued_bucket(kind: str) -> Dict[str, list]:
     return state.setdefault("issued", {}).setdefault(kind, {})
 
-def _set_issued(user_id: int, chat_id: int, kind: str, value: str):
+async def _set_issued(user_id: int, chat_id: int, kind: str, value: str):
     bucket = _issued_bucket(kind)
     user_id_str = str(user_id)
     if user_id_str not in bucket:
         bucket[user_id_str] = []
     
     bucket[user_id_str].append({
-        "value": value, 
+        "value": value,
         "ts": datetime.now(TIMEZONE).isoformat(),
         "chat_id": chat_id
     })
-    save_state()
+    await save_state()
 
-def _clear_issued(user_id: int, kind: str, value_to_clear: str) -> bool:
+async def _clear_issued(user_id: int, kind: str, value_to_clear: str) -> bool:
     bucket = _issued_bucket(kind)
     user_id_str = str(user_id)
     if user_id_str in bucket:
@@ -700,7 +674,7 @@ def _clear_issued(user_id: int, kind: str, value_to_clear: str) -> bool:
             del bucket[user_id_str]
         
         if len(bucket.get(user_id_str, [])) < original_len:
-            save_state()
+            await save_state()
             return True
     return False
 
@@ -730,25 +704,23 @@ def _logical_day_of(ts: datetime) -> date:
     shifted = ts.astimezone(TIMEZONE) - timedelta(hours=5, minutes=30)
     return shifted.date()
 
-def _read_log_rows() -> List[dict]:
-    conn = get_db_connection()
+async def _read_log_rows() -> List[dict]:
     try:
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute("SELECT * FROM audit_log ORDER BY ts_local")
-            return [dict(row) for row in cur.fetchall()]
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM audit_log ORDER BY ts_local")
+            return [dict(row) for row in rows]
     except Exception as e:
         log.error("Failed to read log rows from DB: %s", e)
         return []
-    finally:
-        conn.close()
 
-def _compute_daily_summary(target_day: date) -> Tuple[List[dict], List[dict]]:
+async def _compute_daily_summary(target_day: date) -> Tuple[List[dict], List[dict]]:
     """
     Returns:
       - per-user rows (Summary sheet)
       - per-owner rows (Owners sheet)
     """
-    rows = _read_log_rows()
+    rows = await _read_log_rows()
     day_rows = [r for r in rows if _logical_day_of(r["ts_local"]) == target_day]
 
     users: Dict[str, dict] = {}
@@ -760,7 +732,7 @@ def _compute_daily_summary(target_day: date) -> Tuple[List[dict], List[dict]]:
         kind, action, value, owner = r["kind"], r["action"], r["value"], (r.get("owner","") or "").lower()
 
         if kind == "username":
-            if action == "issued": 
+            if action == "issued":
                 d["username_issued"].append((value, owner))
                 if owner:
                     s = owner_stats.setdefault(owner, {"total": 0, "tg": 0, "wa": 0})
@@ -768,7 +740,7 @@ def _compute_daily_summary(target_day: date) -> Tuple[List[dict], List[dict]]:
                     s["tg"] += 1
             if action == "cleared": d["username_cleared"].append(value)
         elif kind == "whatsapp":
-            if action == "issued": 
+            if action == "issued":
                 d["wa_issued"].append((value, owner))
                 if owner:
                     s = owner_stats.setdefault(owner, {"total": 0, "tg": 0, "wa": 0})
@@ -857,8 +829,8 @@ def _style_and_save_excel(user_rows: List[dict], owner_rows: List[dict]) -> io.B
     excel_buffer.seek(0)
     return excel_buffer
 
-def _get_daily_excel_report(target_day: date) -> Tuple[Optional[str], Optional[io.BytesIO]]:
-    user_rows, owner_rows = _compute_daily_summary(target_day)
+async def _get_daily_excel_report(target_day: date) -> Tuple[Optional[str], Optional[io.BytesIO]]:
+    user_rows, owner_rows = await _compute_daily_summary(target_day)
     if not user_rows and not owner_rows:
         return ("No data for that day.", None)
     try:
@@ -961,7 +933,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
             "stop_after": bool(and_stop_str),
             "saved_rr_indices": { "username_owner_idx": state["rr"]["username_owner_idx"], "wa_owner_idx": state["rr"]["wa_owner_idx"] }
         }
-        save_state()
+        await save_state()
         stop_msg = " and will be stopped" if state["priority_queue"]["stop_after"] else ""
         return f"Priority queue activated: Next {count} customers will be directed to {owner_name}{stop_msg}."
 
@@ -1136,7 +1108,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
                     if item_value_norm == item_to_clear_norm:
                         user_id = int(user_id_str)
-                        if _clear_issued(user_id, kind, item.get("value")):
+                        if await _clear_issued(user_id, kind, item.get("value")):
                             user_info = state.get("user_names", {}).get(user_id_str, {})
                             user_name_cleared = user_info.get("username") or user_info.get("first_name") or user_id_str
                             cleared = True
@@ -1156,13 +1128,9 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         if not user_id_to_ban:
             return f"User '{target_name}' not found."
         
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("INSERT INTO whatsapp_bans (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id_to_ban,))
-                conn.commit()
-        finally:
-            conn.close()
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("INSERT INTO whatsapp_bans (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id_to_ban)
         
         WHATSAPP_BANNED_USERS.add(user_id_to_ban)
         return f"User {target_name} has been banned from requesting WhatsApp numbers."
@@ -1174,13 +1142,9 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         if not user_id_to_unban:
             return f"User '{target_name}' not found."
 
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM whatsapp_bans WHERE user_id = %s", (user_id_to_unban,))
-                conn.commit()
-        finally:
-            conn.close()
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM whatsapp_bans WHERE user_id = $1", user_id_to_unban)
 
         WHATSAPP_BANNED_USERS.discard(user_id_to_unban)
         return f"User {target_name} has been unbanned from requesting WhatsApp numbers."
@@ -1199,7 +1163,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
     m = OWNER_REPORT_RX.match(text)
     if m:
         target_day = _parse_report_day(m.group(1))
-        _, owner_rows = _compute_daily_summary(target_day)
+        _, owner_rows = await _compute_daily_summary(target_day)
         if not owner_rows:
             return f"No owner activity found for {target_day.isoformat()}."
         
@@ -1261,8 +1225,8 @@ async def _send_all_pending_reminders(context: ContextTypes.DEFAULT_TYPE) -> str
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     reminders_to_send = []
     state_changed = False
-    await db_lock.acquire()
-    try:
+    
+    async with db_lock:
         now = datetime.now(TIMEZONE)
         
         for kind in ("username", "whatsapp"):
@@ -1291,9 +1255,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                         log.error(f"Error processing reminder for user {user_id_str}: {e}")
         
         if state_changed:
-            save_state()
-    finally:
-        db_lock.release()
+            await save_state()
 
     for r in reminders_to_send:
         try:
@@ -1305,31 +1267,22 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
 async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
     """Clears daily WhatsApp quotas and the 'issued' state for a new day."""
     log.info("Performing daily reset...")
-    await db_lock.acquire()
-    try:
-        conn = get_db_connection()
+    async with db_lock:
         try:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM wa_daily_usage;")
-                cur.execute("DELETE FROM user_daily_activity;")
-                conn.commit()
+            pool = await get_db_pool()
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM wa_daily_usage;")
+                await conn.execute("DELETE FROM user_daily_activity;")
                 log.info("Cleared daily WhatsApp and user activity quotas.")
         except Exception as e:
             log.error(f"Failed to clear daily tables: {e}")
-        finally:
-            conn.close()
 
         if "issued" in state:
             state["issued"]["username"].clear()
             state["issued"]["whatsapp"].clear()
         
-        save_state()
+        await save_state()
         log.info("Daily reset complete. Cleared issued items.")
-
-    except Exception as e:
-        log.error(f"An error occurred during daily reset: {e}")
-    finally:
-        db_lock.release()
 
 # =============================
 # MESSAGE HANDLER
@@ -1345,17 +1298,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = msg.chat_id
     cache_user_info(update.effective_user)
     
-    context._chat_id = chat_id
-
-    await db_lock.acquire()
-    try:
+    # Use a single lock for the entire message handling process to ensure atomicity
+    async with db_lock:
         # Admin: Report
         mrep = SEND_REPORT_RX.match(text)
         if _is_admin(update) and mrep:
             target_day = _parse_report_day(mrep.group(1))
-            err, excel_buffer = _get_daily_excel_report(target_day)
-            db_lock.release()
-            if err: await msg.chat.send_message(err, reply_to_message_id=msg.message_id)
+            err, excel_buffer = await _get_daily_excel_report(target_day)
+            
+            # Message sending must happen outside the lock if it's slow,
+            # but since excel generation is now async, it's safer to keep it inside.
+            if err:
+                await msg.chat.send_message(err, reply_to_message_id=msg.message_id)
             elif excel_buffer:
                 file_name = f"daily_summary_{target_day.isoformat()}.xlsx"
                 await msg.chat.send_document(
@@ -1368,11 +1322,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if _is_admin(update):
             admin_reply = await _handle_admin_command(text, context, update)
             if admin_reply:
-                db_lock.release()
                 await msg.chat.send_message(admin_reply, reply_to_message_id=msg.message_id, parse_mode=ParseMode.HTML)
                 return
+            # Check for partial admin commands to provide feedback
             elif any(text.lower().startswith(cmd) for cmd in ['add ', 'delete ', 'list ', 'stop ', 'open ', 'remind ', 'take ', 'clear ', 'ban ', 'unban ', '+', 'owner report', 'commands']):
-                db_lock.release()
                 await msg.chat.send_message("I don't recognize that command.", reply_to_message_id=msg.message_id)
                 return
 
@@ -1383,55 +1336,48 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if user_id_str in bucket:
                 items_to_clear = [item.get("value") for item in bucket[user_id_str] if _value_in_text(item.get("value"), text)]
                 for value in items_to_clear:
-                    _clear_issued(uid, kind, value)
-                    _log_event(kind, "cleared", update, value, owner="")
+                    await _clear_issued(uid, kind, value)
+                    await _log_event(kind, "cleared", update, value, owner="")
                     log.info(f"Cleared pending {kind} for user {uid}: {value}")
 
         # Feeders
         if NEED_USERNAME_RX.match(text):
             rec = await _next_from_username_pool()
             reply = "No available username." if not rec else f"@{rec['owner']}\n{rec['username']}"
-            db_lock.release()
             await msg.chat.send_message(reply, reply_to_message_id=msg.message_id)
             if rec:
-                await db_lock.acquire()
-                _set_issued(uid, chat_id, "username", rec["username"])
-                _log_event("username", "issued", update, rec["username"], owner=rec["owner"])
-                _increment_user_activity(uid, "username")
-                db_lock.release()
+                await _set_issued(uid, chat_id, "username", rec["username"])
+                await _log_event("username", "issued", update, rec["username"], owner=rec["owner"])
+                await _increment_user_activity(uid, "username")
             return
 
         if NEED_WHATSAPP_RX.match(text):
             if uid in WHATSAPP_BANNED_USERS:
-                db_lock.release()
                 await msg.chat.send_message("អ្នកត្រូវបានហាមឃាត់ពីការស្នើសុំលេខ WhatsApp ។", reply_to_message_id=msg.message_id)
                 return
 
-            username_count, whatsapp_count = _get_user_activity(uid)
+            username_count, whatsapp_count = await _get_user_activity(uid)
             has_bonus = username_count > USERNAME_THRESHOLD_FOR_BONUS
 
             if not has_bonus and whatsapp_count >= USER_WHATSAPP_LIMIT:
-                db_lock.release()
                 await msg.chat.send_message(f"អ្នកបានស្នើសុំ WhatsApp គ្រប់ចំនួនកំណត់សម្រាប់ថ្ងៃនេះហើយ។\nសូមស្នើសុំ username ឱ្យលើសពី {USERNAME_THRESHOLD_FOR_BONUS} ដើម្បីទទួលបានការស្នើសុំ WhatsApp បន្ថែមទៀតដោយគ្មានដែនកំណត់។", reply_to_message_id=msg.message_id)
                 return
 
             rec = await _next_from_whatsapp_pool()
             reply = "No available WhatsApp."
             if rec:
-                 if _wa_quota_reached(rec["number"]):
+                if await _wa_quota_reached(rec["number"]):
                      reply = "No available WhatsApp (daily limit may be reached)."
                      rec = None
-                 else:
+                else:
                      reply = f"@{rec['owner']}\n{rec['number']}"
-            db_lock.release()
+            
             await msg.chat.send_message(reply, reply_to_message_id=msg.message_id)
             if rec:
-                await db_lock.acquire()
-                _wa_inc_count(_norm_phone(rec["number"]), _logical_day_today())
-                _set_issued(uid, chat_id, "whatsapp", rec["number"])
-                _log_event("whatsapp", "issued", update, rec["number"], owner=rec["owner"])
-                _increment_user_activity(uid, "whatsapp")
-                db_lock.release()
+                await _wa_inc_count(_norm_phone(rec["number"]), _logical_day_today())
+                await _set_issued(uid, chat_id, "whatsapp", rec["number"])
+                await _log_event("whatsapp", "issued", update, rec["number"], owner=rec["owner"])
+                await _increment_user_activity(uid, "whatsapp")
             return
 
         # Lookups
@@ -1447,23 +1393,23 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if rec and rec.get("channel") == "whatsapp": reply = f"Owner of WhatsApp {phone} → @{rec['owner']}"
                 elif rec: reply = f"Owner of number {phone} → @{rec['owner']} (@{rec.get('telegram') or '-'})"
                 else: reply = f"Owner of number {phone} → not found"
-            db_lock.release()
+            
             await msg.chat.send_message(reply, reply_to_message_id=msg.message_id)
             return
-
-    finally:
-        if db_lock.locked():
-            db_lock.release()
 
 # =============================
 # MAIN
 # =============================
-if __name__ == "__main__":
-    setup_database()
-    load_state()
-    _migrate_state_if_needed()
-    load_owner_directory()
-    load_whatsapp_bans()
+async def main():
+    """Start the bot."""
+    # This must be the first async operation to set up the pool
+    await get_db_pool()
+    
+    await setup_database()
+    await load_state()
+    await _migrate_state_if_needed()
+    await load_owner_directory()
+    await load_whatsapp_bans()
 
     app = Application.builder().token(BOT_TOKEN).build()
     
@@ -1475,5 +1421,9 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.ALL, on_message))
 
     log.info("Bot is starting...")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    # Use await for run_polling in an async context
+    await app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
+
+if __name__ == "__main__":
+    asyncio.run(main())
