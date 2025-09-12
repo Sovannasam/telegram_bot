@@ -606,6 +606,9 @@ UNBAN_WHATSAPP_RX     = re.compile(r"^\s*unban\s+whatsapp\s+@?(\S+)\s*$", re.IGN
 LIST_BANNED_RX        = re.compile(r"^\s*list\s+banned\s*$", re.IGNORECASE)
 OWNER_REPORT_RX       = re.compile(r"^\s*owner\s+report(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 COMMANDS_RX           = re.compile(r"^\s*commands\s*$", re.IGNORECASE)
+MY_DETAIL_RX          = re.compile(r"^\s*my\s+detail\s*$", re.IGNORECASE)
+DETAIL_USER_RX        = re.compile(r"^\s*detail\s+@?(\S+)\s*$", re.IGNORECASE)
+
 
 def _looks_like_phone(s: str) -> bool:
     return bool(PHONE_LIKE_RX.fullmatch((s or "").strip()))
@@ -720,6 +723,46 @@ def _value_in_text(value: Optional[str], text: str) -> bool:
         v_digits = re.sub(r'\D', '', v_norm)
         text_digits = re.sub(r'\D', '', text_norm)
         return v_digits and v_digits in text_digits
+
+# =============================
+# DETAIL COMMANDS
+# =============================
+async def _get_user_detail_text(user_id: int) -> str:
+    """Generates a formatted string of a user's daily activity."""
+    user_info = state.get("user_names", {}).get(str(user_id), {})
+    user_display = user_info.get('username') or user_info.get('first_name') or f"ID: {user_id}"
+    if user_info.get('username'):
+        user_display = f"@{user_display}"
+
+    # Get today's request counts from the database
+    username_reqs, whatsapp_reqs = await _get_user_activity(user_id)
+
+    # Get pending items from the current state
+    pending_usernames = [item['value'] for item in _issued_bucket("username").get(str(user_id), [])]
+    pending_whatsapps = [item['value'] for item in _issued_bucket("whatsapp").get(str(user_id), [])]
+
+    # Build the response message
+    lines = [f"<b>📊 Daily Detail for {user_display}</b>"]
+    lines.append(f"<b>- Usernames Received Today:</b> {username_reqs}")
+    lines.append(f"<b>- WhatsApps Received Today:</b> {whatsapp_reqs}")
+    lines.append("") # Spacer
+
+    if pending_usernames:
+        lines.append("<b>⏳ Pending Usernames (Not Provided Back):</b>")
+        for u in pending_usernames:
+            lines.append(f"  - <code>{u}</code>")
+    else:
+        lines.append("<b>✅ No Pending Usernames</b>")
+
+    if pending_whatsapps:
+        lines.append("\n<b>⏳ Pending WhatsApps (Not Provided Back):</b>")
+        for w in pending_whatsapps:
+            lines.append(f"  - <code>{w}</code>")
+    else:
+        lines.append("\n<b>✅ No Pending WhatsApps</b>")
+
+    return "\n".join(lines)
+
 
 # =============================
 # EXCEL (reads audit_log)
@@ -904,6 +947,7 @@ def _get_commands_text() -> str:
 <code>i need username</code> - Request a username.
 <code>i need whatsapp</code> - Request a WhatsApp number.
 <code>who's using @item</code> - Check the owner of an item.
+<code>my detail</code> - See your own daily stats.
 
 <b>--- Admin: Owner & Item Management ---</b>
 <code>add owner @owner</code>
@@ -938,6 +982,7 @@ def _get_commands_text() -> str:
 <code>list owners</code>
 <code>list disabled</code>
 <code>list @owner</code>
+<code>detail @user</code> - See a user's daily stats.
 """
 
 async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, update: Update) -> Optional[str]:
@@ -1200,6 +1245,14 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         command_list_text = _get_commands_text()
         return command_list_text # Return text to be sent by on_message
 
+    m = DETAIL_USER_RX.match(text)
+    if m:
+        target_name = m.group(1)
+        target_user_id = _find_user_id_by_name(target_name)
+        if not target_user_id:
+            return f"User '{target_name}' not found."
+        return await _get_user_detail_text(target_user_id)
+
 
     return None
 
@@ -1335,33 +1388,38 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Use a single lock for the entire message handling process to ensure atomicity
     async with db_lock:
+        # User "my detail" command
+        if MY_DETAIL_RX.match(text):
+            detail_text = await _get_user_detail_text(uid)
+            await msg.reply_html(detail_text)
+            return
+
         # Admin: Report
         mrep = SEND_REPORT_RX.match(text)
         if _is_admin(update) and mrep:
             target_day = _parse_report_day(mrep.group(1))
             err, excel_buffer = await _get_daily_excel_report(target_day)
             
-            # Message sending must happen outside the lock if it's slow,
-            # but since excel generation is now async, it's safer to keep it inside.
+            # Message sending is quick, so it's safe inside the lock.
             if err:
-                await msg.chat.send_message(err, reply_to_message_id=msg.message_id)
+                await msg.reply_text(err)
             elif excel_buffer:
                 file_name = f"daily_summary_{target_day.isoformat()}.xlsx"
-                await msg.chat.send_document(
+                await msg.reply_document(
                     document=excel_buffer, filename=file_name,
-                    caption=f"Daily summary (logical day starting 05:30) — {target_day}",
-                    reply_to_message_id=msg.message_id)
+                    caption=f"Daily summary (logical day starting 05:30) — {target_day}"
+                )
             return
 
         # Admin: Console
         if _is_admin(update):
             admin_reply = await _handle_admin_command(text, context, update)
             if admin_reply:
-                await msg.chat.send_message(admin_reply, reply_to_message_id=msg.message_id, parse_mode=ParseMode.HTML)
+                await msg.reply_html(admin_reply)
                 return
             # Check for partial admin commands to provide feedback
-            elif any(text.lower().startswith(cmd) for cmd in ['add ', 'delete ', 'list ', 'stop ', 'open ', 'remind ', 'take ', 'clear ', 'ban ', 'unban ', '+', 'owner report', 'commands']):
-                await msg.chat.send_message("I don't recognize that command.", reply_to_message_id=msg.message_id)
+            elif any(text.lower().startswith(cmd) for cmd in ['add ', 'delete ', 'list ', 'stop ', 'open ', 'remind ', 'take ', 'clear ', 'ban ', 'unban ', '+', 'owner report', 'commands', 'detail ']):
+                await msg.reply_text("I don't recognize that admin command.")
                 return
 
         # Auto-clear holds
@@ -1379,7 +1437,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if NEED_USERNAME_RX.match(text):
             rec = await _next_from_username_pool()
             reply = "No available username." if not rec else f"@{rec['owner']}\n{rec['username']}"
-            await msg.chat.send_message(reply, reply_to_message_id=msg.message_id)
+            await msg.reply_text(reply)
             if rec:
                 await _set_issued(uid, chat_id, "username", rec["username"])
                 await _log_event("username", "issued", update, rec["username"], owner=rec["owner"])
@@ -1388,14 +1446,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if NEED_WHATSAPP_RX.match(text):
             if uid in WHATSAPP_BANNED_USERS:
-                await msg.chat.send_message("អ្នកត្រូវបានហាមឃាត់ពីការស្នើសុំលេខ WhatsApp ។", reply_to_message_id=msg.message_id)
+                await msg.reply_text("អ្នកត្រូវបានហាមឃាត់ពីការស្នើសុំលេខ WhatsApp ។")
                 return
 
             username_count, whatsapp_count = await _get_user_activity(uid)
             has_bonus = username_count > USERNAME_THRESHOLD_FOR_BONUS
 
             if not has_bonus and whatsapp_count >= USER_WHATSAPP_LIMIT:
-                await msg.chat.send_message(f"អ្នកបានស្នើសុំ WhatsApp គ្រប់ចំនួនកំណត់សម្រាប់ថ្ងៃនេះហើយ។\nសូមស្នើសុំ username ឱ្យលើសពី {USERNAME_THRESHOLD_FOR_BONUS} ដើម្បីទទួលបានការស្នើសុំ WhatsApp បន្ថែមទៀតដោយគ្មានដែនកំណត់។", reply_to_message_id=msg.message_id)
+                await msg.reply_text(f"អ្នកបានស្នើសុំ WhatsApp គ្រប់ចំនួនកំណត់សម្រាប់ថ្ងៃនេះហើយ។\nសូមស្នើសុំ username ឱ្យលើសពី {USERNAME_THRESHOLD_FOR_BONUS} ដើម្បីទទួលបានការស្នើសុំ WhatsApp បន្ថែមទៀតដោយគ្មានដែនកំណត់។")
                 return
 
             rec = await _next_from_whatsapp_pool()
@@ -1407,7 +1465,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                      reply = f"@{rec['owner']}\n{rec['number']}"
             
-            await msg.chat.send_message(reply, reply_to_message_id=msg.message_id)
+            await msg.reply_text(reply)
             if rec:
                 await _wa_inc_count(_norm_phone(rec["number"]), _logical_day_today())
                 await _set_issued(uid, chat_id, "whatsapp", rec["number"])
@@ -1429,7 +1487,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 elif rec: reply = f"Owner of number {phone} → @{rec['owner']} (@{rec.get('telegram') or '-'})"
                 else: reply = f"Owner of number {phone} → not found"
             
-            await msg.chat.send_message(reply, reply_to_message_id=msg.message_id)
+            await msg.reply_text(reply)
             return
 
 # =============================
@@ -1453,7 +1511,7 @@ if __name__ == "__main__":
     app = (
         Application.builder()
         .token(BOT_TOKEN)
-        .post_initialization(post_initialization)
+        .post_init(post_initialization)
         .post_shutdown(post_shutdown)
         .build()
     )
