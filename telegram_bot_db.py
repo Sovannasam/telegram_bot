@@ -40,11 +40,19 @@ BOT_TOKEN = get_env_variable("BOT_TOKEN")
 DATABASE_URL = get_env_variable("DATABASE_URL")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "excelmerge")  # telegram username (without @)
 WA_DAILY_LIMIT = int(os.getenv("WA_DAILY_LIMIT", "2"))      # max sends per number per logical day
-REMINDER_DELAY_MINUTES = int(os.getenv("REMINDER_DELAY_MINUTES", "25")) # Delay for reminders
+REMINDER_DELAY_MINUTES = int(os.getenv("REMINDER_DELAY_MINUTES", "20")) # Delay for reminders
 USER_WHATSAPP_LIMIT = int(os.getenv("USER_WHATSAPP_LIMIT", "10"))
 USERNAME_THRESHOLD_FOR_BONUS = int(os.getenv("USERNAME_THRESHOLD_FOR_BONUS", "35"))
 REQUEST_GROUP_ID = int(os.getenv("REQUEST_GROUP_ID", "-1002438185636")) # Group for 'i need ...' commands
 CLEARING_GROUP_ID = int(os.getenv("CLEARING_GROUP_ID", "-1002624324856")) # Group for auto-clearing pendings
+
+# Whitelist of allowed countries (lowercase for case-insensitive matching)
+ALLOWED_COUNTRIES = {
+    'morocco', 'panama', 'saudi arabia', 'united arab emirates', 'uae',
+    'oman', 'jordan', 'italy', 'germany', 'indonesia', 'colombia',
+    'bulgaria', 'brazil', 'spain', 'belgium', 'algeria', 'south africa',
+    'philippines', 'indian', 'india'
+}
 
 TIMEZONE = pytz.timezone("Asia/Phnom_Penh")
 
@@ -749,6 +757,43 @@ def _value_in_text(value: Optional[str], text: str) -> bool:
         return v_digits and v_digits in text_digits
 
 # =============================
+# COUNTRY & AGE FILTERING
+# =============================
+def _find_age_in_text(text: str) -> Optional[int]:
+    """Finds a plausible age in the text."""
+    # Looks for: age: 25, age 25, 25 years old, 25yr, etc.
+    match = re.search(
+        r'\b(?:age|old)\s*:?\s*(\d{1,2})\b|\b(\d{1,2})\s*(?:yrs|yr|years|year old)\b',
+        text.lower()
+    )
+    if match:
+        age_str = match.group(1) or match.group(2)
+        if age_str:
+            return int(age_str)
+    return None
+
+def _find_country_in_text(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Finds a country mentioned in the text using a pattern.
+    Returns a tuple: (found_country_name, canonical_allowed_country_name | 'not_allowed' | None)
+    """
+    match = re.search(r'\b(?:from|country)\s*:?\s*([a-zA-Z\s,]+)', text, re.IGNORECASE)
+    if not match:
+        return None, None # No country pattern found
+
+    potential_country = match.group(1).split(',')[0].strip().lower()
+    
+    for allowed in ALLOWED_COUNTRIES:
+        if allowed in potential_country:
+            # Handle variations like "indian" -> "india"
+            if allowed in ['indian', 'india']:
+                return potential_country, 'india'
+            return potential_country, allowed
+            
+    # A country pattern was found, but it's not in our list
+    return potential_country, 'not_allowed'
+
+# =============================
 # DETAIL COMMANDS
 # =============================
 async def _get_user_detail_text(user_id: int) -> str:
@@ -1424,7 +1469,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             target_day = _parse_report_day(mrep.group(1))
             err, excel_buffer = await _get_daily_excel_report(target_day)
             
-            # Message sending is quick, so it's safe inside the lock.
             if err:
                 await msg.reply_text(err)
             elif excel_buffer:
@@ -1441,30 +1485,65 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if admin_reply:
                 await msg.reply_html(admin_reply)
                 return
-            # Check for partial admin commands to provide feedback
             elif any(text.lower().startswith(cmd) for cmd in ['add ', 'delete ', 'list ', 'stop ', 'open ', 'remind ', 'take ', 'clear ', 'ban ', 'unban ', '+', 'owner report', 'commands', 'detail ']):
                 await msg.reply_text("I don't recognize that admin command.")
                 return
 
-        # Auto-clear holds - ONLY in the designated clearing group
-        if chat_id == CLEARING_GROUP_ID:
-            for kind in ("username", "whatsapp"):
-                bucket = _issued_bucket(kind)
-                user_id_str = str(uid)
-                if user_id_str in bucket:
-                    # Find which unique pending values are present in the new message
-                    unique_pending_values = {item.get("value") for item in bucket[user_id_str]}
-                    
-                    values_found_in_message = set()
-                    for pending_value in unique_pending_values:
-                        if _value_in_text(pending_value, text):
-                            values_found_in_message.add(pending_value)
+        # Find all unique pending values from the user in the message
+        values_found_in_message = set()
+        user_id_str = str(uid)
+        for kind in ("username", "whatsapp"):
+            bucket = _issued_bucket(kind)
+            if user_id_str in bucket:
+                for item in bucket[user_id_str]:
+                    pending_value = item.get("value")
+                    if _value_in_text(pending_value, text):
+                        values_found_in_message.add(pending_value)
 
-                    # For each unique value found in the message, clear ONE corresponding pending item
+        # If the message is in the clearing group and contains a pending item, apply filters.
+        if chat_id == CLEARING_GROUP_ID and values_found_in_message:
+            found_country, country_status = _find_country_in_text(text)
+            age = _find_age_in_text(text)
+            
+            is_allowed = True
+            rejection_reason = ""
+
+            if country_status: # A country pattern was found
+                if country_status == 'not_allowed':
+                    is_allowed = False
+                    rejection_reason = f"Country '{found_country}' is not on the allowed list."
+                elif country_status == 'india':
+                    if age is None:
+                        is_allowed = False
+                        rejection_reason = "Age must be provided for India."
+                    elif age <= 30:
+                        is_allowed = False
+                        rejection_reason = f"Age {age} for India is not allowed (must be > 30)."
+            
+            if not is_allowed:
+                # Get the first item that triggered the check to use in the reply
+                first_offending_value = next(iter(values_found_in_message))
+                item_type = "username" if first_offending_value.startswith('@') else "whatsapp"
+
+                # Construct the detailed rejection message
+                mention = mention_user_html(uid)
+                reply_text = (
+                    f"{mention}, this country is not allowed. Please use that {item_type} "
+                    f"(<code>{first_offending_value}</code>) to give to another customer."
+                )
+
+                await msg.reply_html(reply_text)
+                log.warning(f"Rejected post from user {uid}. Reason: {rejection_reason}. Told user to reuse item.")
+                return # Stop processing, do not clear the item.
+            else:
+                # If allowed, proceed to clear
+                for kind in ("username", "whatsapp"):
+                    # The value_to_clear must come from the set we already identified
                     for value_to_clear in values_found_in_message:
-                        if await _clear_one_issued(uid, kind, value_to_clear):
+                         if await _clear_one_issued(uid, kind, value_to_clear):
                             await _log_event(kind, "cleared", update, value_to_clear, owner="")
                             log.info(f"Auto-cleared ONE pending {kind} for user {uid}: {value_to_clear}")
+
 
         # Feeders - ONLY in the designated request group
         if chat_id == REQUEST_GROUP_ID:
