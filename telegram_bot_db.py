@@ -13,7 +13,7 @@ import pytz
 import asyncpg
 from telegram import Update
 from telegram.constants import ChatType, ParseMode
-from telegram.ext import Application, ContextTypes, MessageHandler, filters, JobQueue
+from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 # =============================
 # LOGGING
@@ -54,16 +54,30 @@ DB_POOL: Optional[asyncpg.Pool] = None
 
 async def get_db_pool() -> asyncpg.Pool:
     global DB_POOL
-    if DB_POOL is None:
+    if DB_POOL is None or DB_POOL.is_closing():
         try:
-            DB_POOL = await asyncpg.create_pool(dsn=DATABASE_URL)
-            if DB_POOL is None: # create_pool can return None on failure
-                 raise ConnectionError("Database pool initialization failed.")
+            DB_POOL = await asyncpg.create_pool(
+                dsn=DATABASE_URL, 
+                max_inactive_connection_lifetime=60,
+                min_size=1, # Ensure at least one connection is ready
+                max_size=10 # Limit max connections
+            )
+            if DB_POOL is None:
+                 raise ConnectionError("Database pool initialization failed, create_pool returned None.")
             log.info("Database connection pool established.")
         except Exception as e:
             log.error(f"Could not create database connection pool: {e}")
             raise
     return DB_POOL
+
+async def close_db_pool():
+    global DB_POOL
+    if DB_POOL and not DB_POOL.is_closing():
+        log.info("Closing database connection pool.")
+        await DB_POOL.close()
+        DB_POOL = None
+        log.info("Database connection pool closed.")
+
 
 async def setup_database():
     log.info("Setting up database schema...")
@@ -158,15 +172,25 @@ async def load_state():
         async with pool.acquire() as conn:
             result = await conn.fetchval("SELECT data FROM kv_storage WHERE key = 'state'")
             if result:
-                loaded = dict(result)
-                state = {**BASE_STATE, **loaded}
+                loaded = json.loads(result)
+                # Deep merge to preserve base structure for new keys
+                temp_state = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
+                for key, value in loaded.items():
+                    if isinstance(value, dict) and key in temp_state:
+                        temp_state[key].update(value)
+                    else:
+                        temp_state[key] = value
+                state = temp_state
                 log.info("Bot state loaded from database.")
             else:
                 state = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
                 await save_state()
     except Exception as e:
-        log.warning("Failed to load state from DB: %s", e)
+        log.warning(f"Failed to load state from DB: %s. Using default state.", e)
+        state = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
 
+
+    # Ensure nested structures exist after loading
     state.setdefault("rr", {}).setdefault("username_entry_idx", {})
     state["rr"].setdefault("wa_entry_idx", {})
     state.setdefault("issued", {}).setdefault("username", {})
@@ -285,7 +309,7 @@ async def load_owner_directory():
         pool = await get_db_pool()
         async with pool.acquire() as conn:
             result = await conn.fetchval("SELECT data FROM kv_storage WHERE key = 'owners'")
-            OWNER_DATA = (dict(result) or []) if result else []
+            OWNER_DATA = (json.loads(result) or []) if result else []
     except Exception as e:
         log.error("Failed to load owners from DB: %s", e)
         OWNER_DATA = []
@@ -1411,32 +1435,39 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =============================
 # MAIN
 # =============================
-async def main():
-    """Start the bot."""
-    # This must be the first async operation to set up the pool
+async def post_initialization(application: Application):
+    """Runs once after the bot is initialized."""
     await get_db_pool()
-    
     await setup_database()
     await load_state()
     await _migrate_state_if_needed()
     await load_owner_directory()
     await load_whatsapp_bans()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+async def post_shutdown(application: Application):
+    """Runs once before the bot shuts down."""
+    await close_db_pool()
+
+
+if __name__ == "__main__":
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_initialization(post_initialization)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
     
+    # Set up job queue
     if app.job_queue:
         app.job_queue.run_repeating(check_reminders, interval=60, first=60)
         reset_time = time(hour=5, minute=31, tzinfo=TIMEZONE)
         app.job_queue.run_daily(daily_reset, time=reset_time)
 
+    # Add message handler
     app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.ALL, on_message))
 
+    # Run the bot
     log.info("Bot is starting...")
-    # Use await for run_polling in an async context
-    await app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
