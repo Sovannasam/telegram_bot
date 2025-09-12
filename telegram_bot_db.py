@@ -40,9 +40,11 @@ BOT_TOKEN = get_env_variable("BOT_TOKEN")
 DATABASE_URL = get_env_variable("DATABASE_URL")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "excelmerge")  # telegram username (without @)
 WA_DAILY_LIMIT = int(os.getenv("WA_DAILY_LIMIT", "2"))      # max sends per number per logical day
-REMINDER_DELAY_MINUTES = int(os.getenv("REMINDER_DELAY_MINUTES", "25")) # Delay for reminders
+REMINDER_DELAY_MINUTES = int(os.getenv("REMINDER_DELAY_MINUTES", "20")) # Delay for reminders
 USER_WHATSAPP_LIMIT = int(os.getenv("USER_WHATSAPP_LIMIT", "10"))
 USERNAME_THRESHOLD_FOR_BONUS = int(os.getenv("USERNAME_THRESHOLD_FOR_BONUS", "35"))
+REQUEST_GROUP_ID = int(os.getenv("REQUEST_GROUP_ID", "-1002438185636")) # Group for 'i need ...' commands
+CLEARING_GROUP_ID = int(os.getenv("CLEARING_GROUP_ID", "-1002624324856")) # Group for auto-clearing pendings
 
 TIMEZONE = pytz.timezone("Asia/Phnom_Penh")
 
@@ -690,6 +692,7 @@ async def _set_issued(user_id: int, chat_id: int, kind: str, value: str):
     await save_state()
 
 async def _clear_issued(user_id: int, kind: str, value_to_clear: str) -> bool:
+    """Removes ALL occurrences of a pending item for a user. Used by admin commands."""
     bucket = _issued_bucket(kind)
     user_id_str = str(user_id)
     if user_id_str in bucket:
@@ -701,6 +704,27 @@ async def _clear_issued(user_id: int, kind: str, value_to_clear: str) -> bool:
             del bucket[user_id_str]
         
         if len(bucket.get(user_id_str, [])) < original_len:
+            await save_state()
+            return True
+    return False
+
+async def _clear_one_issued(user_id: int, kind: str, value_to_clear: str) -> bool:
+    """Removes the FIRST occurrence of a pending item for a user. Used by auto-clear."""
+    bucket = _issued_bucket(kind)
+    user_id_str = str(user_id)
+    if user_id_str in bucket:
+        item_to_remove = None
+        # Find the first item in the list that matches the value
+        for item in bucket[user_id_str]:
+            if item.get("value") == value_to_clear:
+                item_to_remove = item
+                break
+        
+        if item_to_remove:
+            bucket[user_id_str].remove(item_to_remove)
+            # If the list is now empty, remove the user's key
+            if not bucket[user_id_str]:
+                del bucket[user_id_str]
             await save_state()
             return True
     return False
@@ -1422,58 +1446,68 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.reply_text("I don't recognize that admin command.")
                 return
 
-        # Auto-clear holds
-        for kind in ("username", "whatsapp"):
-            bucket = _issued_bucket(kind)
-            user_id_str = str(uid)
-            if user_id_str in bucket:
-                items_to_clear = [item.get("value") for item in bucket[user_id_str] if _value_in_text(item.get("value"), text)]
-                for value in items_to_clear:
-                    await _clear_issued(uid, kind, value)
-                    await _log_event(kind, "cleared", update, value, owner="")
-                    log.info(f"Cleared pending {kind} for user {uid}: {value}")
+        # Auto-clear holds - ONLY in the designated clearing group
+        if chat_id == CLEARING_GROUP_ID:
+            for kind in ("username", "whatsapp"):
+                bucket = _issued_bucket(kind)
+                user_id_str = str(uid)
+                if user_id_str in bucket:
+                    # Find which unique pending values are present in the new message
+                    unique_pending_values = {item.get("value") for item in bucket[user_id_str]}
+                    
+                    values_found_in_message = set()
+                    for pending_value in unique_pending_values:
+                        if _value_in_text(pending_value, text):
+                            values_found_in_message.add(pending_value)
 
-        # Feeders
-        if NEED_USERNAME_RX.match(text):
-            rec = await _next_from_username_pool()
-            reply = "No available username." if not rec else f"@{rec['owner']}\n{rec['username']}"
-            await msg.reply_text(reply)
-            if rec:
-                await _set_issued(uid, chat_id, "username", rec["username"])
-                await _log_event("username", "issued", update, rec["username"], owner=rec["owner"])
-                await _increment_user_activity(uid, "username")
-            return
+                    # For each unique value found in the message, clear ONE corresponding pending item
+                    for value_to_clear in values_found_in_message:
+                        if await _clear_one_issued(uid, kind, value_to_clear):
+                            await _log_event(kind, "cleared", update, value_to_clear, owner="")
+                            log.info(f"Auto-cleared ONE pending {kind} for user {uid}: {value_to_clear}")
 
-        if NEED_WHATSAPP_RX.match(text):
-            if uid in WHATSAPP_BANNED_USERS:
-                await msg.reply_text("អ្នកត្រូវបានហាមឃាត់ពីការស្នើសុំលេខ WhatsApp ។")
+        # Feeders - ONLY in the designated request group
+        if chat_id == REQUEST_GROUP_ID:
+            if NEED_USERNAME_RX.match(text):
+                rec = await _next_from_username_pool()
+                reply = "No available username." if not rec else f"@{rec['owner']}\n{rec['username']}"
+                await msg.reply_text(reply)
+                if rec:
+                    await _set_issued(uid, chat_id, "username", rec["username"])
+                    await _log_event("username", "issued", update, rec["username"], owner=rec["owner"])
+                    await _increment_user_activity(uid, "username")
                 return
 
-            username_count, whatsapp_count = await _get_user_activity(uid)
-            has_bonus = username_count > USERNAME_THRESHOLD_FOR_BONUS
+            if NEED_WHATSAPP_RX.match(text):
+                if uid in WHATSAPP_BANNED_USERS:
+                    await msg.reply_text("អ្នកត្រូវបានហាមឃាត់ពីការស្នើសុំលេខ WhatsApp ។")
+                    return
 
-            if not has_bonus and whatsapp_count >= USER_WHATSAPP_LIMIT:
-                await msg.reply_text(f"អ្នកបានស្នើសុំ WhatsApp គ្រប់ចំនួនកំណត់សម្រាប់ថ្ងៃនេះហើយ។\nសូមស្នើសុំ username ឱ្យលើសពី {USERNAME_THRESHOLD_FOR_BONUS} ដើម្បីទទួលបានការស្នើសុំ WhatsApp បន្ថែមទៀតដោយគ្មានដែនកំណត់។")
+                username_count, whatsapp_count = await _get_user_activity(uid)
+                has_bonus = username_count > USERNAME_THRESHOLD_FOR_BONUS
+
+                if not has_bonus and whatsapp_count >= USER_WHATSAPP_LIMIT:
+                    await msg.reply_text(f"អ្នកបានស្នើសុំ WhatsApp គ្រប់ចំនួនកំណត់សម្រាប់ថ្ងៃនេះហើយ។\nសូមស្នើសុំ username ឱ្យលើសពី {USERNAME_THRESHOLD_FOR_BONUS} ដើម្បីទទួលបានការស្នើសុំ WhatsApp បន្ថែមទៀតដោយគ្មានដែនកំណត់។")
+                    return
+
+                rec = await _next_from_whatsapp_pool()
+                reply = "No available WhatsApp."
+                if rec:
+                    if await _wa_quota_reached(rec["number"]):
+                         reply = "No available WhatsApp (daily limit may be reached)."
+                         rec = None
+                    else:
+                         reply = f"@{rec['owner']}\n{rec['number']}"
+                
+                await msg.reply_text(reply)
+                if rec:
+                    await _wa_inc_count(_norm_phone(rec["number"]), _logical_day_today())
+                    await _set_issued(uid, chat_id, "whatsapp", rec["number"])
+                    await _log_event("whatsapp", "issued", update, rec["number"], owner=rec["owner"])
+                    await _increment_user_activity(uid, "whatsapp")
                 return
 
-            rec = await _next_from_whatsapp_pool()
-            reply = "No available WhatsApp."
-            if rec:
-                if await _wa_quota_reached(rec["number"]):
-                     reply = "No available WhatsApp (daily limit may be reached)."
-                     rec = None
-                else:
-                     reply = f"@{rec['owner']}\n{rec['number']}"
-            
-            await msg.reply_text(reply)
-            if rec:
-                await _wa_inc_count(_norm_phone(rec["number"]), _logical_day_today())
-                await _set_issued(uid, chat_id, "whatsapp", rec["number"])
-                await _log_event("whatsapp", "issued", update, rec["number"], owner=rec["owner"])
-                await _increment_user_activity(uid, "whatsapp")
-            return
-
-        # Lookups
+        # Lookups (can be used in any group)
         m_owner = WHO_USING_REGEX.match(text)
         if m_owner:
             handle, phone = m_owner.groups()
