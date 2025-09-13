@@ -1165,7 +1165,6 @@ def _find_owner_group(name: str) -> Optional[dict]:
 
 def _find_user_id_by_name(name: str) -> Optional[int]:
     # Normalize name: remove leading @, lowercase, and strip whitespace
-    norm_name = name.lower().lstrip('@').strip()
     user_names = state.get("user_names", {})
     for uid, data in user_names.items():
         # Check against stored username (if it exists)
