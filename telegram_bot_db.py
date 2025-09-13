@@ -850,7 +850,6 @@ async def _get_user_detail_text(user_id: int) -> str:
 
     pending_usernames = [item['value'] for item in _issued_bucket("username").get(str(user_id), [])]
     pending_whatsapps = [item['value'] for item in _issued_bucket("whatsapp").get(str(user_id), [])]
-    pending_app_ids = [item['value'] for item in _issued_bucket("app_id").get(str(user_id), [])]
 
     lines = [f"<b>📊 Daily Detail for {user_display}</b>"]
     lines.append(f"<b>- Usernames Received:</b> {username_reqs}")
@@ -879,13 +878,6 @@ async def _get_user_detail_text(user_id: int) -> str:
     else:
         lines.append("\n<b>✅ No Pending WhatsApps</b>")
     
-    if pending_app_ids:
-        lines.append("\n<b>⏳ Pending App IDs (Awaiting Confirmation):</b>")
-        for app_id in pending_app_ids:
-            lines.append(f"  - <code>{app_id}</code>")
-    else:
-        lines.append("\n<b>✅ No Pending App IDs</b>")
-
     return "\n".join(lines)
 
 
@@ -1529,7 +1521,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.reply_text("I don't recognize that admin command.")
                 return
 
-        # MODIFIED: New logic for silent success and wrong ID reminders
         if chat_id == CONFIRMATION_GROUP_ID:
             if '+1' in text:
                 match = re.search(r'@([^\s]+)', text)
