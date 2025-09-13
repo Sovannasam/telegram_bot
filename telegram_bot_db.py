@@ -418,6 +418,20 @@ async def _increment_successful_adds(user_id: int):
     except Exception as e:
         log.warning(f"Successful adds write failed for user {user_id}: {e}")
 
+async def _decrement_successful_adds(user_id: int):
+    """Decrements the successful_adds counter, ensuring it doesn't go below zero."""
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE user_daily_activity
+                SET successful_adds = successful_adds - 1
+                WHERE day = $1 AND user_id = $2 AND successful_adds > 0;
+            """, _logical_day_today(), user_id)
+        log.info(f"Decremented successful adds for user {user_id}")
+    except Exception as e:
+        log.warning(f"Successful adds decrement failed for user {user_id}: {e}")
+
 async def _wa_get_count(number_norm: str, day: date) -> int:
     try:
         pool = await get_db_pool()
@@ -640,6 +654,7 @@ COMMANDS_RX           = re.compile(r"^\s*commands\s*$", re.IGNORECASE)
 MY_DETAIL_RX          = re.compile(r"^\s*my\s+detail\s*$", re.IGNORECASE)
 DETAIL_USER_RX        = re.compile(r"^\s*detail\s+@?(\S+)\s*$", re.IGNORECASE)
 OWNER_CONFIRMATION_RX = re.compile(r"(.+?)\s*\+1\s*@(\S+)", re.IGNORECASE)
+OWNER_REJECTION_RX    = re.compile(r"(.+?)\s*-1\s*$", re.IGNORECASE)
 
 
 def _looks_like_phone(s: str) -> bool:
@@ -1531,17 +1546,28 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # OWNER CONFIRMATION LOGIC - Only in the owner confirmation group
         if chat_id == OWNER_CONFIRM_GROUP_ID:
             owner_confirm_match = OWNER_CONFIRMATION_RX.match(text)
+            owner_reject_match = OWNER_REJECTION_RX.match(text)
             sender_username = (update.effective_user.username or "").lower()
             all_owners = {_norm_owner_name(o['owner']) for o in OWNER_DATA}
 
-            if sender_username in all_owners and owner_confirm_match:
-                customer_name, customer_id_str = owner_confirm_match.groups()
-                customer_user_id = _find_user_id_by_name(customer_name)
-                if customer_user_id:
-                    await _increment_successful_adds(customer_user_id)
-                else:
-                    log.warning(f"Owner {sender_username} confirmed customer '{customer_name}', but user could not be found.")
-                return # End processing for this group
+            if sender_username in all_owners:
+                if owner_confirm_match:
+                    customer_name, customer_id_str = owner_confirm_match.groups()
+                    customer_user_id = _find_user_id_by_name(customer_name)
+                    if customer_user_id:
+                        await _increment_successful_adds(customer_user_id)
+                    else:
+                        log.warning(f"Owner {sender_username} confirmed customer '{customer_name}', but user could not be found.")
+                    return # End processing for this group
+                
+                elif owner_reject_match:
+                    customer_name = owner_reject_match.group(1).strip()
+                    customer_user_id = _find_user_id_by_name(customer_name)
+                    if customer_user_id:
+                        await _decrement_successful_adds(customer_user_id)
+                    else:
+                        log.warning(f"Owner {sender_username} rejected customer '{customer_name}', but user could not be found.")
+                    return # End processing for this group
 
         # USER AUTO-CLEARING LOGIC - Only in the clearing group
         if chat_id == CLEARING_GROUP_ID and values_found_in_message:
@@ -1678,4 +1704,8 @@ if __name__ == "__main__":
     # Run the bot
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
+" in the Canvas.
+I want to update code, every message owner send in owner confirmtion group, bit will silence, not send any message, and also do i need to add group chat ID in Environment Variables
+?
 
