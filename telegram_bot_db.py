@@ -166,7 +166,6 @@ async def setup_database():
                 PRIMARY KEY (day, owner_name)
             );
         """)
-        # NEW: Table for admins and permissions
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS admins (
                 username TEXT PRIMARY KEY,
@@ -196,8 +195,46 @@ BASE_STATE = {
 }
 state: Dict = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
 WHATSAPP_BANNED_USERS: set[int] = set()
-# NEW: In-memory cache for admin permissions
 ADMIN_PERMISSIONS: Dict[str, List[str]] = {}
+
+# =============================
+# PERMISSIONS & ADMINS
+# =============================
+# MODIFIED: Changed from permission groups to individual commands
+COMMAND_PERMISSIONS = {
+    'add owner', 'delete owner', 'add username', 'delete username', 'add whatsapp', 'delete whatsapp',
+    'stop open', 'take customer', 'ban whatsapp', 'unban whatsapp', 'report',
+    'owner report', 'performance', 'remind user', 'clear pending', 'clear all pending',
+    'list owners', 'list disabled', 'list owner', 'detail user', 'list banned', 'list admins'
+}
+
+async def load_admins():
+    global ADMIN_PERMISSIONS
+    ADMIN_PERMISSIONS = {}
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT username, permissions FROM admins")
+            for row in rows:
+                ADMIN_PERMISSIONS[row['username']] = json.loads(row['permissions'])
+        log.info(f"Loaded {len(ADMIN_PERMISSIONS)} admins from database.")
+    except Exception as e:
+        log.error(f"Failed to load admins from DB: %s", e)
+
+def _is_super_admin(user: Optional[Update.effective_user]) -> bool:
+    if not user: return False
+    return (user.username or "").lower() == ADMIN_USERNAME.lower()
+
+def _is_admin(user: Optional[Update.effective_user]) -> bool:
+    if not user or not user.username: return False
+    return _is_super_admin(user) or _norm_owner_name(user.username) in ADMIN_PERMISSIONS
+
+def _has_permission(user: Optional[Update.effective_user], permission: str) -> bool:
+    if not user or not user.username: return False
+    if _is_super_admin(user): return True
+    
+    user_permissions = ADMIN_PERMISSIONS.get(_norm_owner_name(user.username), [])
+    return permission in user_permissions
 
 async def load_whatsapp_bans():
     global WHATSAPP_BANNED_USERS
@@ -296,9 +333,6 @@ def _norm_owner_name(s: str) -> str:
     s = (s or "").strip()
     if s.startswith("@"): s = s[1:]
     return s.lower()
-def _is_super_admin(user: Optional[Update.effective_user]) -> bool:
-    if not user: return False
-    return (user.username or "").lower() == ADMIN_USERNAME.lower()
 
 def _is_owner(user: Optional[Update.effective_user]) -> bool:
     if not user or not user.username:
@@ -711,11 +745,11 @@ MY_DETAIL_RX          = re.compile(r"^\s*my\s+detail\s*$", re.IGNORECASE)
 DETAIL_USER_RX        = re.compile(r"^\s*detail\s+@?(\S+)\s*$", re.IGNORECASE)
 MY_PERFORMANCE_RX     = re.compile(r"^\s*my\s+performance(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 PERFORMANCE_OWNER_RX  = re.compile(r"^\s*performance\s+@?(\S+?)(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
-# NEW: Regex for admin management
 ADD_ADMIN_RX          = re.compile(r"^\s*add\s+admin\s+@?(\S+)\s*$", re.IGNORECASE)
 DELETE_ADMIN_RX       = re.compile(r"^\s*delete\s+admin\s+@?(\S+)\s*$", re.IGNORECASE)
-ALLOW_ADMIN_RX        = re.compile(r"^\s*allow\s+@?(\S+)\s+use\s+(.+)\s*$", re.IGNORECASE)
-STOP_ALLOW_ADMIN_RX   = re.compile(r"^\s*stop\s+allow\s+@?(\S+)\s+use\s+(.+)\s*$", re.IGNORECASE)
+# MODIFIED: Updated Regex for command-based permissions
+ALLOW_ADMIN_CMD_RX    = re.compile(r"^\s*allow\s+@?(\S+)\s+to\s+use\s+command\s+(.+)\s*$", re.IGNORECASE)
+STOP_ALLOW_ADMIN_CMD_RX = re.compile(r"^\s*stop\s+allow\s+@?(\S+)\s+to\s+use\s+command\s+(.+)\s*$", re.IGNORECASE)
 LIST_ADMINS_RX        = re.compile(r"^\s*list\s+admins\s*$", re.IGNORECASE)
 
 
@@ -962,7 +996,6 @@ async def _get_user_detail_text(user_id: int) -> str:
     return "\n".join(lines)
 
 
-# NEW: Function to generate the performance report text
 async def _get_owner_performance_text(owner_name: str, day: date) -> str:
     """Generates a formatted string of an owner's daily performance."""
     tg_count, wa_count = await _get_owner_performance(owner_name, day)
@@ -1190,11 +1223,84 @@ def _get_commands_text() -> str:
 <code>list disabled</code>
 <code>list @owner</code>
 <code>detail @user</code> - See a user's daily stats.
+
+<b>--- Super Admin ---</b>
+<code>add admin @user</code>
+<code>delete admin @user</code>
+<code>allow @user to use command [command]</code>
+<code>stop allow @user to use command [command]</code>
+<code>list admins</code>
 """
 
 async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, update: Update) -> Optional[str]:
+    user = update.effective_user
+    
+    # Super Admin Commands First
+    if _is_super_admin(user):
+        m_add_admin = ADD_ADMIN_RX.match(text)
+        if m_add_admin:
+            name = _norm_owner_name(m_add_admin.group(1))
+            pool = await get_db_pool()
+            async with pool.acquire() as conn:
+                await conn.execute("INSERT INTO admins (username, permissions) VALUES ($1, '[]') ON CONFLICT(username) DO NOTHING", name)
+            await load_admins()
+            return f"Admin '{name}' added with no permissions."
+
+        m_del_admin = DELETE_ADMIN_RX.match(text)
+        if m_del_admin:
+            name = _norm_owner_name(m_del_admin.group(1))
+            pool = await get_db_pool()
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM admins WHERE username = $1", name)
+            await load_admins()
+            return f"Admin '{name}' deleted."
+
+        m_allow = ALLOW_ADMIN_CMD_RX.match(text)
+        if m_allow:
+            name, command = m_allow.groups()
+            name = _norm_owner_name(name)
+            command = command.lower().strip()
+            if command not in COMMAND_PERMISSIONS:
+                return f"Invalid command name. Available commands: {', '.join(sorted(COMMAND_PERMISSIONS))}"
+            
+            current_perms = set(ADMIN_PERMISSIONS.get(name, []))
+            current_perms.add(command)
+            
+            pool = await get_db_pool()
+            async with pool.acquire() as conn:
+                 await conn.execute("INSERT INTO admins (username, permissions) VALUES ($1, $2) ON CONFLICT(username) DO UPDATE SET permissions = $2", name, json.dumps(list(current_perms)))
+            await load_admins()
+            return f"Permission '{command}' granted to '{name}'."
+
+        m_stop_allow = STOP_ALLOW_ADMIN_CMD_RX.match(text)
+        if m_stop_allow:
+            name, command = m_stop_allow.groups()
+            name = _norm_owner_name(name)
+            command = command.lower().strip()
+            if command not in COMMAND_PERMISSIONS:
+                return f"Invalid command name. Available commands: {', '.join(sorted(COMMAND_PERMISSIONS))}"
+
+            current_perms = set(ADMIN_PERMISSIONS.get(name, []))
+            current_perms.discard(command)
+            
+            pool = await get_db_pool()
+            async with pool.acquire() as conn:
+                await conn.execute("UPDATE admins SET permissions = $1 WHERE username = $2", json.dumps(list(current_perms)), name)
+            await load_admins()
+            return f"Permission '{command}' revoked from '{name}'."
+
+        if LIST_ADMINS_RX.match(text):
+            if not ADMIN_PERMISSIONS:
+                return "No admins configured."
+            lines = ["<b>Configured Admins:</b>"]
+            for name, perms in ADMIN_PERMISSIONS.items():
+                lines.append(f"- <code>{name}</code>: {', '.join(perms) or 'No permissions'}")
+            return "\n".join(lines)
+
+    # Regular Admin Commands (with permission checks)
     m = TAKE_CUSTOMER_RX.match(text)
     if m:
+        if not _has_permission(user, 'take customer'): return "You don't have permission to use this command."
         count_str, owner_name, and_stop_str = m.groups()
         count = int(count_str)
         owner_norm = _norm_owner_name(owner_name)
@@ -1214,6 +1320,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     m = STOP_OPEN_RX.match(text)
     if m:
+        if not _has_permission(user, 'stop open'): return "You don't have permission to use this command."
         action, target_raw = m.groups(); is_stop = action.lower() == "stop"
         t = target_raw.lower()
         if t in ("all whatsapp", "all whatsapps", "whatsapp all", "all wa", "wa all"):
@@ -1259,6 +1366,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     m = ADD_OWNER_RX.match(text)
     if m:
+        if not _has_permission(user, 'add owner'): return "You don't have permission to use this command."
         name = _norm_owner_name(m.group(1))
         if _find_owner_group(name): return f"Owner '{name}' already exists."
         OWNER_DATA.append(_ensure_owner_shape({"owner": name}))
@@ -1267,6 +1375,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     m = DEL_OWNER_RX.match(text)
     if m:
+        if not _has_permission(user, 'delete owner'): return "You don't have permission to use this command."
         name = _norm_owner_name(m.group(1)); before = len(OWNER_DATA)
         OWNER_DATA[:] = [g for g in OWNER_DATA if _norm_owner_name(g.get("owner","")) != name]
         if len(OWNER_DATA) == before: return f"Owner '{name}' not found."
@@ -1275,6 +1384,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     m = ADD_USERNAME_RX.match(text)
     if m:
+        if not _has_permission(user, 'add username'): return "You don't have permission to use this command."
         handle, owner_name = m.groups(); owner = _find_owner_group(owner_name)
         if not owner: return f"Owner '{owner_name}' not found."
         norm_h = _norm_handle(handle)
@@ -1285,6 +1395,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     m = ADD_WHATSAPP_RX.match(text)
     if m:
+        if not _has_permission(user, 'add whatsapp'): return "You don't have permission to use this command."
         num, owner_name = m.groups(); owner = _find_owner_group(owner_name)
         if not owner: return f"Owner '{owner_name}' not found."
         norm_n = _norm_phone(num)
@@ -1295,6 +1406,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     m = DEL_USERNAME_RX.match(text)
     if m:
+        if not _has_permission(user, 'delete username'): return "You don't have permission to use this command."
         handle = m.group(1); norm_h = _norm_handle(handle); found = False
         for owner in OWNER_DATA:
             before = len(owner["entries"])
@@ -1306,6 +1418,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     m = DEL_WHATSAPP_RX.match(text)
     if m:
+        if not _has_permission(user, 'delete whatsapp'): return "You don't have permission to use this command."
         num = m.group(1); norm_n = _norm_phone(num); found = False
         for owner in OWNER_DATA:
             before = len(owner["whatsapp"])
@@ -1316,6 +1429,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         return f"Deleted WhatsApp number {num} from all owners."
 
     if LIST_OWNERS_RX.match(text):
+        if not _has_permission(user, 'list owners'): return "You don't have permission to use this command."
         if not OWNER_DATA: return "No owners configured."
         lines = ["<b>Owner Roster:</b>"]
         for o in OWNER_DATA:
@@ -1326,6 +1440,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         return "\n".join(lines)
 
     if LIST_DISABLED_RX.match(text):
+        if not _has_permission(user, 'list disabled'): return "You don't have permission to use this command."
         disabled = [o for o in OWNER_DATA if _owner_is_paused(o)]
         if not disabled: return "No owners are currently disabled/paused."
         lines = ["<b>Disabled/Paused Owners:</b>"]
@@ -1336,6 +1451,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     m = LIST_OWNER_DETAIL_RX.match(text) or LIST_OWNER_ALIAS_RX.match(text)
     if m:
+        if not _has_permission(user, 'list owner'): return "You don't have permission to use this command."
         name = m.group(1).strip()
         if name.lower() in ("owners", "disabled"): return None
         owner = _find_owner_group(name)
@@ -1358,10 +1474,13 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         return "\n".join(lines)
 
     m = REMIND_ALL_RX.match(text)
-    if m: return await _send_all_pending_reminders(context)
+    if m:
+        if not _has_permission(user, 'remind user'): return "You don't have permission to use this command."
+        return await _send_all_pending_reminders(context)
 
     m = CLEAR_ALL_PENDING_RX.match(text)
     if m:
+        if not _has_permission(user, 'clear all pending'): return "You don't have permission to use this command."
         issued_data = state.setdefault("issued", {})
         username_count = sum(len(items) for items in issued_data.get("username", {}).values())
         whatsapp_count = sum(len(items) for items in issued_data.get("whatsapp", {}).values())
@@ -1381,6 +1500,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     m = CLEAR_PENDING_RX.match(text)
     if m:
+        if not _has_permission(user, 'clear pending'): return "You don't have permission to use this command."
         item_to_clear = m.group(1).strip()
         for kind in ("username", "whatsapp", "app_id"):
             for user_id_str, items in list(_issued_bucket(kind).items()):
@@ -1405,6 +1525,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     m = BAN_WHATSAPP_RX.match(text)
     if m:
+        if not _has_permission(user, 'ban whatsapp'): return "You don't have permission to use this command."
         target_name = m.group(1)
         user_id_to_ban = _find_user_id_by_name(target_name)
         if not user_id_to_ban:
@@ -1419,6 +1540,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     m = UNBAN_WHATSAPP_RX.match(text)
     if m:
+        if not _has_permission(user, 'unban whatsapp'): return "You don't have permission to use this command."
         target_name = m.group(1)
         user_id_to_unban = _find_user_id_by_name(target_name)
         if not user_id_to_unban:
@@ -1432,6 +1554,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         return f"User {target_name} has been unbanned from requesting WhatsApp numbers."
 
     if LIST_BANNED_RX.match(text):
+        if not _has_permission(user, 'list banned'): return "You don't have permission to use this command."
         if not WHATSAPP_BANNED_USERS:
             return "No users are currently banned from requesting WhatsApp numbers."
 
@@ -1444,6 +1567,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     m = OWNER_REPORT_RX.match(text)
     if m:
+        if not _has_permission(user, 'owner report'): return "You don't have permission to use this command."
         target_day = _parse_report_day(m.group(1))
         _, owner_rows = await _compute_daily_summary(target_day)
         if not owner_rows:
@@ -1460,6 +1584,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     m = DETAIL_USER_RX.match(text)
     if m:
+        if not _has_permission(user, 'detail user'): return "You don't have permission to use this command."
         target_name = m.group(1)
         target_user_id = _find_user_id_by_name(target_name)
         if not target_user_id:
@@ -1568,7 +1693,7 @@ async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
                 await conn.execute("DELETE FROM user_daily_activity;")
                 await conn.execute("DELETE FROM user_daily_country_counts;")
                 await conn.execute("DELETE FROM user_daily_confirmations;")
-                await conn.execute("DELETE FROM owner_daily_performance;") # NEW
+                await conn.execute("DELETE FROM owner_daily_performance;") 
                 log.info("Cleared daily WhatsApp, user activity, country, confirmation, and performance quotas from database.")
         except Exception as e:
             log.error(f"Failed to clear daily tables: {e}")
@@ -1611,7 +1736,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Admin: Report
         mrep = SEND_REPORT_RX.match(text)
-        if _is_admin(update) and mrep:
+        if _is_admin(update.effective_user) and _has_permission(update.effective_user, 'report') and mrep:
             target_day = _parse_report_day(mrep.group(1))
             err, excel_buffer = await _get_daily_excel_report(target_day)
 
@@ -1627,7 +1752,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Admin "performance @owner" command
         m_owner_perf = PERFORMANCE_OWNER_RX.match(text)
-        if _is_admin(update) and m_owner_perf:
+        if _is_admin(update.effective_user) and _has_permission(update.effective_user, 'performance') and m_owner_perf:
             owner_name_raw, day_str = m_owner_perf.groups()
             owner_name = _norm_owner_name(owner_name_raw)
             if not _find_owner_group(owner_name):
@@ -1639,16 +1764,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # Admin: Console
-        if _is_admin(update):
+        if _is_admin(update.effective_user):
             admin_reply = await _handle_admin_command(text, context, update)
             if admin_reply:
                 await msg.reply_html(admin_reply)
                 return
-            # Prevent non-admin commands from being misinterpreted as admin commands
-            elif any(text.lower().startswith(cmd) for cmd in ['add ', 'delete ', 'list ', 'stop ', 'open ', 'remind ', 'take ', 'clear ', 'ban ', 'unban ', '+', 'owner report', 'commands', 'detail ']):
-                await msg.reply_text("I don't recognize that admin command.")
-                return
-
+        
         if chat_id == CONFIRMATION_GROUP_ID:
             if '+1' in text:
                 match = re.search(r'@([^\s]+)', text)
@@ -1662,7 +1783,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         for item in items:
                             stored_app_id_raw = item.get("value", "")
                             
-                            # MODIFIED: Try both direct and normalized match
                             match_is_found = (stored_app_id_raw == app_id_confirmed_raw or 
                                               _normalize_app_id(stored_app_id_raw) == _normalize_app_id(app_id_confirmed_raw))
 
@@ -1700,16 +1820,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 app_id = f"@{app_id_match.group(1)}"
                 
                 context_data = {}
-                # MODIFIED: Determine source kind based on what's being cleared, with a fallback to last requested item.
                 if values_found_in_message:
-                    # WhatsApp takes priority
                     cleared_item_value = None
-                    kind_to_check = "username" # Default
+                    kind_to_check = "username" 
                     for v in values_found_in_message:
                         if _looks_like_phone(v):
                             kind_to_check = "whatsapp"
                             cleared_item_value = v
-                            break # Found whatsapp, no need to check further
+                            break
                     
                     if not cleared_item_value:
                         cleared_item_value = next(iter(values_found_in_message))
@@ -1720,13 +1838,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             context_data["source_owner"] = item.get("owner")
                             context_data["source_kind"] = kind_to_check
                             break
-                else: # Fallback if nothing is being cleared in this message
+                else: 
                     last_item = None
                     last_ts = datetime.min.replace(tzinfo=TIMEZONE)
                     for kind_to_check in ("username", "whatsapp"):
                         user_items = _issued_bucket(kind_to_check).get(str(uid), [])
                         if user_items:
-                            latest_in_kind = user_items[-1] # Get the most recently issued item of this kind
+                            latest_in_kind = user_items[-1] 
                             item_ts = datetime.fromisoformat(latest_in_kind["ts"])
                             if item_ts > last_ts:
                                 last_ts = item_ts
@@ -1841,6 +1959,7 @@ async def post_initialization(application: Application):
     await _migrate_state_if_needed()
     await load_owner_directory()
     await load_whatsapp_bans()
+    await load_admins()
 
 async def post_shutdown(application: Application):
     """Runs once before the bot shuts down."""
