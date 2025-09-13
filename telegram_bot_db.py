@@ -166,6 +166,13 @@ async def setup_database():
                 PRIMARY KEY (day, owner_name)
             );
         """)
+        # NEW: Table for admins and permissions
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                username TEXT PRIMARY KEY,
+                permissions JSONB NOT NULL
+            );
+        """)
     log.info("Database schema is ready.")
 
 
@@ -189,6 +196,8 @@ BASE_STATE = {
 }
 state: Dict = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
 WHATSAPP_BANNED_USERS: set[int] = set()
+# NEW: In-memory cache for admin permissions
+ADMIN_PERMISSIONS: Dict[str, List[str]] = {}
 
 async def load_whatsapp_bans():
     global WHATSAPP_BANNED_USERS
@@ -287,10 +296,9 @@ def _norm_owner_name(s: str) -> str:
     s = (s or "").strip()
     if s.startswith("@"): s = s[1:]
     return s.lower()
-def _is_admin(update: Update) -> bool:
-    u = update.effective_user
-    if not u: return False
-    return (u.username or "").lower() == ADMIN_USERNAME.lower()
+def _is_super_admin(user: Optional[Update.effective_user]) -> bool:
+    if not user: return False
+    return (user.username or "").lower() == ADMIN_USERNAME.lower()
 
 def _is_owner(user: Optional[Update.effective_user]) -> bool:
     if not user or not user.username:
@@ -703,6 +711,12 @@ MY_DETAIL_RX          = re.compile(r"^\s*my\s+detail\s*$", re.IGNORECASE)
 DETAIL_USER_RX        = re.compile(r"^\s*detail\s+@?(\S+)\s*$", re.IGNORECASE)
 MY_PERFORMANCE_RX     = re.compile(r"^\s*my\s+performance(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 PERFORMANCE_OWNER_RX  = re.compile(r"^\s*performance\s+@?(\S+?)(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
+# NEW: Regex for admin management
+ADD_ADMIN_RX          = re.compile(r"^\s*add\s+admin\s+@?(\S+)\s*$", re.IGNORECASE)
+DELETE_ADMIN_RX       = re.compile(r"^\s*delete\s+admin\s+@?(\S+)\s*$", re.IGNORECASE)
+ALLOW_ADMIN_RX        = re.compile(r"^\s*allow\s+@?(\S+)\s+use\s+(.+)\s*$", re.IGNORECASE)
+STOP_ALLOW_ADMIN_RX   = re.compile(r"^\s*stop\s+allow\s+@?(\S+)\s+use\s+(.+)\s*$", re.IGNORECASE)
+LIST_ADMINS_RX        = re.compile(r"^\s*list\s+admins\s*$", re.IGNORECASE)
 
 
 def _looks_like_phone(s: str) -> bool:
@@ -1583,7 +1597,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_html(detail_text)
             return
             
-        # NEW: Owner "my performance" command
+        # Owner "my performance" command
         m_my_perf = MY_PERFORMANCE_RX.match(text)
         if m_my_perf:
             if _is_owner(update.effective_user):
@@ -1611,7 +1625,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
         
-        # NEW: Admin "performance @owner" command
+        # Admin "performance @owner" command
         m_owner_perf = PERFORMANCE_OWNER_RX.match(text)
         if _is_admin(update) and m_owner_perf:
             owner_name_raw, day_str = m_owner_perf.groups()
