@@ -1686,7 +1686,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 app_id = f"@{app_id_match.group(1)}"
                 
                 context_data = {}
-                # MODIFIED: Determine source kind based on what's being cleared in *this* message.
+                # MODIFIED: Determine source kind based on what's being cleared, with a fallback to last requested item.
                 if values_found_in_message:
                     # WhatsApp takes priority
                     cleared_item_value = None
@@ -1706,6 +1706,22 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             context_data["source_owner"] = item.get("owner")
                             context_data["source_kind"] = kind_to_check
                             break
+                else: # Fallback if nothing is being cleared in this message
+                    last_item = None
+                    last_ts = datetime.min.replace(tzinfo=TIMEZONE)
+                    for kind_to_check in ("username", "whatsapp"):
+                        user_items = _issued_bucket(kind_to_check).get(str(uid), [])
+                        if user_items:
+                            latest_in_kind = user_items[-1] # Get the most recently issued item of this kind
+                            item_ts = datetime.fromisoformat(latest_in_kind["ts"])
+                            if item_ts > last_ts:
+                                last_ts = item_ts
+                                last_item = latest_in_kind
+                                last_item['kind'] = kind_to_check
+                    
+                    if last_item:
+                        context_data["source_owner"] = last_item.get("owner")
+                        context_data["source_kind"] = last_item.get("kind")
                 
                 await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
                 await _log_event("app_id", "issued", update, app_id, owner=context_data.get("source_owner", ""))
