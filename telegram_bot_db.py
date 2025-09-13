@@ -1381,7 +1381,8 @@ async def _send_all_pending_reminders(context: ContextTypes.DEFAULT_TYPE) -> str
     reminded_users = set()
 
     reminders_to_send = []
-    for kind in ("username", "whatsapp", "app_id"):
+    # MODIFIED: Removed 'app_id' from the reminder loop
+    for kind in ("username", "whatsapp"):
         bucket = _issued_bucket(kind)
         for user_id_str, items in bucket.items():
             for item in items:
@@ -1389,7 +1390,7 @@ async def _send_all_pending_reminders(context: ContextTypes.DEFAULT_TYPE) -> str
                 chat_id = item.get("chat_id")
                 value = item.get("value")
                 if chat_id and value:
-                    label = "username" if kind == "username" else "WhatsApp" if kind == "whatsapp" else "App ID"
+                    label = "username" if kind == "username" else "WhatsApp"
                     reminder_text = (
                         f"សូមរំលឹក: {mention_user_html(user_id)}, "
                         f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ {label} {value} ដែលអ្នកបានស្នើសុំ។"
@@ -1421,7 +1422,8 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     async with db_lock:
         now = datetime.now(TIMEZONE)
 
-        for kind in ("username", "whatsapp", "app_id"):
+        # MODIFIED: Removed 'app_id' from the reminder loop
+        for kind in ("username", "whatsapp"):
             bucket = _issued_bucket(kind)
             for user_id_str, items in list(bucket.items()):
                 for item in list(items):
@@ -1437,7 +1439,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                             chat_id = item.get("chat_id")
                             value = item.get("value")
                             if chat_id and value:
-                                label = "username" if kind == "username" else "WhatsApp" if kind == "whatsapp" else "App ID"
+                                label = "username" if kind == "username" else "WhatsApp"
                                 reminder_text = (
                                     f"សូមរំលឹក: {mention_user_html(user_id)}, "
                                     f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ {label} {value} ដែលអ្នកបានស្នើសុំ។"
