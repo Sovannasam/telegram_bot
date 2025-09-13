@@ -268,7 +268,6 @@ WHATSAPP_POOL: List[Dict] = []
 
 def _norm_handle(h: str) -> str: return re.sub(r"^@", "", (h or "").strip().lower())
 def _norm_phone(p: str) -> str: return re.sub(r"\D+", "", (p or ""))
-# NEW: Helper to normalize App IDs for robust matching
 def _normalize_app_id(app_id: str) -> str:
     """Removes leading '@' and all non-alphanumeric characters."""
     if not app_id:
@@ -636,7 +635,8 @@ WHO_USING_REGEX = re.compile(
 )
 NEED_USERNAME_RX = re.compile(r"^\s*i\s*need\s*(?:user\s*name|username)\s*$", re.IGNORECASE)
 NEED_WHATSAPP_RX = re.compile(r"^\s*i\s*need\s*(?:id\s*)?whats?app\s*$", re.IGNORECASE)
-APP_ID_RX = re.compile(r"app\s*:\s*.*?@([^\s]+)", re.IGNORECASE)
+# MODIFIED: Made the App ID detection more flexible
+APP_ID_RX = re.compile(r"\bapp\b.*?\@([^\s]+)", re.IGNORECASE)
 
 STOP_OPEN_RX          = re.compile(r"^\s*(stop|open)\s+(.+?)\s*$", re.IGNORECASE)
 ADD_OWNER_RX          = re.compile(r"^\s*add\s+owner\s+@?(.+?)\s*$", re.IGNORECASE)
