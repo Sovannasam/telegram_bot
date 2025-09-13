@@ -612,6 +612,7 @@ LIST_OWNER_ALIAS_RX   = re.compile(r"^\s*list\s+@?(.+?)\s*$", re.IGNORECASE)
 REMIND_ALL_RX         = re.compile(r"^\s*remind\s+user\s*$", re.IGNORECASE)
 TAKE_CUSTOMER_RX      = re.compile(r"^\s*take\s+(\d+)\s+customer(?:s)?\s+to\s+owner\s+@?(.+?)(?:\s+(and\s+stop))?\s*$", re.IGNORECASE)
 CLEAR_PENDING_RX      = re.compile(r"^\s*clear\s+pending\s+(.+)\s*$", re.IGNORECASE)
+CLEAR_ALL_PENDING_RX  = re.compile(r"^\s*clear\s+all\s+pending\s*$", re.IGNORECASE)
 BAN_WHATSAPP_RX       = re.compile(r"^\s*ban\s+whatsapp\s+@?(\S+)\s*$", re.IGNORECASE)
 UNBAN_WHATSAPP_RX     = re.compile(r"^\s*unban\s+whatsapp\s+@?(\S+)\s*$", re.IGNORECASE)
 LIST_BANNED_RX        = re.compile(r"^\s*list\s+banned\s*$", re.IGNORECASE)
@@ -1052,6 +1053,7 @@ def _get_commands_text() -> str:
 <code>owner report [today|yesterday|YYYY-MM-DD]</code>
 <code>remind user</code>
 <code>clear pending @item_or_number</code>
+<code>clear all pending</code>
 
 <b>--- Admin: Viewing Information ---</b>
 <code>list owners</code>
@@ -1231,6 +1233,24 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     m = REMIND_ALL_RX.match(text)
     if m: return await _send_all_pending_reminders(context)
+
+    m = CLEAR_ALL_PENDING_RX.match(text)
+    if m:
+        issued_data = state.setdefault("issued", {})
+        username_count = sum(len(items) for items in issued_data.get("username", {}).values())
+        whatsapp_count = sum(len(items) for items in issued_data.get("whatsapp", {}).values())
+        
+        if username_count == 0 and whatsapp_count == 0:
+            return "There were no pending items to clear."
+        
+        # Reset the state for pending items
+        issued_data["username"] = {}
+        issued_data["whatsapp"] = {}
+        
+        await save_state()
+        log.info(f"Admin cleared all pending items. Removed {username_count} usernames and {whatsapp_count} whatsapps.")
+        return f"✅ All pending items have been cleared ({username_count} usernames, {whatsapp_count} whatsapps)."
+
 
     m = CLEAR_PENDING_RX.match(text)
     if m:
@@ -1642,4 +1662,3 @@ if __name__ == "__main__":
     # Run the bot
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
