@@ -1705,7 +1705,5 @@ if __name__ == "__main__":
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
-" in the Canvas.
-I want to update code, every message owner send in owner confirmtion group, bit will silence, not send any message, and also do i need to add group chat ID in Environment Variables
-?
+
 
