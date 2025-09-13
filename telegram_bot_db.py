@@ -1535,24 +1535,39 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 match = re.search(r'@([^\s]+)', text)
                 if match:
                     app_id_confirmed_raw = f"@{match.group(1)}"
-                    app_id_confirmed_norm = _normalize_app_id(app_id_confirmed_raw)
                     found_and_counted = False
                     
+                    # First, try a direct, exact match.
                     for user_id_str, items in list(_issued_bucket("app_id").items()):
                         if found_and_counted: break
                         for item in items:
                             stored_app_id_raw = item.get("value", "")
-                            stored_app_id_norm = _normalize_app_id(stored_app_id_raw)
-                            
-                            if stored_app_id_norm == app_id_confirmed_norm:
+                            if stored_app_id_raw == app_id_confirmed_raw:
                                 user_id_of_item = int(user_id_str)
                                 await _increment_user_confirmation_count(user_id_of_item)
                                 await _log_event("app_id", "confirmed", update, stored_app_id_raw)
-                                # MODIFIED: Clear the item after counting it
                                 await _clear_one_issued(user_id_of_item, "app_id", stored_app_id_raw)
-                                log.info(f"Owner {update.effective_user.username} confirmed App ID {stored_app_id_raw}, count incremented and item cleared for user {user_id_of_item}")
+                                log.info(f"Owner {update.effective_user.username} confirmed App ID {stored_app_id_raw} via direct match. Counted and cleared for user {user_id_of_item}")
                                 found_and_counted = True
                                 break
+                    
+                    # If no direct match, try a normalized match to handle invisible characters or minor differences.
+                    if not found_and_counted:
+                        app_id_confirmed_norm = _normalize_app_id(app_id_confirmed_raw)
+                        for user_id_str, items in list(_issued_bucket("app_id").items()):
+                            if found_and_counted: break
+                            for item in items:
+                                stored_app_id_raw = item.get("value", "")
+                                stored_app_id_norm = _normalize_app_id(stored_app_id_raw)
+                                
+                                if stored_app_id_norm == app_id_confirmed_norm:
+                                    user_id_of_item = int(user_id_str)
+                                    await _increment_user_confirmation_count(user_id_of_item)
+                                    await _log_event("app_id", "confirmed", update, stored_app_id_raw)
+                                    await _clear_one_issued(user_id_of_item, "app_id", stored_app_id_raw)
+                                    log.info(f"Owner {update.effective_user.username} confirmed App ID {stored_app_id_raw} via normalized match. Counted and cleared for user {user_id_of_item}")
+                                    found_and_counted = True
+                                    break
                     
                     if not found_and_counted:
                         await msg.reply_text("Wrong ID, please check.")
@@ -1701,4 +1716,5 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
 
