@@ -283,15 +283,20 @@ def _is_admin(update: Update) -> bool:
     return u.username.lower() in state.get("admins", [])
 
 def _has_permission(update: Update, command: str) -> bool:
+    # Super admins have all permissions by default
     if _is_super_admin(update):
         return True
+    
+    # Regular admins must have the permission explicitly granted
     u = update.effective_user
     if not u or not u.username:
         return False
     
     username = u.username.lower()
     user_perms = state.get("admin_permissions", {}).get(username, [])
-    return command in user_perms
+    # A regular admin is granted permission if the command is in their list
+    # or if the command is a broad permission like 'all'
+    return command in user_perms or "all" in user_perms
 
 def _owner_is_paused(group: dict) -> bool:
     if group.get("disabled") or group.get("active") is False: return True
@@ -687,6 +692,12 @@ MY_PERFORMANCE_RX     = re.compile(r"^\s*my\s+performance\s*$", re.IGNORECASE)
 PERFORMANCE_OWNER_RX  = re.compile(r"^\s*performance\s+@?(\S+)\s*$", re.IGNORECASE)
 NEW_CUSTOMER_ID_RX    = re.compile(r'app\s*:\s*\S+\s*@(\S+)', re.IGNORECASE)
 
+# --- NEW REGEXES FOR ADMIN PERMISSIONS ---
+ADMIN_ALLOW_RX = re.compile(r"^\s*admin\s+@?(\S+)\s+allow\s+to\s+use\s+(.+)\s*$", re.IGNORECASE)
+ADMIN_STOP_ALLOW_RX = re.compile(r"^\s*admin\s+@?(\S+)\s+stop\s+allow\s+to\s+use\s+(.+)\s*$", re.IGNORECASE)
+LIST_PERMISSIONS_RX = re.compile(r"^\s*list\s+permissions\s+@?(\S+)\s*$", re.IGNORECASE)
+
+
 def _looks_like_phone(s: str) -> bool:
     return bool(PHONE_LIKE_RX.fullmatch((s or "").strip()))
 
@@ -803,7 +814,9 @@ async def _clear_one_issued(user_id: int, kind: str, value_to_clear: str, new_cu
 
             # Add to the cleared_items log for verification
             cleared_log = state.setdefault("cleared_items", {})
+            # FIX: Ensure user_cleared is a list to avoid a TypeError
             user_cleared = cleared_log.setdefault(user_id_str, [])
+            
             user_cleared.append({
                 "cleared_item": value_to_clear,
                 "new_customer_id": new_customer_id,
@@ -1118,6 +1131,8 @@ async def _get_daily_excel_report(target_day: date) -> Tuple[Optional[str], Opti
     if not user_rows and not owner_rows:
         return ("No data for that day.", None)
     try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
         excel_buffer = _style_and_save_excel(user_rows, owner_rows)
         return (None, excel_buffer)
     except Exception as e:
@@ -1197,6 +1212,55 @@ def _get_commands_text() -> str:
 async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, update: Update) -> Optional[str]:
     is_super = _is_super_admin(update)
     
+    # --- NEW PERMISSION COMMANDS (Super Admin Only) ---
+    if is_super:
+        m = ADMIN_ALLOW_RX.match(text)
+        if m:
+            admin_name = m.group(1).lower()
+            command = m.group(2).strip().lower()
+            
+            if admin_name not in state["admins"]:
+                return f"Admin @{admin_name} not found. Use 'add admin @{admin_name}' first."
+            
+            permissions = state.setdefault("admin_permissions", {}).setdefault(admin_name, [])
+            if command in permissions:
+                return f"Admin @{admin_name} already has permission for '{command}'."
+                
+            permissions.append(command)
+            await save_state()
+            return f"Granted permission for '{command}' to admin @{admin_name}."
+
+        m = ADMIN_STOP_ALLOW_RX.match(text)
+        if m:
+            admin_name = m.group(1).lower()
+            command = m.group(2).strip().lower()
+            
+            if admin_name not in state["admins"]:
+                return f"Admin @{admin_name} not found."
+            
+            permissions = state.setdefault("admin_permissions", {}).setdefault(admin_name, [])
+            if command not in permissions:
+                return f"Admin @{admin_name} does not have permission for '{command}'."
+
+            permissions.remove(command)
+            if not permissions:
+                del state["admin_permissions"][admin_name]
+            await save_state()
+            return f"Revoked permission for '{command}' from admin @{admin_name}."
+            
+        m = LIST_PERMISSIONS_RX.match(text)
+        if m:
+            admin_name = m.group(1).lower()
+            permissions = state.setdefault("admin_permissions", {}).get(admin_name, [])
+            
+            if not permissions:
+                return f"Admin @{admin_name} has no special permissions."
+                
+            lines = [f"<b>Permissions for @{admin_name}:</b>"]
+            lines += [f"- <code>{p}</code>" for p in permissions]
+            return "\n".join(lines)
+
+
     # --- SUPER ADMIN ONLY COMMANDS (Cannot be delegated) ---
     if is_super:
         m = ADD_ADMIN_RX.match(text)
@@ -1258,145 +1322,6 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
             await save_state()
             stop_msg = " and will be stopped" if state["priority_queue"]["stop_after"] else ""
             return f"Priority queue activated: Next {count} customers will be directed to {owner_name}{stop_msg}."
-
-    # --- ADMIN & SUPER ADMIN COMMANDS ---
-    m = STOP_OPEN_RX.match(text)
-    if m:
-        action, target_raw = m.groups(); is_stop = action.lower() == "stop"
-        kind, value = _parse_stop_open_target(target_raw)
-
-        if kind == 'owner':
-            owner = _find_owner_group(value)
-            if not owner: return f"Owner '{value}' not found."
-            owner["disabled"] = bool(is_stop); owner.pop("disabled_until", None)
-            await _rebuild_pools_preserving_rotation()
-            return f"{'Stopped' if is_stop else 'Opened'} owner {value}."
-        
-        # Super admin can stop anything
-        if is_super:
-            t = target_raw.lower()
-            if t in ("all whatsapp", "all whatsapps", "whatsapp all", "all wa", "wa all"):
-                total = changed = 0
-                for owner in OWNER_DATA:
-                    for w in owner.get("whatsapp", []):
-                        total += 1
-                        if w.get("disabled") != is_stop: w["disabled"] = is_stop; changed += 1
-                await _rebuild_pools_preserving_rotation()
-                return f"{'Stopped' if is_stop else 'Opened'} all WhatsApp numbers — changed {changed}/{total}."
-
-            if t in ("all username", "all usernames", "username all", "usernames"):
-                total = changed = 0
-                for owner in OWNER_DATA:
-                    for e in owner.get("entries", []):
-                        total += 1
-                        if e.get("disabled") != is_stop: e["disabled"] = is_stop; changed += 1
-                await _rebuild_pools_preserving_rotation()
-                return f"{'Stopped' if is_stop else 'Opened'} all usernames — changed {changed}/{total}."
-            
-            if kind == "phone":
-                norm_n = _norm_phone(value); found = False
-                for owner in OWNER_DATA:
-                    for w in owner.get("whatsapp", []):
-                        if _norm_phone(w.get("number")) == norm_n: w["disabled"] = is_stop; found = True
-                if not found: return f"WhatsApp number {value} not found."
-                await _rebuild_pools_preserving_rotation()
-                return f"{'Stopped' if is_stop else 'Opened'} WhatsApp {value}."
-            if kind == "username":
-                norm_h = _norm_handle(value); found = False
-                for owner in OWNER_DATA:
-                    for e in owner.get("entries", []):
-                        if _norm_handle(e.get("telegram")) == norm_h: e["disabled"] = is_stop; found = True
-                if not found: return f"Username {value} not found."
-                await _rebuild_pools_preserving_rotation()
-                return f"{'Stopped' if is_stop else 'Opened'} username {value}."
-
-    m = ADD_USERNAME_RX.match(text)
-    if m:
-        handle, owner_name = m.groups(); owner = _find_owner_group(owner_name)
-        if not owner: return f"Owner '{owner_name}' not found."
-        norm_h = _norm_handle(handle)
-        if any(_norm_handle(e.get("telegram")) == norm_h for e in owner["entries"]): return f"@{handle} already exists for owner {owner_name}."
-        owner["entries"].append({"telegram": handle, "phone": "", "disabled": False})
-        await _rebuild_pools_preserving_rotation()
-        return f"Added username @{handle} to {owner_name}."
-
-    m = ADD_WHATSAPP_RX.match(text)
-    if m:
-        num, owner_name = m.groups(); owner = _find_owner_group(owner_name)
-        if not owner: return f"Owner '{owner_name}' not found."
-        norm_n = _norm_phone(num)
-        if any(_norm_phone(w.get("number")) == norm_n for w in owner["whatsapp"]): return f"Number {num} already exists for owner {owner_name}."
-        owner["whatsapp"].append({"number": num, "disabled": False})
-        await _rebuild_pools_preserving_rotation()
-        return f"Added WhatsApp {num} to {owner_name}."
-
-    m = DEL_USERNAME_RX.match(text)
-    if m:
-        handle = m.group(1); norm_h = _norm_handle(handle); found = False
-        for owner in OWNER_DATA:
-            before = len(owner["entries"])
-            owner["entries"] = [e for e in owner["entries"] if _norm_handle(e.get("telegram")) != norm_h]
-            if len(owner["entries"]) < before: found = True
-        if not found: return f"Username @{handle} not found."
-        await _rebuild_pools_preserving_rotation()
-        return f"Deleted username @{handle} from all owners."
-
-    m = DEL_WHATSAPP_RX.match(text)
-    if m:
-        num = m.group(1); norm_n = _norm_phone(num); found = False
-        for owner in OWNER_DATA:
-            before = len(owner["whatsapp"])
-            owner["whatsapp"] = [w for w in owner["whatsapp"] if _norm_phone(w.get("number")) != norm_n]
-            if len(owner["whatsapp"]) < before: found = True
-        if not found: return f"WhatsApp number {num} not found."
-        await _rebuild_pools_preserving_rotation()
-        return f"Deleted WhatsApp number {num} from all owners."
-
-    # --- SUPER ADMIN ONLY (continued) ---
-    if is_super:
-        if LIST_OWNERS_RX.match(text):
-            if not OWNER_DATA: return "No owners configured."
-            lines = ["<b>Owner Roster:</b>"]
-            for o in OWNER_DATA:
-                status = "PAUSED" if _owner_is_paused(o) else "active"
-                u_count = len([e for e in o.get("entries", []) if not e.get("disabled")])
-                w_count = len([w for w in o.get("whatsapp", []) if not w.get("disabled")])
-                lines.append(f"- <code>{o['owner']}</code> ({status}): {u_count} usernames, {w_count} whatsapps")
-            return "\n".join(lines)
-
-        if LIST_DISABLED_RX.match(text):
-            disabled = [o for o in OWNER_DATA if _owner_is_paused(o)]
-            if not disabled: return "No owners are currently disabled/paused."
-            lines = ["<b>Disabled/Paused Owners:</b>"]
-            for o in disabled:
-                reason = f" (until {o['disabled_until']})" if o.get("disabled_until") else ""
-                lines.append(f"- <code>{o['owner']}</code>{reason}")
-            return "\n".join(lines)
-
-        m = LIST_OWNER_DETAIL_RX.match(text) or LIST_OWNER_ALIAS_RX.match(text)
-        if m:
-            name = m.group(1).strip()
-            if name.lower() in ("owners", "disabled"): return None
-            owner = _find_owner_group(name)
-            if not owner: return f"Owner '{name}' not found."
-            
-            owner_status_flag = " ⛔" if _owner_is_paused(owner) else ""
-            lines = [f"<b>Details for {owner['owner']}{owner_status_flag}:</b>"]
-            if owner.get("entries"):
-                lines.append("<u>Usernames:</u>")
-                for e in owner["entries"]:
-                    flag = " ⛔" if e.get("disabled") else ""; h = e.get("telegram") or ""
-                    if h and not h.startswith("@"): h = "@" + h
-                    lines.append(f"- {h}{flag}")
-            if owner.get("whatsapp"):
-                lines.append("<u>WhatsApp Numbers:</u>")
-                for w in owner["whatsapp"]:
-                    flag = " ⛔" if w.get("disabled") else ""
-                    lines.append(f"- {w['number']}{flag}")
-            if len(lines) == 1: lines.append("No entries found.")
-            return "\n".join(lines)
-
-        if REMIND_ALL_RX.match(text): return await _send_all_pending_reminders(context)
         
         m = CLEAR_PENDING_RX.match(text)
         if m:
@@ -1472,6 +1397,148 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
             owner_name = m.group(1).lower()
             if not _find_owner_group(owner_name): return f"Owner '@{owner_name}' not found."
             return await _get_owner_performance_text(owner_name)
+    
+    # --- ADMIN & SUPER ADMIN COMMANDS (PERMISSION CHECKED) ---
+    m = STOP_OPEN_RX.match(text)
+    if m and _has_permission(update, "stop/open"):
+        action, target_raw = m.groups(); is_stop = action.lower() == "stop"
+        kind, value = _parse_stop_open_target(target_raw)
+
+        if kind == 'owner':
+            owner = _find_owner_group(value)
+            if not owner: return f"Owner '{value}' not found."
+            owner["disabled"] = bool(is_stop); owner.pop("disabled_until", None)
+            await _rebuild_pools_preserving_rotation()
+            return f"{'Stopped' if is_stop else 'Opened'} owner {value}."
+        
+        if is_super:
+            t = target_raw.lower()
+            if t in ("all whatsapp", "all whatsapps", "whatsapp all", "all wa", "wa all"):
+                total = changed = 0
+                for owner in OWNER_DATA:
+                    for w in owner.get("whatsapp", []):
+                        total += 1
+                        if w.get("disabled") != is_stop: w["disabled"] = is_stop; changed += 1
+                await _rebuild_pools_preserving_rotation()
+                return f"{'Stopped' if is_stop else 'Opened'} all WhatsApp numbers — changed {changed}/{total}."
+
+            if t in ("all username", "all usernames", "username all", "usernames"):
+                total = changed = 0
+                for owner in OWNER_DATA:
+                    for e in owner.get("entries", []):
+                        total += 1
+                        if e.get("disabled") != is_stop: e["disabled"] = is_stop; changed += 1
+                await _rebuild_pools_preserving_rotation()
+                return f"{'Stopped' if is_stop else 'Opened'} all usernames — changed {changed}/{total}."
+            
+            if kind == "phone":
+                norm_n = _norm_phone(value); found = False
+                for owner in OWNER_DATA:
+                    for w in owner.get("whatsapp", []):
+                        if _norm_phone(w.get("number")) == norm_n: w["disabled"] = is_stop; found = True
+                if not found: return f"WhatsApp number {value} not found."
+                await _rebuild_pools_preserving_rotation()
+                return f"{'Stopped' if is_stop else 'Opened'} WhatsApp {value}."
+            if kind == "username":
+                norm_h = _norm_handle(value); found = False
+                for owner in OWNER_DATA:
+                    for e in owner.get("entries", []):
+                        if _norm_handle(e.get("telegram")) == norm_h: e["disabled"] = is_stop; found = True
+                if not found: return f"Username {value} not found."
+                await _rebuild_pools_preserving_rotation()
+                return f"{'Stopped' if is_stop else 'Opened'} username {value}."
+
+    m = ADD_USERNAME_RX.match(text)
+    if m and _has_permission(update, "add_username"):
+        handle, owner_name = m.groups(); owner = _find_owner_group(owner_name)
+        if not owner: return f"Owner '{owner_name}' not found."
+        norm_h = _norm_handle(handle)
+        if any(_norm_handle(e.get("telegram")) == norm_h for e in owner["entries"]): return f"@{handle} already exists for owner {owner_name}."
+        owner["entries"].append({"telegram": handle, "phone": "", "disabled": False})
+        await _rebuild_pools_preserving_rotation()
+        return f"Added username @{handle} to {owner_name}."
+
+    m = ADD_WHATSAPP_RX.match(text)
+    if m and _has_permission(update, "add_whatsapp"):
+        num, owner_name = m.groups(); owner = _find_owner_group(owner_name)
+        if not owner: return f"Owner '{owner_name}' not found."
+        norm_n = _norm_phone(num)
+        if any(_norm_phone(w.get("number")) == norm_n for w in owner["whatsapp"]): return f"Number {num} already exists for owner {owner_name}."
+        owner["whatsapp"].append({"number": num, "disabled": False})
+        await _rebuild_pools_preserving_rotation()
+        return f"Added WhatsApp {num} to {owner_name}."
+
+    m = DEL_USERNAME_RX.match(text)
+    if m and _has_permission(update, "delete_username"):
+        handle = m.group(1); norm_h = _norm_handle(handle); found = False
+        for owner in OWNER_DATA:
+            before = len(owner["entries"])
+            owner["entries"] = [e for e in owner["entries"] if _norm_handle(e.get("telegram")) != norm_h]
+            if len(owner["entries"]) < before: found = True
+        if not found: return f"Username @{handle} not found."
+        await _rebuild_pools_preserving_rotation()
+        return f"Deleted username @{handle} from all owners."
+
+    m = DEL_WHATSAPP_RX.match(text)
+    if m and _has_permission(update, "delete_whatsapp"):
+        num = m.group(1); norm_n = _norm_phone(num); found = False
+        for owner in OWNER_DATA:
+            before = len(owner["whatsapp"])
+            owner["whatsapp"] = [w for w in owner["whatsapp"] if _norm_phone(w.get("number")) != norm_n]
+            if len(owner["whatsapp"]) < before: found = True
+        if not found: return f"WhatsApp number {num} not found."
+        await _rebuild_pools_preserving_rotation()
+        return f"Deleted WhatsApp number {num} from all owners."
+
+    # --- LIST COMMANDS (PERMISSION CHECKED) ---
+    if LIST_OWNERS_RX.match(text) and _has_permission(update, "list_owners"):
+        if not OWNER_DATA: return "No owners configured."
+        lines = ["<b>Owner Roster:</b>"]
+        for o in OWNER_DATA:
+            status = "PAUSED" if _owner_is_paused(o) else "active"
+            u_count = len([e for e in o.get("entries", []) if not e.get("disabled")])
+            w_count = len([w for w in o.get("whatsapp", []) if not w.get("disabled")])
+            lines.append(f"- <code>{o['owner']}</code> ({status}): {u_count} usernames, {w_count} whatsapps")
+        return "\n".join(lines)
+
+    if LIST_DISABLED_RX.match(text) and _has_permission(update, "list_disabled"):
+        disabled = [o for o in OWNER_DATA if _owner_is_paused(o)]
+        if not disabled: return "No owners are currently disabled/paused."
+        lines = ["<b>Disabled/Paused Owners:</b>"]
+        for o in disabled:
+            reason = f" (until {o['disabled_until']})" if o.get("disabled_until") else ""
+            lines.append(f"- <code>{o['owner']}</code>{reason}")
+        return "\n".join(lines)
+
+    m = LIST_OWNER_DETAIL_RX.match(text) or LIST_OWNER_ALIAS_RX.match(text)
+    if m and _has_permission(update, "list_owner_detail"):
+        name = m.group(1).strip()
+        if name.lower() in ("owners", "disabled"): return None
+        owner = _find_owner_group(name)
+        if not owner: return f"Owner '{name}' not found."
+        
+        owner_status_flag = " ⛔" if _owner_is_paused(owner) else ""
+        lines = [f"<b>Details for {owner['owner']}{owner_status_flag}:</b>"]
+        if owner.get("entries"):
+            lines.append("<u>Usernames:</u>")
+            for e in owner["entries"]:
+                flag = " ⛔" if e.get("disabled") else ""; h = e.get("telegram") or ""
+                if h and not h.startswith("@"): h = "@" + h
+                lines.append(f"- {h}{flag}")
+        if owner.get("whatsapp"):
+            lines.append("<u>WhatsApp Numbers:</u>")
+            for w in owner["whatsapp"]:
+                flag = " ⛔" if w.get("disabled") else ""
+                lines.append(f"- {w['number']}{flag}")
+        if len(lines) == 1: lines.append("No entries found.")
+        return "\n".join(lines)
+    
+    if REMIND_ALL_RX.match(text) and _has_permission(update, "remind"): return await _send_all_pending_reminders(context)
+
+    # If the user is an admin but the command is not in their permission list,
+    # and they're not a super admin, reply with an error.
+    if _is_admin(update) and not is_super:
+        return "You do not have permission to use that command."
 
     return None
 
