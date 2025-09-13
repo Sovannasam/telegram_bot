@@ -157,6 +157,16 @@ async def setup_database():
                 PRIMARY KEY (day, user_id)
             );
         """)
+        # NEW: Table for owner performance
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS owner_daily_performance (
+                day DATE NOT NULL,
+                owner_name TEXT NOT NULL,
+                telegram_count INTEGER NOT NULL DEFAULT 0,
+                whatsapp_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (day, owner_name)
+            );
+        """)
     log.info("Database schema is ready.")
 
 
@@ -282,6 +292,14 @@ def _is_admin(update: Update) -> bool:
     u = update.effective_user
     if not u: return False
     return (u.username or "").lower() == ADMIN_USERNAME.lower()
+
+# NEW: Function to check if a user is a registered owner
+def _is_owner(user: Optional[Update.effective_user]) -> bool:
+    if not user or not user.username:
+        return False
+    norm_username = _norm_owner_name(user.username)
+    return any(_norm_owner_name(g.get("owner", "")) == norm_username for g in OWNER_DATA)
+
 def _owner_is_paused(group: dict) -> bool:
     if group.get("disabled") or group.get("active") is False: return True
     until = group.get("disabled_until")
@@ -441,6 +459,31 @@ async def _increment_user_confirmation_count(user_id: int):
             """, _logical_day_today(), user_id)
     except Exception as e:
         log.warning(f"User confirmation count write failed for {user_id}: {e}")
+
+# NEW: Function to increment owner performance counts
+async def _increment_owner_performance(owner_name: str, kind: str):
+    """Increments telegram or whatsapp count for an owner on the current day."""
+    if not owner_name: return
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            if kind == 'username':
+                await conn.execute("""
+                    INSERT INTO owner_daily_performance (day, owner_name, telegram_count)
+                    VALUES ($1, $2, 1)
+                    ON CONFLICT (day, owner_name) DO UPDATE
+                    SET telegram_count = owner_daily_performance.telegram_count + 1;
+                """, _logical_day_today(), owner_name)
+            elif kind == 'whatsapp':
+                await conn.execute("""
+                    INSERT INTO owner_daily_performance (day, owner_name, whatsapp_count)
+                    VALUES ($1, $2, 1)
+                    ON CONFLICT (day, owner_name) DO UPDATE
+                    SET whatsapp_count = owner_daily_performance.whatsapp_count + 1;
+                """, _logical_day_today(), owner_name)
+    except Exception as e:
+        log.warning(f"Owner performance write failed for {owner_name}: {e}")
+
 
 async def _wa_get_count(number_norm: str, day: date) -> int:
     try:
@@ -635,7 +678,6 @@ WHO_USING_REGEX = re.compile(
 )
 NEED_USERNAME_RX = re.compile(r"^\s*i\s*need\s*(?:user\s*name|username)\s*$", re.IGNORECASE)
 NEED_WHATSAPP_RX = re.compile(r"^\s*i\s*need\s*(?:id\s*)?whats?app\s*$", re.IGNORECASE)
-# MODIFIED: Made the App ID detection more flexible
 APP_ID_RX = re.compile(r"\bapp\b.*?\@([^\s]+)", re.IGNORECASE)
 
 STOP_OPEN_RX          = re.compile(r"^\s*(stop|open)\s+(.+?)\s*$", re.IGNORECASE)
@@ -662,6 +704,9 @@ OWNER_REPORT_RX       = re.compile(r"^\s*owner\s+report(?:\s+(yesterday|today|\d
 COMMANDS_RX           = re.compile(r"^\s*commands\s*$", re.IGNORECASE)
 MY_DETAIL_RX          = re.compile(r"^\s*my\s+detail\s*$", re.IGNORECASE)
 DETAIL_USER_RX        = re.compile(r"^\s*detail\s+@?(\S+)\s*$", re.IGNORECASE)
+# NEW: Regex for performance commands
+MY_PERFORMANCE_RX     = re.compile(r"^\s*my\s+performance(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
+PERFORMANCE_OWNER_RX  = re.compile(r"^\s*performance\s+@?(\S+?)(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 
 
 def _looks_like_phone(s: str) -> bool:
@@ -724,17 +769,22 @@ def mention_user_html(user_id: int) -> str:
 def _issued_bucket(kind: str) -> Dict[str, list]:
     return state.setdefault("issued", {}).setdefault(kind, {})
 
-async def _set_issued(user_id: int, chat_id: int, kind: str, value: str):
+# MODIFIED: _set_issued now accepts additional context
+async def _set_issued(user_id: int, chat_id: int, kind: str, value: str, context_data: Optional[Dict] = None):
     bucket = _issued_bucket(kind)
     user_id_str = str(user_id)
     if user_id_str not in bucket:
         bucket[user_id_str] = []
-
-    bucket[user_id_str].append({
+    
+    item_data = {
         "value": value,
         "ts": datetime.now(TIMEZONE).isoformat(),
         "chat_id": chat_id
-    })
+    }
+    if context_data:
+        item_data.update(context_data)
+        
+    bucket[user_id_str].append(item_data)
     await save_state()
 
 async def _clear_issued(user_id: int, kind: str, value_to_clear: str) -> bool:
@@ -816,7 +866,7 @@ def _find_country_in_text(text: str) -> Tuple[Optional[str], Optional[str]]:
     return potential_country, 'not_allowed'
 
 # =============================
-# DETAIL COMMANDS
+# DETAIL & PERFORMANCE COMMANDS
 # =============================
 async def _get_user_country_counts(user_id: int) -> List[Tuple[str, int]]:
     try:
@@ -844,6 +894,20 @@ async def _get_user_confirmation_count(user_id: int) -> int:
     except Exception as e:
         log.warning(f"User confirmation count read failed for {user_id}: {e}")
         return 0
+
+async def _get_owner_performance(owner_name: str, day: date) -> Tuple[int, int]:
+    """Fetches an owner's performance stats for a given day."""
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT telegram_count, whatsapp_count FROM owner_daily_performance WHERE day=$1 AND owner_name=$2",
+                day, owner_name
+            )
+            return (row['telegram_count'], row['whatsapp_count']) if row else (0, 0)
+    except Exception as e:
+        log.warning(f"Owner performance read failed for {owner_name}: {e}")
+        return (0, 0)
 
 async def _get_user_detail_text(user_id: int) -> str:
     user_info = state.get("user_names", {}).get(str(user_id), {})
@@ -885,6 +949,19 @@ async def _get_user_detail_text(user_id: int) -> str:
     else:
         lines.append("\n<b>✅ No Pending WhatsApps</b>")
     
+    return "\n".join(lines)
+
+
+# NEW: Function to generate the performance report text
+async def _get_owner_performance_text(owner_name: str, day: date) -> str:
+    """Generates a formatted string of an owner's daily performance."""
+    tg_count, wa_count = await _get_owner_performance(owner_name, day)
+    total = tg_count + wa_count
+    
+    lines = [f"<b>📊 Performance for @{owner_name} on {day.isoformat()}</b>"]
+    lines.append(f"<b>- Customers via Telegram:</b> {tg_count}")
+    lines.append(f"<b>- Customers via WhatsApp:</b> {wa_count}")
+    lines.append(f"<b>- Total Customers:</b> {total}")
     return "\n".join(lines)
 
 
@@ -1065,6 +1142,7 @@ def _get_commands_text() -> str:
 <code>i need whatsapp</code> - Request a WhatsApp number.
 <code>who's using @item</code> - Check the owner of an item.
 <code>my detail</code> - See your own daily stats.
+<code>my performance</code> - See your daily customer stats (owners only).
 
 <b>--- Admin: Owner & Item Management ---</b>
 <code>add owner @owner</code>
@@ -1092,6 +1170,7 @@ def _get_commands_text() -> str:
 <b>--- Admin: Reports & Manual Actions ---</b>
 <code>report [today|yesterday|YYYY-MM-DD]</code>
 <code>owner report [today|yesterday|YYYY-MM-DD]</code>
+<code>performance @owner [day]</code> - See owner's customer stats.
 <code>remind user</code>
 <code>clear pending @item_or_number</code>
 <code>clear all pending</code>
@@ -1479,7 +1558,8 @@ async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
                 await conn.execute("DELETE FROM user_daily_activity;")
                 await conn.execute("DELETE FROM user_daily_country_counts;")
                 await conn.execute("DELETE FROM user_daily_confirmations;")
-                log.info("Cleared daily WhatsApp, user activity, country, and confirmation quotas from database.")
+                await conn.execute("DELETE FROM owner_daily_performance;") # NEW
+                log.info("Cleared daily WhatsApp, user activity, country, confirmation, and performance quotas from database.")
         except Exception as e:
             log.error(f"Failed to clear daily tables: {e}")
 
@@ -1501,11 +1581,25 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cache_user_info(update.effective_user)
 
     async with db_lock:
+        # User "my detail" command
         if MY_DETAIL_RX.match(text):
             detail_text = await _get_user_detail_text(uid)
             await msg.reply_html(detail_text)
             return
+            
+        # NEW: Owner "my performance" command
+        m_my_perf = MY_PERFORMANCE_RX.match(text)
+        if m_my_perf:
+            if _is_owner(update.effective_user):
+                owner_name = _norm_owner_name(update.effective_user.username)
+                target_day = _parse_report_day(m_my_perf.group(1))
+                perf_text = await _get_owner_performance_text(owner_name, target_day)
+                await msg.reply_html(perf_text)
+            else:
+                await msg.reply_text("This command is only for registered owners.")
+            return
 
+        # Admin: Report
         mrep = SEND_REPORT_RX.match(text)
         if _is_admin(update) and mrep:
             target_day = _parse_report_day(mrep.group(1))
@@ -1520,12 +1614,27 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption=f"Daily summary (logical day starting 05:30) — {target_day}"
                 )
             return
+        
+        # NEW: Admin "performance @owner" command
+        m_owner_perf = PERFORMANCE_OWNER_RX.match(text)
+        if _is_admin(update) and m_owner_perf:
+            owner_name_raw, day_str = m_owner_perf.groups()
+            owner_name = _norm_owner_name(owner_name_raw)
+            if not _find_owner_group(owner_name):
+                await msg.reply_text(f"Owner '{owner_name}' not found.")
+                return
+            target_day = _parse_report_day(day_str)
+            perf_text = await _get_owner_performance_text(owner_name, target_day)
+            await msg.reply_html(perf_text)
+            return
 
+        # Admin: Console
         if _is_admin(update):
             admin_reply = await _handle_admin_command(text, context, update)
             if admin_reply:
                 await msg.reply_html(admin_reply)
                 return
+            # Prevent non-admin commands from being misinterpreted as admin commands
             elif any(text.lower().startswith(cmd) for cmd in ['add ', 'delete ', 'list ', 'stop ', 'open ', 'remind ', 'take ', 'clear ', 'ban ', 'unban ', '+', 'owner report', 'commands', 'detail ']):
                 await msg.reply_text("I don't recognize that admin command.")
                 return
@@ -1537,37 +1646,28 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     app_id_confirmed_raw = f"@{match.group(1)}"
                     found_and_counted = False
                     
-                    # First, try a direct, exact match.
+                    # Search all users to find who this App ID belongs to
                     for user_id_str, items in list(_issued_bucket("app_id").items()):
                         if found_and_counted: break
                         for item in items:
                             stored_app_id_raw = item.get("value", "")
-                            if stored_app_id_raw == app_id_confirmed_raw:
+                            
+                            # MODIFIED: Try both direct and normalized match
+                            match_is_found = (stored_app_id_raw == app_id_confirmed_raw or 
+                                              _normalize_app_id(stored_app_id_raw) == _normalize_app_id(app_id_confirmed_raw))
+
+                            if match_is_found:
                                 user_id_of_item = int(user_id_str)
+                                source_owner = item.get("source_owner")
+                                source_kind = item.get("source_kind")
+
                                 await _increment_user_confirmation_count(user_id_of_item)
-                                await _log_event("app_id", "confirmed", update, stored_app_id_raw)
+                                await _increment_owner_performance(source_owner, source_kind)
+                                await _log_event("app_id", "confirmed", update, stored_app_id_raw, owner=source_owner)
                                 await _clear_one_issued(user_id_of_item, "app_id", stored_app_id_raw)
-                                log.info(f"Owner {update.effective_user.username} confirmed App ID {stored_app_id_raw} via direct match. Counted and cleared for user {user_id_of_item}")
+                                log.info(f"Owner {update.effective_user.username} confirmed App ID {stored_app_id_raw}. Counted for {source_owner} and cleared for user {user_id_of_item}")
                                 found_and_counted = True
                                 break
-                    
-                    # If no direct match, try a normalized match to handle invisible characters or minor differences.
-                    if not found_and_counted:
-                        app_id_confirmed_norm = _normalize_app_id(app_id_confirmed_raw)
-                        for user_id_str, items in list(_issued_bucket("app_id").items()):
-                            if found_and_counted: break
-                            for item in items:
-                                stored_app_id_raw = item.get("value", "")
-                                stored_app_id_norm = _normalize_app_id(stored_app_id_raw)
-                                
-                                if stored_app_id_norm == app_id_confirmed_norm:
-                                    user_id_of_item = int(user_id_str)
-                                    await _increment_user_confirmation_count(user_id_of_item)
-                                    await _log_event("app_id", "confirmed", update, stored_app_id_raw)
-                                    await _clear_one_issued(user_id_of_item, "app_id", stored_app_id_raw)
-                                    log.info(f"Owner {update.effective_user.username} confirmed App ID {stored_app_id_raw} via normalized match. Counted and cleared for user {user_id_of_item}")
-                                    found_and_counted = True
-                                    break
                     
                     if not found_and_counted:
                         await msg.reply_text("Wrong ID, please check.")
@@ -1578,9 +1678,28 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             app_id_match = APP_ID_RX.search(text)
             if app_id_match:
                 app_id = f"@{app_id_match.group(1)}"
-                await _set_issued(uid, chat_id, "app_id", app_id)
-                await _log_event("app_id", "issued", update, app_id)
-                log.info(f"Recorded new pending App ID '{app_id}' for user {uid}")
+                
+                # Find the most recent pending username/whatsapp to link the app_id to an owner
+                last_item = None
+                last_ts = datetime.min.replace(tzinfo=TIMEZONE)
+                for kind_to_check in ("username", "whatsapp"):
+                    user_items = _issued_bucket(kind_to_check).get(str(uid), [])
+                    if user_items:
+                        latest_in_kind = user_items[-1]
+                        item_ts = datetime.fromisoformat(latest_in_kind["ts"])
+                        if item_ts > last_ts:
+                            last_ts = item_ts
+                            last_item = latest_in_kind
+                            last_item['kind'] = kind_to_check
+                
+                context_data = {}
+                if last_item:
+                    context_data["source_owner"] = last_item.get("owner")
+                    context_data["source_kind"] = last_item.get("kind")
+
+                await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
+                await _log_event("app_id", "issued", update, app_id, owner=context_data.get("source_owner", ""))
+                log.info(f"Recorded new pending App ID '{app_id}' for user {uid} linked to owner {context_data.get('source_owner')}")
 
             values_found_in_message = set()
             user_id_str = str(uid)
@@ -1631,7 +1750,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply = "No available username." if not rec else f"@{rec['owner']}\n{rec['username']}"
                 await msg.reply_text(reply)
                 if rec:
-                    await _set_issued(uid, chat_id, "username", rec["username"])
+                    await _set_issued(uid, chat_id, "username", rec["username"], context_data={"owner": rec["owner"]})
                     await _log_event("username", "issued", update, rec["username"], owner=rec["owner"])
                     await _increment_user_activity(uid, "username")
                 return
@@ -1660,7 +1779,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.reply_text(reply)
                 if rec:
                     await _wa_inc_count(_norm_phone(rec["number"]), _logical_day_today())
-                    await _set_issued(uid, chat_id, "whatsapp", rec["number"])
+                    await _set_issued(uid, chat_id, "whatsapp", rec["number"], context_data={"owner": rec["owner"]})
                     await _log_event("whatsapp", "issued", update, rec["number"], owner=rec["owner"])
                     await _increment_user_activity(uid, "whatsapp")
                 return
@@ -1716,5 +1835,4 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
 
