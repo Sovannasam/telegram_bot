@@ -139,6 +139,16 @@ async def setup_database():
                 user_id BIGINT PRIMARY KEY
             );
         """)
+        # NEW: Table to store country counts for each user per day
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_daily_country_counts (
+                day DATE NOT NULL,
+                user_id BIGINT NOT NULL,
+                country TEXT NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (day, user_id, country)
+            );
+        """)
     log.info("Database schema is ready.")
 
 
@@ -397,6 +407,21 @@ async def _increment_user_activity(user_id: int, kind: str):
                 """, _logical_day_today(), user_id)
     except Exception as e:
         log.warning(f"User activity write failed for {user_id}: {e}")
+
+# NEW: Function to increment country counts
+async def _increment_user_country_count(user_id: int, country: str):
+    """Increments the count for a given country for a user on the current logical day."""
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO user_daily_country_counts (day, user_id, country, count)
+                VALUES ($1, $2, $3, 1)
+                ON CONFLICT (day, user_id, country) DO UPDATE
+                SET count = user_daily_country_counts.count + 1;
+            """, _logical_day_today(), user_id, country)
+    except Exception as e:
+        log.warning(f"User country count write failed for {user_id} and country {country}: {e}")
 
 async def _wa_get_count(number_norm: str, day: date) -> int:
     try:
@@ -798,6 +823,22 @@ def _find_country_in_text(text: str) -> Tuple[Optional[str], Optional[str]]:
 # =============================
 # DETAIL COMMANDS
 # =============================
+# NEW: Helper function to get country counts from DB
+async def _get_user_country_counts(user_id: int) -> List[Tuple[str, int]]:
+    """Fetches a user's country submission counts for the current logical day."""
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT country, count FROM user_daily_country_counts WHERE day=$1 AND user_id=$2 ORDER BY country",
+                _logical_day_today(), user_id
+            )
+            return [(row['country'], row['count']) for row in rows]
+    except Exception as e:
+        log.warning(f"User country count read failed for {user_id}: {e}")
+        return []
+
+# MODIFIED: Updated to include the country report
 async def _get_user_detail_text(user_id: int) -> str:
     """Generates a formatted string of a user's daily activity."""
     user_info = state.get("user_names", {}).get(str(user_id), {})
@@ -808,6 +849,9 @@ async def _get_user_detail_text(user_id: int) -> str:
     # Get today's request counts from the database
     username_reqs, whatsapp_reqs = await _get_user_activity(user_id)
 
+    # Get country counts for today
+    country_counts = await _get_user_country_counts(user_id)
+
     # Get pending items from the current state
     pending_usernames = [item['value'] for item in _issued_bucket("username").get(str(user_id), [])]
     pending_whatsapps = [item['value'] for item in _issued_bucket("whatsapp").get(str(user_id), [])]
@@ -816,6 +860,14 @@ async def _get_user_detail_text(user_id: int) -> str:
     lines = [f"<b>📊 Daily Detail for {user_display}</b>"]
     lines.append(f"<b>- Usernames Received:</b> {username_reqs}")
     lines.append(f"<b>- WhatsApps Received:</b> {whatsapp_reqs}")
+    
+    # Add country report section if data exists
+    if country_counts:
+        lines.append("") # Spacer
+        lines.append("<b>🌍 Country Submissions:</b>")
+        for country, count in country_counts:
+            lines.append(f"  - {country.title()}: {count}")
+
     lines.append("") # Spacer
 
     if pending_usernames:
@@ -1449,6 +1501,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             log.error(f"Failed to send recurring reminder to chat {r['chat_id']}: {e}")
 
 
+# MODIFIED: Added country counts table to the daily reset
 async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
     """Clears daily WhatsApp quotas and user activity for a new day."""
     log.info("Performing daily reset...")
@@ -1459,7 +1512,8 @@ async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
                 # These clear the usage counts for the new logical day
                 await conn.execute("DELETE FROM wa_daily_usage;")
                 await conn.execute("DELETE FROM user_daily_activity;")
-                log.info("Cleared daily WhatsApp and user activity quotas from database.")
+                await conn.execute("DELETE FROM user_daily_country_counts;") # Clear country counts
+                log.info("Cleared daily WhatsApp, user activity, and country quotas from database.")
         except Exception as e:
             log.error(f"Failed to clear daily tables: {e}")
 
@@ -1559,10 +1613,16 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 log.warning(f"Rejected post from user {uid}. Reason: {rejection_reason}. Told user to reuse item.")
                 return
             else:
-                # If allowed, proceed to clear
+                # MODIFIED: Increment country count if allowed, then clear items
+                # If we have a valid, allowed country, log it once for this message.
+                if country_status and country_status != 'not_allowed':
+                    await _increment_user_country_count(uid, country_status)
+                    log.info(f"Incremented country count for user {uid} for country '{country_status}'")
+                
+                # Proceed to clear any pending items found in the message
                 for kind in ("username", "whatsapp"):
                     for value_to_clear in values_found_in_message:
-                         if await _clear_one_issued(uid, kind, value_to_clear):
+                        if await _clear_one_issued(uid, kind, value_to_clear):
                             await _log_event(kind, "cleared", update, value_to_clear, owner="")
                             log.info(f"Auto-cleared ONE pending {kind} for user {uid}: {value_to_clear}")
 
