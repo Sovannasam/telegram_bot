@@ -200,7 +200,6 @@ ADMIN_PERMISSIONS: Dict[str, List[str]] = {}
 # =============================
 # PERMISSIONS & ADMINS
 # =============================
-# MODIFIED: Changed from permission groups to individual commands
 COMMAND_PERMISSIONS = {
     'add owner', 'delete owner', 'add username', 'delete username', 'add whatsapp', 'delete whatsapp',
     'stop open', 'take customer', 'ban whatsapp', 'unban whatsapp', 'report',
@@ -747,7 +746,6 @@ MY_PERFORMANCE_RX     = re.compile(r"^\s*my\s+performance(?:\s+(yesterday|today|
 PERFORMANCE_OWNER_RX  = re.compile(r"^\s*performance\s+@?(\S+?)(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 ADD_ADMIN_RX          = re.compile(r"^\s*add\s+admin\s+@?(\S+)\s*$", re.IGNORECASE)
 DELETE_ADMIN_RX       = re.compile(r"^\s*delete\s+admin\s+@?(\S+)\s*$", re.IGNORECASE)
-# MODIFIED: Updated Regex for command-based permissions
 ALLOW_ADMIN_CMD_RX    = re.compile(r"^\s*allow\s+@?(\S+)\s+to\s+use\s+command\s+(.+)\s*$", re.IGNORECASE)
 STOP_ALLOW_ADMIN_CMD_RX = re.compile(r"^\s*stop\s+allow\s+@?(\S+)\s+to\s+use\s+command\s+(.+)\s*$", re.IGNORECASE)
 LIST_ADMINS_RX        = re.compile(r"^\s*list\s+admins\s*$", re.IGNORECASE)
@@ -997,14 +995,46 @@ async def _get_user_detail_text(user_id: int) -> str:
 
 
 async def _get_owner_performance_text(owner_name: str, day: date) -> str:
-    """Generates a formatted string of an owner's daily performance."""
+    """Generates a formatted string of an owner's daily performance and inventory."""
+    # Daily Performance (from DB)
     tg_count, wa_count = await _get_owner_performance(owner_name, day)
-    total = tg_count + wa_count
+    total_customers = tg_count + wa_count
     
     lines = [f"<b>📊 Performance for @{owner_name} on {day.isoformat()}</b>"]
     lines.append(f"<b>- Customers via Telegram:</b> {tg_count}")
     lines.append(f"<b>- Customers via WhatsApp:</b> {wa_count}")
-    lines.append(f"<b>- Total Customers:</b> {total}")
+    lines.append(f"<b>- Total Customers:</b> {total_customers}")
+    lines.append("") # Spacer
+
+    # Inventory Stats (from OWNER_DATA)
+    owner_group = _find_owner_group(owner_name)
+    total_tg = 0
+    total_wa = 0
+    stopped_tg = []
+    stopped_wa = []
+
+    if owner_group:
+        total_tg = len(owner_group.get("entries", []))
+        total_wa = len(owner_group.get("whatsapp", []))
+        stopped_tg = [e.get("telegram") for e in owner_group.get("entries", []) if e.get("disabled")]
+        stopped_wa = [w.get("number") for w in owner_group.get("whatsapp", []) if w.get("disabled")]
+
+    lines.append("<b>📋 Current Inventory</b>")
+    lines.append(f"<b>- Total Telegram in Bot:</b> {total_tg}")
+    lines.append(f"<b>- Total WhatsApp in Bot:</b> {total_wa}")
+    
+    if stopped_tg:
+        lines.append("")
+        lines.append("<b>⛔ Stopped Telegram Usernames:</b>")
+        for u in stopped_tg:
+            lines.append(f"  - <code>{u}</code>")
+            
+    if stopped_wa:
+        lines.append("")
+        lines.append("<b>⛔ Stopped WhatsApp Numbers:</b>")
+        for w in stopped_wa:
+            lines.append(f"  - <code>{w}</code>")
+
     return "\n".join(lines)
 
 
