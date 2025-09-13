@@ -656,6 +656,7 @@ COMMANDS_RX           = re.compile(r"^\s*commands\s*$", re.IGNORECASE)
 MY_DETAIL_RX          = re.compile(r"^\s*my\s+detail\s*$", re.IGNORECASE)
 DETAIL_USER_RX        = re.compile(r"^\s*detail\s+@?(\S+)\s*$", re.IGNORECASE)
 MY_PERFORMANCE_RX     = re.compile(r"^\s*my\s+performance\s*$", re.IGNORECASE)
+PERFORMANCE_OWNER_RX  = re.compile(r"^\s*performance\s+@?(\S+)\s*$", re.IGNORECASE)
 NEW_CUSTOMER_ID_RX    = re.compile(r'app\s*:\s*\S+\s*@(\S+)', re.IGNORECASE)
 
 def _looks_like_phone(s: str) -> bool:
@@ -803,7 +804,7 @@ def _value_in_text(value: Optional[str], text: str) -> bool:
     else:
         v_digits = re.sub(r'\D', '', v_norm)
         text_digits = re.sub(r'\D', '', text_norm)
-        return v_digits and v_digits in text_digits
+        return v_digits and v_digits in text_norm
 
 async def _verify_and_credit_add(user_id: int, confirmed_id: str) -> bool:
     """
@@ -913,23 +914,42 @@ async def _get_owner_performance_text(owner_name: str) -> str:
     """Calculates and formats the performance report for a single owner."""
     today = _logical_day_today()
     pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT kind, COUNT(*) as count FROM audit_log WHERE owner = $1 AND action = 'issued' AND ts_local >= $2 GROUP BY kind",
-            owner_name, today
-        )
-    
+    owner_id = _find_user_id_by_name(owner_name)
+
     user_count = 0
     wa_count = 0
-    for row in rows:
-        if row['kind'] == 'username':
-            user_count = row['count']
-        elif row['kind'] == 'whatsapp':
-            wa_count = row['count']
-            
-    lines = [f"<b>📊 Your Performance Today ({owner_name}):</b>"]
+    adds = 0
+    subs = 0
+
+    async with pool.acquire() as conn:
+        # Get assigned items count from the audit log
+        rows_assigned = await conn.fetch(
+            "SELECT kind, COUNT(*) as count FROM audit_log WHERE lower(owner) = $1 AND action = 'issued' AND ts_local::date = $2 GROUP BY kind",
+            owner_name.lower(), today
+        )
+        for row in rows_assigned:
+            if row['kind'] == 'username':
+                user_count = row['count']
+            elif row['kind'] == 'whatsapp':
+                wa_count = row['count']
+        
+        # Get confirmed adds/subs count from the audit log
+        if owner_id:
+            rows_confirmed = await conn.fetch(
+                "SELECT action, COUNT(*) as count FROM audit_log WHERE user_id = $1 AND kind = 'confirmation' AND ts_local::date = $2 GROUP BY action",
+                owner_id, today
+            )
+            for row in rows_confirmed:
+                if row['action'] == 'add':
+                    adds = row['count']
+                elif row['action'] == 'subtract':
+                    subs = row['count']
+
+    lines = [f"<b>📊 Performance Today for Owner: @{owner_name}</b>"]
     lines.append(f"<b>- Usernames Assigned:</b> {user_count}")
     lines.append(f"<b>- WhatsApps Assigned:</b> {wa_count}")
+    lines.append(f"<b>- Customers Confirmed (+1):</b> {adds}")
+    lines.append(f"<b>- Confirmations Removed (-1):</b> {subs}")
     return "\n".join(lines)
 
 
@@ -1121,10 +1141,10 @@ def _get_commands_text() -> str:
 <code>i need username</code> - Request a username.
 <code>i need whatsapp</code> - Request a WhatsApp number.
 <code>who's using @item</code> - Check the owner of an item.
-<code>my detail</code> - See your own daily stats.
+<code>my detail</code> - See your own daily stats. (For regular users only)
 
 <b>--- Owner Commands ---</b>
-<code>my performance</code> - See your daily item assignment stats.
+<code>my performance</code> - See your daily item assignment stats. (Use this instead of 'my detail')
 
 <b>--- Admin: Owner & Item Management ---</b>
 <code>add owner @owner</code>
@@ -1160,6 +1180,7 @@ def _get_commands_text() -> str:
 <code>list disabled</code>
 <code>list @owner</code>
 <code>detail @user</code> - See a user's daily stats.
+<code>performance @owner</code> - See an owner's daily performance.
 """
 
 async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, update: Update) -> Optional[str]:
@@ -1430,6 +1451,13 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
             return f"User '{target_name}' not found."
         return await _get_user_detail_text(target_user_id)
 
+    m = PERFORMANCE_OWNER_RX.match(text)
+    if m:
+        owner_name = m.group(1).lower()
+        if not _find_owner_group(owner_name):
+            return f"Owner '@{owner_name}' not found."
+        return await _get_owner_performance_text(owner_name)
+
 
     return None
 
@@ -1579,15 +1607,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Use a single lock for the entire message handling process to ensure atomicity
     async with db_lock:
-        # User "my detail" command
+        sender_username = (msg.from_user.username or "").lower()
+        all_owners = {_norm_owner_name(o['owner']) for o in OWNER_DATA}
+        
+        # User "my detail" command - but not for owners
         if MY_DETAIL_RX.match(text):
+            if sender_username in all_owners:
+                return # Silently ignore for owners
             detail_text = await _get_user_detail_text(uid)
             await msg.reply_html(detail_text)
             return
             
         # Owner "my performance" command
-        sender_username = (msg.from_user.username or "").lower()
-        all_owners = {_norm_owner_name(o['owner']) for o in OWNER_DATA}
         if MY_PERFORMANCE_RX.match(text) and sender_username in all_owners:
             performance_text = await _get_owner_performance_text(sender_username)
             await msg.reply_html(performance_text)
@@ -1615,7 +1646,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if admin_reply:
                 await msg.reply_html(admin_reply)
                 return
-            elif any(text.lower().startswith(cmd) for cmd in ['add ', 'delete ', 'list ', 'stop ', 'open ', 'remind ', 'take ', 'clear ', 'ban ', 'unban ', '+', 'owner report', 'commands', 'detail ']):
+            elif any(text.lower().startswith(cmd) for cmd in ['add ', 'delete ', 'list ', 'stop ', 'open ', 'remind ', 'take ', 'clear ', 'ban ', 'unban ', '+', 'owner report', 'commands', 'detail ', 'performance ']):
                 await msg.reply_text("I don't recognize that admin command.")
                 return
 
@@ -1648,7 +1679,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     
                     customer_user_id = _find_user_id_by_name(customer_name)
                     if customer_user_id:
-                        if not await _verify_and_credit_add(customer_user_id, customer_id_str):
+                        if await _verify_and_credit_add(customer_user_id, customer_id_str):
+                            await _log_event("confirmation", "add", update, f"{customer_name} @{customer_id_str}")
+                        else:
                             owner_mention = mention_user_html(uid)
                             customer_mention = mention_user_html(customer_user_id)
                             reply_text = (
@@ -1670,6 +1703,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     customer_user_id = _find_user_id_by_name(customer_name)
                     if customer_user_id:
                         await _decrement_successful_adds(customer_user_id)
+                        await _log_event("confirmation", "subtract", update, customer_name)
                     else:
                         log.warning(f"Owner {sender_username} rejected customer '{customer_name}', but user could not be found.")
                     return
