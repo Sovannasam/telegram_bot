@@ -157,6 +157,7 @@ BASE_STATE = {
         "wa_owner_idx": 0, "wa_entry_idx": {},
     },
     "issued": {"username": {}, "whatsapp": {}},
+    "cleared_items": {}, # New: To track cleared items before owner confirmation
     "priority_queue": {
         "active": False,
         "owner": None,
@@ -211,6 +212,7 @@ async def load_state():
     state["rr"].setdefault("wa_entry_idx", {})
     state.setdefault("issued", {}).setdefault("username", {})
     state["issued"].setdefault("whatsapp", {})
+    state.setdefault("cleared_items", {})
     state.setdefault("priority_queue", BASE_STATE["priority_queue"])
 
 
@@ -653,9 +655,7 @@ OWNER_REPORT_RX       = re.compile(r"^\s*owner\s+report(?:\s+(yesterday|today|\d
 COMMANDS_RX           = re.compile(r"^\s*commands\s*$", re.IGNORECASE)
 MY_DETAIL_RX          = re.compile(r"^\s*my\s+detail\s*$", re.IGNORECASE)
 DETAIL_USER_RX        = re.compile(r"^\s*detail\s+@?(\S+)\s*$", re.IGNORECASE)
-OWNER_CONFIRMATION_RX = re.compile(r"(.+?)\s*\+1\s*@(\S+)", re.IGNORECASE)
-OWNER_REJECTION_RX    = re.compile(r"(.+?)\s*-1\s*$", re.IGNORECASE)
-
+NEW_CUSTOMER_ID_RX    = re.compile(r'app\s*:\s*\S+\s*@(\S+)', re.IGNORECASE)
 
 def _looks_like_phone(s: str) -> bool:
     return bool(PHONE_LIKE_RX.fullmatch((s or "").strip()))
@@ -753,13 +753,14 @@ async def _clear_issued(user_id: int, kind: str, value_to_clear: str) -> bool:
             return True
     return False
 
-async def _clear_one_issued(user_id: int, kind: str, value_to_clear: str) -> bool:
-    """Removes the FIRST occurrence of a pending item for a user. Used by auto-clear."""
+async def _clear_one_issued(user_id: int, kind: str, value_to_clear: str, new_customer_id: str):
+    """
+    Removes the FIRST occurrence of a pending item and logs it for owner confirmation.
+    """
     bucket = _issued_bucket(kind)
     user_id_str = str(user_id)
     if user_id_str in bucket:
         item_to_remove = None
-        # Find the first item in the list that matches the value
         for item in bucket[user_id_str]:
             if item.get("value") == value_to_clear:
                 item_to_remove = item
@@ -767,12 +768,22 @@ async def _clear_one_issued(user_id: int, kind: str, value_to_clear: str) -> boo
         
         if item_to_remove:
             bucket[user_id_str].remove(item_to_remove)
-            # If the list is now empty, remove the user's key
             if not bucket[user_id_str]:
                 del bucket[user_id_str]
+
+            # Add to the cleared_items log for verification
+            cleared_log = state.setdefault("cleared_items", {})
+            user_cleared = cleared_log.setdefault(user_id_str, [])
+            user_cleared.append({
+                "cleared_item": value_to_clear,
+                "new_customer_id": new_customer_id,
+                "timestamp": datetime.now(TIMEZONE).isoformat()
+            })
+            
             await save_state()
             return True
     return False
+
 
 def _value_in_text(value: Optional[str], text: str) -> bool:
     if not value:
@@ -792,6 +803,33 @@ def _value_in_text(value: Optional[str], text: str) -> bool:
         v_digits = re.sub(r'\D', '', v_norm)
         text_digits = re.sub(r'\D', '', text_norm)
         return v_digits and v_digits in text_digits
+
+async def _verify_and_credit_add(user_id: int, confirmed_id: str) -> bool:
+    """
+    Checks if the confirmed ID matches a recently cleared item for the user.
+    If it matches, credits the user and removes the item from the log.
+    """
+    user_id_str = str(user_id)
+    confirmed_id = "@" + confirmed_id.lstrip("@") # Ensure it starts with @
+    cleared_log = state.setdefault("cleared_items", {})
+    user_cleared_list = cleared_log.get(user_id_str, [])
+    
+    item_to_credit = None
+    for item in user_cleared_list:
+        if item.get("new_customer_id") == confirmed_id:
+            item_to_credit = item
+            break
+
+    if item_to_credit:
+        await _increment_successful_adds(user_id)
+        # Remove the credited item from the list to prevent double counting
+        user_cleared_list.remove(item_to_credit)
+        if not user_cleared_list:
+            del cleared_log[user_id_str]
+        await save_state()
+        return True
+    
+    return False
 
 # =============================
 # COUNTRY & AGE FILTERING
@@ -1472,7 +1510,12 @@ async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
             pool = await get_db_pool()
             async with pool.acquire() as conn:
                 await conn.execute("DELETE FROM wa_daily_usage;")
-                await conn.execute("DELETE FROM user_daily_activity;")
+                # Keep user activity for the new detail commands, but reset counts
+                await conn.execute("""
+                    UPDATE user_daily_activity SET username_requests = 0, whatsapp_requests = 0, successful_adds = 0 WHERE day != $1;
+                    DELETE FROM user_daily_activity WHERE day != $1 AND username_requests = 0 AND whatsapp_requests = 0 AND successful_adds = 0;
+                """, _logical_day_today())
+
                 log.info("Cleared daily WhatsApp and user activity quotas.")
         except Exception as e:
             log.error(f"Failed to clear daily tables: {e}")
@@ -1481,8 +1524,11 @@ async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
             state["issued"]["username"].clear()
             state["issued"]["whatsapp"].clear()
         
+        if "cleared_items" in state:
+            state["cleared_items"].clear() # Clear the verification log daily
+
         await save_state()
-        log.info("Daily reset complete. Cleared issued items.")
+        log.info("Daily reset complete. Cleared issued items and verification log.")
 
 # =============================
 # MESSAGE HANDLER
@@ -1545,29 +1591,50 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # OWNER CONFIRMATION LOGIC - Only in the owner confirmation group
         if chat_id == OWNER_CONFIRM_GROUP_ID:
-            owner_confirm_match = OWNER_CONFIRMATION_RX.match(text)
-            owner_reject_match = OWNER_REJECTION_RX.match(text)
             sender_username = (update.effective_user.username or "").lower()
             all_owners = {_norm_owner_name(o['owner']) for o in OWNER_DATA}
 
             if sender_username in all_owners:
-                if owner_confirm_match:
-                    customer_name, customer_id_str = owner_confirm_match.groups()
+                action = None
+                if "+1" in text:
+                    action = "add"
+                elif "-1" in text:
+                    action = "subtract"
+
+                id_match = re.search(r'@(\S+)', text)
+
+                # Handle +1 confirmations (ID is required)
+                if action == "add" and id_match:
+                    customer_id_str = id_match.group(1)
+                    customer_name = text.replace("+1", "").replace(f"@{customer_id_str}", "").strip()
+                    
                     customer_user_id = _find_user_id_by_name(customer_name)
                     if customer_user_id:
-                        await _increment_successful_adds(customer_user_id)
+                        if not await _verify_and_credit_add(customer_user_id, customer_id_str):
+                            owner_mention = mention_user_html(uid)
+                            customer_mention = mention_user_html(customer_user_id)
+                            reply_text = (
+                                f"{owner_mention}, the ID <code>@{customer_id_str}</code> for user {customer_mention} is incorrect. "
+                                "Please check again."
+                            )
+                            await msg.reply_html(reply_text)
+                            log.warning(f"Owner {sender_username} tried to credit {customer_name} for ID @{customer_id_str}, but no matching cleared item was found.")
                     else:
                         log.warning(f"Owner {sender_username} confirmed customer '{customer_name}', but user could not be found.")
-                    return # End processing for this group
-                
-                elif owner_reject_match:
-                    customer_name = owner_reject_match.group(1).strip()
+                    return
+
+                # Handle -1 subtractions (ID is optional)
+                elif action == "subtract":
+                    customer_name = text.replace("-1", "").strip()
+                    if id_match:
+                        customer_name = customer_name.replace(f"@{id_match.group(1)}", "").strip()
+
                     customer_user_id = _find_user_id_by_name(customer_name)
                     if customer_user_id:
                         await _decrement_successful_adds(customer_user_id)
                     else:
                         log.warning(f"Owner {sender_username} rejected customer '{customer_name}', but user could not be found.")
-                    return # End processing for this group
+                    return
 
         # USER AUTO-CLEARING LOGIC - Only in the clearing group
         if chat_id == CLEARING_GROUP_ID and values_found_in_message:
@@ -1601,12 +1668,25 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 log.warning(f"Rejected post from user {uid}. Reason: {rejection_reason}. Told user to reuse item.")
                 return
             else:
-                # If allowed, proceed to clear
-                for kind in ("username", "whatsapp"):
-                    for value_to_clear in values_found_in_message:
-                         if await _clear_one_issued(uid, kind, value_to_clear):
+                # Find all new customer IDs from the "App: ..." lines
+                new_customer_ids = ["@" + match.group(1) for match in NEW_CUSTOMER_ID_RX.finditer(text)]
+                
+                if not new_customer_ids:
+                    log.warning(f"User {uid} cleared an item, but no new customer ID could be parsed from the message.")
+                    return
+
+                # If allowed, proceed to clear and log for verification
+                for value_to_clear in values_found_in_message:
+                    kind = "username" if value_to_clear.startswith("@") else "whatsapp"
+                    # For simplicity, we associate all new IDs found with the first cleared item.
+                    # This handles multiple profiles in one message.
+                    for new_id in new_customer_ids:
+                        if await _clear_one_issued(uid, kind, value_to_clear, new_id):
                             await _log_event(kind, "cleared", update, value_to_clear, owner="")
-                            log.info(f"Auto-cleared ONE pending {kind} for user {uid}: {value_to_clear}")
+                            log.info(f"Auto-cleared ONE pending {kind} for user {uid}: {value_to_clear}. Awaiting owner confirmation for ID {new_id}.")
+                            # Remove the cleared value so it's not processed again for other new IDs
+                            new_customer_ids.remove(new_id) 
+                            break # Move to the next value_to_clear
 
         # Feeders - ONLY in the designated request group
         if chat_id == REQUEST_GROUP_ID:
@@ -1698,12 +1778,14 @@ if __name__ == "__main__":
         reset_time = time(hour=5, minute=31, tzinfo=TIMEZONE)
         app.job_queue.run_daily(daily_reset, time=reset_time)
 
-    # Add message handler
-    app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.ALL, on_message))
+    # Add message handler for new messages
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND & ~filters.StatusUpdate.ALL, on_message))
+    
+    # Add handler for edited messages
+    app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE, on_message))
+
 
     # Run the bot
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
-
 
