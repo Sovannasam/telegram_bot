@@ -268,6 +268,13 @@ WHATSAPP_POOL: List[Dict] = []
 
 def _norm_handle(h: str) -> str: return re.sub(r"^@", "", (h or "").strip().lower())
 def _norm_phone(p: str) -> str: return re.sub(r"\D+", "", (p or ""))
+# NEW: Helper to normalize App IDs for robust matching
+def _normalize_app_id(app_id: str) -> str:
+    """Removes leading '@' and all non-alphanumeric characters."""
+    if not app_id:
+        return ""
+    return re.sub(r'[^a-zA-Z0-9]', '', app_id)
+
 def _norm_owner_name(s: str) -> str:
     s = (s or "").strip()
     if s.startswith("@"): s = s[1:]
@@ -1527,25 +1534,29 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if '+1' in text:
                 match = re.search(r'@([^\s]+)', text)
                 if match:
-                    app_id_confirmed = f"@{match.group(1)}"
+                    app_id_confirmed_raw = f"@{match.group(1)}"
+                    app_id_confirmed_norm = _normalize_app_id(app_id_confirmed_raw)
                     found_and_counted = False
-                    # Search all users to find who this App ID belongs to
+                    
                     for user_id_str, items in list(_issued_bucket("app_id").items()):
-                        if found_and_counted: break # Optimization
+                        if found_and_counted: break
                         for item in items:
-                            if item.get("value") == app_id_confirmed:
+                            stored_app_id_raw = item.get("value", "")
+                            stored_app_id_norm = _normalize_app_id(stored_app_id_raw)
+                            
+                            if stored_app_id_norm == app_id_confirmed_norm:
                                 user_id_of_item = int(user_id_str)
-                                # Increment the count for the original user
                                 await _increment_user_confirmation_count(user_id_of_item)
-                                await _log_event("app_id", "confirmed", update, app_id_confirmed)
-                                log.info(f"Owner {update.effective_user.username} confirmed App ID {app_id_confirmed}, count incremented for user {user_id_of_item}")
+                                await _log_event("app_id", "confirmed", update, stored_app_id_raw)
+                                # MODIFIED: Clear the item after counting it
+                                await _clear_one_issued(user_id_of_item, "app_id", stored_app_id_raw)
+                                log.info(f"Owner {update.effective_user.username} confirmed App ID {stored_app_id_raw}, count incremented and item cleared for user {user_id_of_item}")
                                 found_and_counted = True
                                 break
                     
-                    # After checking all users, reply only if the ID was wrong
                     if not found_and_counted:
                         await msg.reply_text("Wrong ID, please check.")
-                        log.warning(f"Received confirmation for incorrect App ID '{app_id_confirmed}' from {update.effective_user.username}.")
+                        log.warning(f"Received confirmation for incorrect App ID '{app_id_confirmed_raw}' from {update.effective_user.username}.")
             return
 
         elif chat_id == CLEARING_GROUP_ID:
