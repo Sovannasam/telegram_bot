@@ -157,7 +157,6 @@ async def setup_database():
                 PRIMARY KEY (day, user_id)
             );
         """)
-        # NEW: Table for owner performance
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS owner_daily_performance (
                 day DATE NOT NULL,
@@ -293,7 +292,6 @@ def _is_admin(update: Update) -> bool:
     if not u: return False
     return (u.username or "").lower() == ADMIN_USERNAME.lower()
 
-# NEW: Function to check if a user is a registered owner
 def _is_owner(user: Optional[Update.effective_user]) -> bool:
     if not user or not user.username:
         return False
@@ -460,7 +458,6 @@ async def _increment_user_confirmation_count(user_id: int):
     except Exception as e:
         log.warning(f"User confirmation count write failed for {user_id}: {e}")
 
-# NEW: Function to increment owner performance counts
 async def _increment_owner_performance(owner_name: str, kind: str):
     """Increments telegram or whatsapp count for an owner on the current day."""
     if not owner_name: return
@@ -704,7 +701,6 @@ OWNER_REPORT_RX       = re.compile(r"^\s*owner\s+report(?:\s+(yesterday|today|\d
 COMMANDS_RX           = re.compile(r"^\s*commands\s*$", re.IGNORECASE)
 MY_DETAIL_RX          = re.compile(r"^\s*my\s+detail\s*$", re.IGNORECASE)
 DETAIL_USER_RX        = re.compile(r"^\s*detail\s+@?(\S+)\s*$", re.IGNORECASE)
-# NEW: Regex for performance commands
 MY_PERFORMANCE_RX     = re.compile(r"^\s*my\s+performance(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 PERFORMANCE_OWNER_RX  = re.compile(r"^\s*performance\s+@?(\S+?)(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 
@@ -1658,14 +1654,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                             if match_is_found:
                                 user_id_of_item = int(user_id_str)
-                                source_owner = item.get("source_owner")
+                                confirming_owner_name = _norm_owner_name(update.effective_user.username)
                                 source_kind = item.get("source_kind")
 
                                 await _increment_user_confirmation_count(user_id_of_item)
-                                await _increment_owner_performance(source_owner, source_kind)
-                                await _log_event("app_id", "confirmed", update, stored_app_id_raw, owner=source_owner)
+                                await _increment_owner_performance(confirming_owner_name, source_kind)
+                                await _log_event("app_id", "confirmed", update, stored_app_id_raw, owner=confirming_owner_name)
                                 await _clear_one_issued(user_id_of_item, "app_id", stored_app_id_raw)
-                                log.info(f"Owner {update.effective_user.username} confirmed App ID {stored_app_id_raw}. Counted for {source_owner} and cleared for user {user_id_of_item}")
+                                log.info(f"Owner {confirming_owner_name} confirmed App ID {stored_app_id_raw}. Counted and cleared for user {user_id_of_item}")
                                 found_and_counted = True
                                 break
                     
@@ -1675,32 +1671,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         elif chat_id == CLEARING_GROUP_ID:
-            app_id_match = APP_ID_RX.search(text)
-            if app_id_match:
-                app_id = f"@{app_id_match.group(1)}"
-                
-                # Find the most recent pending username/whatsapp to link the app_id to an owner
-                last_item = None
-                last_ts = datetime.min.replace(tzinfo=TIMEZONE)
-                for kind_to_check in ("username", "whatsapp"):
-                    user_items = _issued_bucket(kind_to_check).get(str(uid), [])
-                    if user_items:
-                        latest_in_kind = user_items[-1]
-                        item_ts = datetime.fromisoformat(latest_in_kind["ts"])
-                        if item_ts > last_ts:
-                            last_ts = item_ts
-                            last_item = latest_in_kind
-                            last_item['kind'] = kind_to_check
-                
-                context_data = {}
-                if last_item:
-                    context_data["source_owner"] = last_item.get("owner")
-                    context_data["source_kind"] = last_item.get("kind")
-
-                await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
-                await _log_event("app_id", "issued", update, app_id, owner=context_data.get("source_owner", ""))
-                log.info(f"Recorded new pending App ID '{app_id}' for user {uid} linked to owner {context_data.get('source_owner')}")
-
             values_found_in_message = set()
             user_id_str = str(uid)
             for kind in ("username", "whatsapp"):
@@ -1711,6 +1681,36 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if _value_in_text(pending_value, text):
                             values_found_in_message.add(pending_value)
             
+            app_id_match = APP_ID_RX.search(text)
+            if app_id_match:
+                app_id = f"@{app_id_match.group(1)}"
+                
+                context_data = {}
+                # MODIFIED: Determine source kind based on what's being cleared in *this* message.
+                if values_found_in_message:
+                    # WhatsApp takes priority
+                    cleared_item_value = None
+                    kind_to_check = "username" # Default
+                    for v in values_found_in_message:
+                        if _looks_like_phone(v):
+                            kind_to_check = "whatsapp"
+                            cleared_item_value = v
+                            break # Found whatsapp, no need to check further
+                    
+                    if not cleared_item_value:
+                        cleared_item_value = next(iter(values_found_in_message))
+
+                    user_items = _issued_bucket(kind_to_check).get(str(uid), [])
+                    for item in user_items:
+                        if item.get("value") == cleared_item_value:
+                            context_data["source_owner"] = item.get("owner")
+                            context_data["source_kind"] = kind_to_check
+                            break
+                
+                await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
+                await _log_event("app_id", "issued", update, app_id, owner=context_data.get("source_owner", ""))
+                log.info(f"Recorded new pending App ID '{app_id}' for user {uid} linked to owner {context_data.get('source_owner')} and kind {context_data.get('source_kind')}")
+
             if values_found_in_message:
                 found_country, country_status = _find_country_in_text(text)
                 age = _find_age_in_text(text)
