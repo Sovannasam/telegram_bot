@@ -655,6 +655,7 @@ OWNER_REPORT_RX       = re.compile(r"^\s*owner\s+report(?:\s+(yesterday|today|\d
 COMMANDS_RX           = re.compile(r"^\s*commands\s*$", re.IGNORECASE)
 MY_DETAIL_RX          = re.compile(r"^\s*my\s+detail\s*$", re.IGNORECASE)
 DETAIL_USER_RX        = re.compile(r"^\s*detail\s+@?(\S+)\s*$", re.IGNORECASE)
+MY_PERFORMANCE_RX     = re.compile(r"^\s*my\s+performance\s*$", re.IGNORECASE)
 NEW_CUSTOMER_ID_RX    = re.compile(r'app\s*:\s*\S+\s*@(\S+)', re.IGNORECASE)
 
 def _looks_like_phone(s: str) -> bool:
@@ -908,6 +909,29 @@ async def _get_user_detail_text(user_id: int) -> str:
 
     return "\n".join(lines)
 
+async def _get_owner_performance_text(owner_name: str) -> str:
+    """Calculates and formats the performance report for a single owner."""
+    today = _logical_day_today()
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT kind, COUNT(*) as count FROM audit_log WHERE owner = $1 AND action = 'issued' AND ts_local >= $2 GROUP BY kind",
+            owner_name, today
+        )
+    
+    user_count = 0
+    wa_count = 0
+    for row in rows:
+        if row['kind'] == 'username':
+            user_count = row['count']
+        elif row['kind'] == 'whatsapp':
+            wa_count = row['count']
+            
+    lines = [f"<b>📊 Your Performance Today ({owner_name}):</b>"]
+    lines.append(f"<b>- Usernames Assigned:</b> {user_count}")
+    lines.append(f"<b>- WhatsApps Assigned:</b> {wa_count}")
+    return "\n".join(lines)
+
 
 # =============================
 # EXCEL (reads audit_log)
@@ -1098,6 +1122,9 @@ def _get_commands_text() -> str:
 <code>i need whatsapp</code> - Request a WhatsApp number.
 <code>who's using @item</code> - Check the owner of an item.
 <code>my detail</code> - See your own daily stats.
+
+<b>--- Owner Commands ---</b>
+<code>my performance</code> - See your daily item assignment stats.
 
 <b>--- Admin: Owner & Item Management ---</b>
 <code>add owner @owner</code>
@@ -1534,15 +1561,21 @@ async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
 # MESSAGE HANDLER
 # =============================
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_chat or not update.effective_user or \
-       update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+    if not update.effective_chat or not update.effective_user:
+        return
+        
+    # Use edited_message if available, otherwise use message
+    msg = update.edited_message or update.effective_message
+    if not msg:
+        return
+        
+    if msg.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
 
-    msg = update.effective_message
     text = (msg.text or msg.caption or "").strip()
-    uid = update.effective_user.id
+    uid = msg.from_user.id
     chat_id = msg.chat_id
-    cache_user_info(update.effective_user)
+    cache_user_info(msg.from_user)
     
     # Use a single lock for the entire message handling process to ensure atomicity
     async with db_lock:
@@ -1550,6 +1583,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if MY_DETAIL_RX.match(text):
             detail_text = await _get_user_detail_text(uid)
             await msg.reply_html(detail_text)
+            return
+            
+        # Owner "my performance" command
+        sender_username = (msg.from_user.username or "").lower()
+        all_owners = {_norm_owner_name(o['owner']) for o in OWNER_DATA}
+        if MY_PERFORMANCE_RX.match(text) and sender_username in all_owners:
+            performance_text = await _get_owner_performance_text(sender_username)
+            await msg.reply_html(performance_text)
             return
 
         # Admin: Report
@@ -1591,9 +1632,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # OWNER CONFIRMATION LOGIC - Only in the owner confirmation group
         if chat_id == OWNER_CONFIRM_GROUP_ID:
-            sender_username = (update.effective_user.username or "").lower()
-            all_owners = {_norm_owner_name(o['owner']) for o in OWNER_DATA}
-
             if sender_username in all_owners:
                 action = None
                 if "+1" in text:
