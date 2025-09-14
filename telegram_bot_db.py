@@ -2080,5 +2080,5 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-" and the user is asking the following query: "I want bot to send message to user when their whatsapp limit is over, in Khmer language"
+
 
