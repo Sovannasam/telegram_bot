@@ -46,6 +46,7 @@ USERNAME_THRESHOLD_FOR_BONUS = int(os.getenv("USERNAME_THRESHOLD_FOR_BONUS", "35
 REQUEST_GROUP_ID = int(os.getenv("REQUEST_GROUP_ID", "-1002438185636")) # Group for 'i need ...' commands
 CLEARING_GROUP_ID = int(os.getenv("CLEARING_GROUP_ID", "-1002624324856")) # Group for auto-clearing pendings
 CONFIRMATION_GROUP_ID = int(os.getenv("CONFIRMATION_GROUP_ID", "-1002694540582"))
+DETAIL_GROUP_ID = int(os.getenv("DETAIL_GROUP_ID", "-1002598927727")) # Group for 'my detail' reports
 
 
 # Whitelist of allowed countries (lowercase for case-insensitive matching)
@@ -878,7 +879,7 @@ def _value_in_text(value: Optional[str], text: str) -> bool:
     else:
         v_digits = re.sub(r'\D', '', v_norm)
         text_digits = re.sub(r'\D', '', text_norm)
-        return v_digits and v_digits in text_norm
+        return v_digits and v_digits in text_digits
 
 def _find_closest_app_id(typed_id: str) -> Optional[str]:
     """Finds the most similar pending App ID using Levenshtein distance."""
@@ -1362,7 +1363,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
             
             pool = await get_db_pool()
             async with pool.acquire() as conn:
-                 await conn.execute("INSERT INTO admins (username, permissions) VALUES ($1, $2) ON CONFLICT(username) DO UPDATE SET permissions = $2", name, json.dumps(list(current_perms)))
+                await conn.execute("INSERT INTO admins (username, permissions) VALUES ($1, $2) ON CONFLICT(username) DO UPDATE SET permissions = $2", name, json.dumps(list(current_perms)))
             await load_admins()
             return f"Permission '{command}' granted to '{name}'."
 
@@ -1811,9 +1812,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async with db_lock:
         # User "my detail" command
+        # MODIFIED: This command now only works in a specific group chat.
         if MY_DETAIL_RX.match(text):
-            detail_text = await _get_user_detail_text(uid)
-            await msg.reply_html(detail_text)
+            if chat_id == DETAIL_GROUP_ID:
+                detail_text = await _get_user_detail_text(uid)
+                await msg.reply_html(detail_text)
             return
             
         # Owner "my performance" command
@@ -1939,7 +1942,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             kind_to_check = "whatsapp"
                             cleared_item_value = v
                             break
-                    
+                
                     if not cleared_item_value:
                         cleared_item_value = next(iter(values_found_in_message))
 
@@ -2095,4 +2098,3 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
