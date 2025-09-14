@@ -53,7 +53,7 @@ ALLOWED_COUNTRIES = {
     'morocco', 'panama', 'saudi arabia', 'united arab emirates', 'uae',
     'oman', 'jordan', 'italy', 'germany', 'indonesia', 'colombia',
     'bulgaria', 'brazil', 'spain', 'belgium', 'algeria', 'south africa',
-    'philippines', 'indian', 'india', 'Portugal', 'Netherlands', 'Poland', 'Ghana', 
+    'philippines', 'indian', 'india', 'Portugal', 'Netherlands', 'Poland', 'Ghana', 'Dominican Republic'
 }
 
 TIMEZONE = pytz.timezone("Asia/Phnom_Penh")
@@ -204,7 +204,7 @@ COMMAND_PERMISSIONS = {
     'add owner', 'delete owner', 'add username', 'delete username', 'add whatsapp', 'delete whatsapp',
     'stop open', 'take customer', 'ban whatsapp', 'unban whatsapp', 'report',
     'owner report', 'performance', 'remind user', 'clear pending', 'clear all pending',
-    'list owners', 'list disabled', 'list owner', 'detail user', 'list banned', 'list admins'，'Dominican Republic',
+    'list owners', 'list disabled', 'list owner', 'detail user', 'list banned', 'list admins'，
 }
 
 async def load_admins():
