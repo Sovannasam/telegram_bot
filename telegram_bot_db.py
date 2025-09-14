@@ -717,6 +717,9 @@ WHO_USING_REGEX = re.compile(
 NEED_USERNAME_RX = re.compile(r"^\s*i\s*need\s*(?:user\s*name|username)\s*$", re.IGNORECASE)
 NEED_WHATSAPP_RX = re.compile(r"^\s*i\s*need\s*(?:id\s*)?whats?app\s*$", re.IGNORECASE)
 APP_ID_RX = re.compile(r"\bapp\b.*?\@([^\s]+)", re.IGNORECASE)
+EXTRACT_USERNAMES_RX = re.compile(r'@([a-zA-Z0-9_]{4,})')
+EXTRACT_PHONES_RX = re.compile(r'(\+?\d[\d\s\-()]{8,}\d)')
+
 
 STOP_OPEN_RX          = re.compile(r"^\s*(stop|open)\s+(.+?)\s*$", re.IGNORECASE)
 ADD_OWNER_RX          = re.compile(r"^\s*add\s+owner\s+@?(.+?)\s*$", re.IGNORECASE)
@@ -811,7 +814,6 @@ def mention_user_html(user_id: int) -> str:
 def _issued_bucket(kind: str) -> Dict[str, list]:
     return state.setdefault("issued", {}).setdefault(kind, {})
 
-# MODIFIED: _set_issued now accepts additional context
 async def _set_issued(user_id: int, chat_id: int, kind: str, value: str, context_data: Optional[Dict] = None):
     bucket = _issued_bucket(kind)
     user_id_str = str(user_id)
@@ -876,7 +878,7 @@ def _value_in_text(value: Optional[str], text: str) -> bool:
     else:
         v_digits = re.sub(r'\D', '', v_norm)
         text_digits = re.sub(r'\D', '', text_norm)
-        return v_digits and v_digits in text_digits
+        return v_digits and v_digits in text_norm
 
 # =============================
 # COUNTRY & AGE FILTERING
@@ -1056,51 +1058,68 @@ async def _read_log_rows() -> List[dict]:
         return []
 
 async def _compute_daily_summary(target_day: date) -> Tuple[List[dict], List[dict]]:
-    rows = await _read_log_rows()
-    day_rows = [r for r in rows if _logical_day_of(r["ts_local"]) == target_day]
+    """
+    Computes daily summary for users and owners, now with added customer and country data.
+    """
+    # Define the time range for the logical day
+    start_ts = TIMEZONE.localize(datetime.combine(target_day, time(5, 30)))
+    end_ts = start_ts + timedelta(days=1)
 
-    users: Dict[str, dict] = {}
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        # Get all unique user IDs active on the target day from all relevant tables
+        audit_users = await conn.fetch("SELECT DISTINCT user_id FROM audit_log WHERE ts_local >= $1 AND ts_local < $2 AND user_id IS NOT NULL", start_ts, end_ts)
+        confirm_users = await conn.fetch("SELECT DISTINCT user_id FROM user_daily_confirmations WHERE day = $1", target_day)
+        country_users = await conn.fetch("SELECT DISTINCT user_id FROM user_daily_country_counts WHERE day = $1", target_day)
+
+        all_user_ids = {r['user_id'] for r in audit_users if r['user_id']}
+        all_user_ids.update({r['user_id'] for r in confirm_users if r['user_id']})
+        all_user_ids.update({r['user_id'] for r in country_users if r['user_id']})
+
+        # Process data for each user
+        out_users = []
+        for user_id in all_user_ids:
+            user_info = state.get("user_names", {}).get(str(user_id), {})
+            user_display = user_info.get('username') or user_info.get('first_name') or f"ID: {user_id}"
+
+            # Get request counts from audit log
+            username_reqs, whatsapp_reqs = 0, 0
+            req_rows = await conn.fetch("SELECT kind FROM audit_log WHERE ts_local >= $1 AND ts_local < $2 AND user_id = $3 AND action = 'issued'", start_ts, end_ts, user_id)
+            for row in req_rows:
+                if row['kind'] == 'username':
+                    username_reqs += 1
+                elif row['kind'] == 'whatsapp':
+                    whatsapp_reqs += 1
+
+            # Get confirmation counts
+            confirm_count = await _get_user_confirmation_count_for_day(user_id, target_day)
+            
+            # Get country submissions
+            country_counts = await _get_user_country_counts_for_day(user_id, target_day)
+            country_str = ", ".join([f"{c.title()}: {n}" for c, n in country_counts])
+
+            out_users.append({
+                "Day": target_day.isoformat(),
+                "User": user_display,
+                "Total username receive": username_reqs,
+                "Total whatsapp receive": whatsapp_reqs,
+                "Total customer added": confirm_count,
+                "Country Submissions": country_str,
+            })
+
+    # Owner performance logic remains largely the same, but re-fetched for clarity
+    day_rows = [r for r in await _read_log_rows() if _logical_day_of(r["ts_local"]) == target_day]
     owner_stats: Dict[str, dict] = {}
-
     for r in day_rows:
-        user_key = r.get("user_first") or r.get("user_username") or str(r.get("user_id"))
-        d = users.setdefault(user_key, {"username_issued": [], "username_cleared": [], "wa_issued": [], "wa_cleared": []})
-        kind, action, value, owner = r["kind"], r["action"], r["value"], (r.get("owner","") or "").lower()
-
-        if kind == "username":
-            if action == "issued":
-                d["username_issued"].append((value, owner))
-                if owner:
-                    s = owner_stats.setdefault(owner, {"total": 0, "tg": 0, "wa": 0})
-                    s["total"] += 1
-                    s["tg"] += 1
-            if action == "cleared": d["username_cleared"].append(value)
-        elif kind == "whatsapp":
-            if action == "issued":
-                d["wa_issued"].append((value, owner))
-                if owner:
-                    s = owner_stats.setdefault(owner, {"total": 0, "tg": 0, "wa": 0})
-                    s["total"] += 1
-                    s["wa"] += 1
-            if action == "cleared": d["wa_cleared"].append(value)
-
-    out_users = []
-    for user, d in users.items():
-        issued_user_pairs = d["username_issued"]; issued_wa_pairs = d["wa_issued"]
-        issued_user_vals  = [v for v, _ in issued_user_pairs]; issued_wa_vals = [v for v, _ in issued_wa_pairs]
-        notback_user = [v for v in issued_user_vals if v not in d["username_cleared"]]
-        notback_wa = [v for v in issued_wa_vals if v not in d["wa_cleared"]]
-        owners_user = sorted({own for (v, own) in issued_user_pairs if v in notback_user and own})
-        owners_wa = sorted({own for (v, own) in issued_wa_pairs if v in notback_wa and own})
-        out_users.append({
-            "Day": target_day.isoformat(), "User": str(user),
-            "Total username receive": len(issued_user_vals), "Total whatsapp receive": len(issued_wa_vals),
-            "Total username provide back": len(d["username_cleared"]), "Total whatsapp provide back": len(d["wa_cleared"]),
-            "Username not provide back": ", ".join(notback_user), "Owner of username": ", ".join(('@'+o) for o in owners_user),
-            "Whatsapp not provide back": ", ".join(notback_wa), "Owner of whatsapp": ", ".join(('@'+o) for o in owners_wa),
-        })
-    out_users.sort(key=lambda r: r["User"].lower())
-
+        owner = (r.get("owner","") or "").lower()
+        if r["action"] == "issued" and owner:
+            s = owner_stats.setdefault(owner, {"total": 0, "tg": 0, "wa": 0})
+            s["total"] += 1
+            if r["kind"] == "username":
+                s["tg"] += 1
+            elif r["kind"] == "whatsapp":
+                s["wa"] += 1
+    
     out_owners = []
     for owner, s in sorted(owner_stats.items(), key=lambda kv: kv[0]):
         out_owners.append({
@@ -1110,6 +1129,8 @@ async def _compute_daily_summary(target_day: date) -> Tuple[List[dict], List[dic
             "Customers via Telegram": s["tg"],
             "Customers via WhatsApp": s["wa"],
         })
+
+    out_users.sort(key=lambda r: r["User"].lower())
     return out_users, out_owners
 
 def _style_and_save_excel(user_rows: List[dict], owner_rows: List[dict]) -> io.BytesIO:
@@ -1121,10 +1142,9 @@ def _style_and_save_excel(user_rows: List[dict], owner_rows: List[dict]) -> io.B
 
     wb = Workbook()
 
+    # Sheet 1: Summary
     ws = wb.active; ws.title = "Summary"
-    headers = ["Day","User","Total username receive","Total whatsapp receive","Total username provide back",
-               "Total whatsapp provide back","Username not provide back","Owner of username",
-               "Whatsapp not provide back","Owner of whatsapp"]
+    headers = ["Day", "User", "Total username receive", "Total whatsapp receive", "Total customer added", "Country Submissions"]
     ws.append(headers)
     for r in user_rows: ws.append([r.get(h, "") for h in headers])
 
@@ -1142,6 +1162,7 @@ def _style_and_save_excel(user_rows: List[dict], owner_rows: List[dict]) -> io.B
             if c.value: max_len = max(max_len, len(str(c.value)))
         ws.column_dimensions[letter].width = min(max_len + 2, 60)
 
+    # Sheet 2: Owners
     ws2 = wb.create_sheet("Owners")
     headers2 = ["Day","Owner","Customers total","Customers via Telegram","Customers via WhatsApp"]
     ws2.append(headers2)
@@ -1830,56 +1851,75 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 break
                     
                     if not found_and_counted:
-                        await msg.reply_text("Wrong ID, please check.")
+                        suggestion = _find_closest_app_id(app_id_confirmed_raw)
+                        if suggestion:
+                            reply_text = (
+                                f"Wrong ID. Did you mean <code>{suggestion}</code>?\n\n"
+                                f"Tap to copy and send again:\n"
+                                f"<code>+1 {suggestion}</code>"
+                            )
+                            await msg.reply_html(reply_text)
+                        else:
+                            await msg.reply_text("Wrong ID, please check.")
                         log.warning(f"Received confirmation for incorrect App ID '{app_id_confirmed_raw}' from {update.effective_user.username}.")
             return
 
         elif chat_id == CLEARING_GROUP_ID:
-            values_found_in_message = set()
-            user_id_str = str(uid)
-            for kind in ("username", "whatsapp"):
-                bucket = _issued_bucket(kind)
-                if user_id_str in bucket:
-                    for item in bucket[user_id_str]:
-                        pending_value = item.get("value")
-                        if _value_in_text(pending_value, text):
-                            values_found_in_message.add(pending_value)
+            # MODIFIED: New, more robust clearing logic
+            cleared_items_this_message = {'username': [], 'whatsapp': []}
+            pending_usernames = {item['value'] for item in _issued_bucket("username").get(str(uid), [])}
+            pending_whatsapps = {item['value'] for item in _issued_bucket("whatsapp").get(str(uid), [])}
             
+            # Extract all potential usernames and phone numbers from the message
+            found_usernames = {f"@{u}" for u in EXTRACT_USERNAMES_RX.findall(text)}
+            found_phones = EXTRACT_PHONES_RX.findall(text)
+
+            for u in found_usernames:
+                if u in pending_usernames:
+                    cleared_items_this_message['username'].append(u)
+            
+            for p in found_phones:
+                for pending_p in pending_whatsapps:
+                    if _norm_phone(p) == _norm_phone(pending_p):
+                        cleared_items_this_message['whatsapp'].append(pending_p)
+
+            values_found_in_message = set(cleared_items_this_message['username'] + cleared_items_this_message['whatsapp'])
+
             app_id_match = APP_ID_RX.search(text)
             if app_id_match:
                 app_id = f"@{app_id_match.group(1)}"
                 
                 context_data = {}
-                if values_found_in_message:
+                # MODIFIED: Determine source kind based on what's being cleared, with a fallback
+                if cleared_items_this_message['whatsapp']:
+                    kind_to_check = 'whatsapp'
+                    cleared_item_value = cleared_items_this_message['whatsapp'][0]
+                elif cleared_items_this_message['username']:
+                    kind_to_check = 'username'
+                    cleared_item_value = cleared_items_this_message['username'][0]
+                else:
+                    kind_to_check = None
                     cleared_item_value = None
-                    kind_to_check = "username" 
-                    for v in values_found_in_message:
-                        if _looks_like_phone(v):
-                            kind_to_check = "whatsapp"
-                            cleared_item_value = v
-                            break
-                    
-                    if not cleared_item_value:
-                        cleared_item_value = next(iter(values_found_in_message))
 
+                if kind_to_check:
                     user_items = _issued_bucket(kind_to_check).get(str(uid), [])
                     for item in user_items:
                         if item.get("value") == cleared_item_value:
                             context_data["source_owner"] = item.get("owner")
                             context_data["source_kind"] = kind_to_check
                             break
-                else: 
+                else: # Fallback if nothing is being cleared in this message
                     last_item = None
                     last_ts = datetime.min.replace(tzinfo=TIMEZONE)
-                    for kind_to_check in ("username", "whatsapp"):
-                        user_items = _issued_bucket(kind_to_check).get(str(uid), [])
+                    for fallback_kind in ("username", "whatsapp"):
+                        user_items = _issued_bucket(fallback_kind).get(str(uid), [])
                         if user_items:
                             latest_in_kind = user_items[-1] 
                             item_ts = datetime.fromisoformat(latest_in_kind["ts"])
                             if item_ts > last_ts:
                                 last_ts = item_ts
                                 last_item = latest_in_kind
-                                last_item['kind'] = kind_to_check
+                                last_item['kind'] = fallback_kind
                     
                     if last_item:
                         context_data["source_owner"] = last_item.get("owner")
@@ -1915,8 +1955,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await _increment_user_country_count(uid, country_status)
                         log.info(f"Incremented country count for user {uid} for '{country_status}'")
                     
-                    for kind in ("username", "whatsapp"):
-                        for value_to_clear in values_found_in_message:
+                    for kind, items_to_clear in cleared_items_this_message.items():
+                        for value_to_clear in items_to_clear:
                             if await _clear_one_issued(uid, kind, value_to_clear):
                                 await _log_event(kind, "cleared", update, value_to_clear, owner="")
                                 log.info(f"Auto-cleared ONE pending {kind} for user {uid}: {value_to_clear}")
