@@ -720,7 +720,8 @@ WHO_USING_REGEX = re.compile(
 )
 NEED_USERNAME_RX = re.compile(r"^\s*i\s*need\s*(?:user\s*name|username)\s*$", re.IGNORECASE)
 NEED_WHATSAPP_RX = re.compile(r"^\s*i\s*need\s*(?:id\s*)?whats?app\s*$", re.IGNORECASE)
-APP_ID_RX = re.compile(r"\bapp\b.*?\@([^\s]+)", re.IGNORECASE)
+# MODIFIED: Regex now looks for 'app', 'add', or 'id' and allows any characters between it and the @mention
+APP_ID_RX = re.compile(r"\b(app|add|id)\b.*?\@([^\s]+)", re.IGNORECASE)
 EXTRACT_USERNAMES_RX = re.compile(r'@([a-zA-Z0-9_]{4,})')
 EXTRACT_PHONES_RX = re.compile(r'(\+?\d[\d\s\-()]{8,}\d)')
 
@@ -1930,7 +1931,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Reworked Logic: Link a new App ID to a source (explicitly or implicitly)
             if app_id_match:
-                app_id = f"@{app_id_match.group(1)}"
+                # The regex now has two groups: the keyword ('app' or 'add') and the ID itself.
+                app_id = f"@{app_id_match.group(2)}"
                 source_item_to_clear, source_kind = None, None
 
                 # Priority 1: Link to an item explicitly mentioned in this message
