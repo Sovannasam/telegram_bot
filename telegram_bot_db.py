@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, date, time
 from typing import Dict, Optional, List, Tuple
 import re
 import io
+import unicodedata  # NEW: Import for advanced Unicode normalization
 
 import pytz
 import asyncpg
@@ -323,11 +324,16 @@ WHATSAPP_POOL: List[Dict] = []
 
 def _norm_handle(h: str) -> str: return re.sub(r"^@", "", (h or "").strip().lower())
 def _norm_phone(p: str) -> str: return re.sub(r"\D+", "", (p or ""))
+# MODIFIED: Normalization now uses unicodedata for robust, case-insensitive matching
 def _normalize_app_id(app_id: str) -> str:
-    """Removes leading '@' and all non-alphanumeric characters."""
+    """Removes leading '@', normalizes unicode characters, removes non-alphanumeric, and converts to lowercase."""
     if not app_id:
         return ""
-    return re.sub(r'[^a-zA-Z0-9]', '', app_id)
+    # 1. Normalize to handle visually similar characters (homoglyphs) and other variants
+    normalized_str = unicodedata.normalize('NFKC', app_id)
+    # 2. Remove anything that isn't a standard letter or number, and convert to lowercase
+    return re.sub(r'[^a-zA-Z0-9]', '', normalized_str).lower()
+
 
 def _norm_owner_name(s: str) -> str:
     s = (s or "").strip()
@@ -1812,7 +1818,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async with db_lock:
         # User "my detail" command
-        # MODIFIED: This command now only works in a specific group chat.
         if MY_DETAIL_RX.match(text):
             if chat_id == DETAIL_GROUP_ID:
                 detail_text = await _get_user_detail_text(uid)
@@ -1880,8 +1885,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         for item in items:
                             stored_app_id_raw = item.get("value", "")
                             
-                            match_is_found = (stored_app_id_raw == app_id_confirmed_raw or 
-                                              _normalize_app_id(stored_app_id_raw) == _normalize_app_id(app_id_confirmed_raw))
+                            match_is_found = (_normalize_app_id(stored_app_id_raw) == _normalize_app_id(app_id_confirmed_raw))
 
                             if match_is_found:
                                 user_id_of_item = int(user_id_str)
@@ -1950,7 +1954,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     for item in user_items:
                         if item.get("value") == cleared_item_value:
                             context_data["source_owner"] = item.get("owner")
-                            context_data["source_kind"] = kind_to_check
+                            context_data["source_kind"] = item.get("kind")
                             break
                 else: 
                     last_item = None
@@ -2098,3 +2102,4 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
