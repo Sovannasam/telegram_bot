@@ -880,6 +880,49 @@ def _value_in_text(value: Optional[str], text: str) -> bool:
         text_digits = re.sub(r'\D', '', text_norm)
         return v_digits and v_digits in text_norm
 
+def _find_closest_app_id(typed_id: str) -> Optional[str]:
+    """Finds the most similar pending App ID using Levenshtein distance."""
+    
+    def levenshtein(s1, s2):
+        if len(s1) < len(s2):
+            return levenshtein(s2, s1)
+        if len(s2) == 0:
+            return len(s1)
+        previous_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+        return previous_row[-1]
+
+    all_pending_ids = []
+    for _, items in _issued_bucket("app_id").items():
+        for item in items:
+            if item.get("value"):
+                all_pending_ids.append(item.get("value"))
+
+    if not all_pending_ids:
+        return None
+
+    norm_typed_id = _normalize_app_id(typed_id)
+    
+    closest_id = None
+    min_distance = 3 # Max typo distance
+
+    for pending_id in all_pending_ids:
+        norm_pending_id = _normalize_app_id(pending_id)
+        distance = levenshtein(norm_typed_id, norm_pending_id)
+        
+        if distance < min_distance:
+            min_distance = distance
+            closest_id = pending_id
+    
+    return closest_id if min_distance < 3 else None
+
 # =============================
 # COUNTRY & AGE FILTERING
 # =============================
@@ -1092,10 +1135,10 @@ async def _compute_daily_summary(target_day: date) -> Tuple[List[dict], List[dic
                     whatsapp_reqs += 1
 
             # Get confirmation counts
-            confirm_count = await _get_user_confirmation_count_for_day(user_id, target_day)
+            confirm_count = await _get_user_confirmation_count(user_id)
             
             # Get country submissions
-            country_counts = await _get_user_country_counts_for_day(user_id, target_day)
+            country_counts = await _get_user_country_counts(user_id)
             country_str = ", ".join([f"{c.title()}: {n}" for c, n in country_counts])
 
             out_users.append({
@@ -1865,12 +1908,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         elif chat_id == CLEARING_GROUP_ID:
-            # MODIFIED: New, more robust clearing logic
             cleared_items_this_message = {'username': [], 'whatsapp': []}
             pending_usernames = {item['value'] for item in _issued_bucket("username").get(str(uid), [])}
             pending_whatsapps = {item['value'] for item in _issued_bucket("whatsapp").get(str(uid), [])}
             
-            # Extract all potential usernames and phone numbers from the message
             found_usernames = {f"@{u}" for u in EXTRACT_USERNAMES_RX.findall(text)}
             found_phones = EXTRACT_PHONES_RX.findall(text)
 
@@ -1890,25 +1931,25 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 app_id = f"@{app_id_match.group(1)}"
                 
                 context_data = {}
-                # MODIFIED: Determine source kind based on what's being cleared, with a fallback
-                if cleared_items_this_message['whatsapp']:
-                    kind_to_check = 'whatsapp'
-                    cleared_item_value = cleared_items_this_message['whatsapp'][0]
-                elif cleared_items_this_message['username']:
-                    kind_to_check = 'username'
-                    cleared_item_value = cleared_items_this_message['username'][0]
-                else:
-                    kind_to_check = None
+                if values_found_in_message:
                     cleared_item_value = None
+                    kind_to_check = "username" 
+                    for v in values_found_in_message:
+                        if _looks_like_phone(v):
+                            kind_to_check = "whatsapp"
+                            cleared_item_value = v
+                            break
+                    
+                    if not cleared_item_value:
+                        cleared_item_value = next(iter(values_found_in_message))
 
-                if kind_to_check:
                     user_items = _issued_bucket(kind_to_check).get(str(uid), [])
                     for item in user_items:
                         if item.get("value") == cleared_item_value:
                             context_data["source_owner"] = item.get("owner")
                             context_data["source_kind"] = kind_to_check
                             break
-                else: # Fallback if nothing is being cleared in this message
+                else: 
                     last_item = None
                     last_ts = datetime.min.replace(tzinfo=TIMEZONE)
                     for fallback_kind in ("username", "whatsapp"):
