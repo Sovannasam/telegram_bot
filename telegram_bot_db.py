@@ -1987,9 +1987,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if country_status == 'not_allowed':
                         is_allowed = False
                         rejection_reason = f"Country '{found_country}' is not allowed."
-                    elif country_status == 'india' and (age is None or age <= 30):
+                    elif country_status == 'india' and (age is None or age < 30):
                         is_allowed = False
-                        rejection_reason = f"Age must be provided and > 30 for India (got: {age})."
+                        rejection_reason = f"Age must be provided and 30 or older for India (got: {age})."
 
                 if not is_allowed:
                     first_offending_value = next(iter(values_found_in_message))
@@ -2102,4 +2102,5 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
 
