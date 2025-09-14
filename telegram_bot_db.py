@@ -505,7 +505,8 @@ async def _increment_user_confirmation_count(user_id: int):
 
 async def _increment_owner_performance(owner_name: str, kind: Optional[str]):
     """Increments telegram or whatsapp count for an owner on the current day."""
-    if not owner_name or not kind or kind == "unknown": return
+    if not owner_name:
+        return
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
@@ -523,6 +524,7 @@ async def _increment_owner_performance(owner_name: str, kind: Optional[str]):
                     ON CONFLICT (day, owner_name) DO UPDATE
                     SET whatsapp_count = owner_daily_performance.whatsapp_count + 1;
                 """, _logical_day_today(), owner_name)
+            # For kind == 'app_id' or None, there is no performance metric to update.
     except Exception as e:
         log.warning(f"Owner performance write failed for {owner_name}: {e}")
 
@@ -1976,10 +1978,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         log.info(f"Auto-cleared pending {source_kind} for user {uid}: {value_to_clear}")
                 
                 else:
-                    log.warning(f"User {uid} submitted App ID '{app_id}' but it could not be linked to a source item. Logging as unlinked.")
-                    context_data = {"source_owner": "unknown", "source_kind": "unknown"}
+                    # Treat unlinked App IDs as valid entries, storing them for later confirmation
+                    context_data = {"source_owner": "unknown", "source_kind": "app_id"}
                     await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
-                    await _log_event("app_id", "issued_unlinked", update, app_id)
+                    await _log_event("app_id", "issued", update, app_id)
+                    log.info(
+                        f"Recorded App ID '{app_id}' for user {uid} without a source item"
+                    )
 
 
             # Country and Age validation logic
@@ -2098,4 +2103,5 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
 
