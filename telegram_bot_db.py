@@ -1933,7 +1933,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Reworked Logic: Link a new App ID to a source (explicitly or implicitly)
             if app_id_match:
-                # The regex now has two groups: the keyword ('app' or 'add') and the ID itself.
+                # The regex now has two groups: the keyword ('app', 'add', 'id') and the ID itself.
                 app_id = f"@{app_id_match.group(2)}"
                 source_item_to_clear, source_kind = None, None
 
