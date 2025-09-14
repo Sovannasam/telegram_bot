@@ -1954,9 +1954,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             latest_in_kind = user_items[-1]
                             item_ts = datetime.fromisoformat(latest_in_kind["ts"])
                             if item_ts > last_ts:
-                                last_ts, last_item, last_item['kind'] = item_ts, latest_in_kind, kind
+                                last_ts = item_ts
+                                last_item = latest_in_kind
+                                last_item['kind'] = kind # Store kind for later
                     if last_item:
                         source_item_to_clear, source_kind = last_item, last_item['kind']
+
 
                 # If we found a source item, log the new App ID and clear the source
                 if source_item_to_clear and source_kind:
