@@ -1912,7 +1912,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         else:
                             await msg.reply_text("Wrong ID, please check.")
                         log.warning(f"Received confirmation for incorrect App ID '{app_id_confirmed_raw}' from {update.effective_user.username}.")
-            return
+            return # MODIFIED: Added return to prevent fallthrough to the next block
 
         elif chat_id == CLEARING_GROUP_ID:
             cleared_items_this_message = {'username': [], 'whatsapp': []}
@@ -2102,5 +2102,7 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
+
 
 
