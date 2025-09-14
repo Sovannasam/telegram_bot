@@ -427,7 +427,7 @@ async def load_owner_directory():
                 PHONE_INDEX[_norm_phone(ph)] = {"owner": owner, "phone": ph, "telegram": tel, "channel": "telegram"}
         if usernames: USERNAME_POOL.append({"owner": owner, "usernames": usernames})
         numbers: List[str] = []
-        for w in group.get("whatsapp", []):
+        for w in g.get("whatsapp", []):
             if w.get("disabled"): continue
             num = (w.get("number") or "").strip()
             if num:
@@ -1933,49 +1933,32 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             values_found_in_message = set(cleared_items_this_message['username'] + cleared_items_this_message['whatsapp'])
 
+            # MODIFIED: Logic to explicitly link App ID to the cleared item
             app_id_match = APP_ID_RX.search(text)
-            if app_id_match:
+            if app_id_match and values_found_in_message:
                 app_id = f"@{app_id_match.group(1)}"
                 
+                # Determine which item was just cleared to link the App ID
+                cleared_item_value = next(iter(values_found_in_message))
+                kind_of_cleared_item = "whatsapp" if _looks_like_phone(cleared_item_value) else "username"
+                
                 context_data = {}
-                if values_found_in_message:
-                    cleared_item_value = None
-                    kind_to_check = "username" 
-                    for v in values_found_in_message:
-                        if _looks_like_phone(v):
-                            kind_to_check = "whatsapp"
-                            cleared_item_value = v
-                            break
-                
-                    if not cleared_item_value:
-                        cleared_item_value = next(iter(values_found_in_message))
+                user_items = _issued_bucket(kind_of_cleared_item).get(str(uid), [])
+                for item in user_items:
+                    if item.get("value") == cleared_item_value:
+                        context_data["source_owner"] = item.get("owner")
+                        context_data["source_kind"] = kind_of_cleared_item
+                        break
 
-                    user_items = _issued_bucket(kind_to_check).get(str(uid), [])
-                    for item in user_items:
-                        if item.get("value") == cleared_item_value:
-                            context_data["source_owner"] = item.get("owner")
-                            context_data["source_kind"] = item.get("kind")
-                            break
-                else: 
-                    last_item = None
-                    last_ts = datetime.min.replace(tzinfo=TIMEZONE)
-                    for fallback_kind in ("username", "whatsapp"):
-                        user_items = _issued_bucket(fallback_kind).get(str(uid), [])
-                        if user_items:
-                            latest_in_kind = user_items[-1] 
-                            item_ts = datetime.fromisoformat(latest_in_kind["ts"])
-                            if item_ts > last_ts:
-                                last_ts = item_ts
-                                last_item = latest_in_kind
-                                last_item['kind'] = fallback_kind
-                    
-                    if last_item:
-                        context_data["source_owner"] = last_item.get("owner")
-                        context_data["source_kind"] = last_item.get("kind")
-                
                 await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
                 await _log_event("app_id", "issued", update, app_id, owner=context_data.get("source_owner", ""))
                 log.info(f"Recorded new pending App ID '{app_id}' for user {uid} linked to owner {context_data.get('source_owner')} and kind {context_data.get('source_kind')}")
+
+                # Now, clear the source item that was just submitted
+                if await _clear_one_issued(uid, kind_of_cleared_item, cleared_item_value):
+                    await _log_event(kind_of_cleared_item, "cleared", update, cleared_item_value, owner="")
+                    log.info(f"Auto-cleared ONE pending {kind_of_cleared_item} for user {uid}: {cleared_item_value}")
+
 
             if values_found_in_message:
                 found_country, country_status = _find_country_in_text(text)
@@ -2003,11 +1986,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await _increment_user_country_count(uid, country_status)
                         log.info(f"Incremented country count for user {uid} for '{country_status}'")
                     
-                    for kind, items_to_clear in cleared_items_this_message.items():
-                        for value_to_clear in items_to_clear:
-                            if await _clear_one_issued(uid, kind, value_to_clear):
-                                await _log_event(kind, "cleared", update, value_to_clear, owner="")
-                                log.info(f"Auto-cleared ONE pending {kind} for user {uid}: {value_to_clear}")
             return
 
         elif chat_id == REQUEST_GROUP_ID:
@@ -2102,7 +2080,5 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
-
-
+" and the user is asking the following query: "I want bot to send message to user when their whatsapp limit is over, in Khmer language"
 
