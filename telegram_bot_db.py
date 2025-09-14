@@ -55,7 +55,7 @@ ALLOWED_COUNTRIES = {
     'morocco', 'panama', 'saudi arabia', 'united arab emirates', 'uae',
     'oman', 'jordan', 'italy', 'germany', 'indonesia', 'colombia',
     'bulgaria', 'brazil', 'spain', 'belgium', 'algeria', 'south africa',
-    'philippines', 'indian', 'india', 'Portugal', 'Netherlands', 'Poland', 'Ghana', 'Dominican Republic'
+    'philippines', 'indian', 'india', 'portugal', 'netherlands', 'poland', 'ghana', 'dominican republic'
 }
 
 TIMEZONE = pytz.timezone("Asia/Phnom_Penh")
@@ -943,19 +943,21 @@ def _find_age_in_text(text: str) -> Optional[int]:
     return None
 
 def _find_country_in_text(text: str) -> Tuple[Optional[str], Optional[str]]:
-    match = re.search(r'\b(?:from|country)\s*:?\s*([a-zA-Z\s,]+)', text, re.IGNORECASE)
+    # MODIFIED: Reworked logic to be more robust
+    match = re.search(r'\b(?:from|country)\s*:?\s*(.*)', text, re.IGNORECASE)
     if not match:
         return None, None
 
-    potential_country = match.group(1).split(',')[0].strip().lower()
+    line_after_from = match.group(1).split('\n')[0].strip().lower()
 
-    for allowed in ALLOWED_COUNTRIES:
-        if allowed in potential_country:
-            if allowed in ['indian', 'india']:
-                return potential_country, 'india'
-            return potential_country, allowed
+    for country in ALLOWED_COUNTRIES:
+        if re.search(r'\b' + re.escape(country) + r'\b', line_after_from):
+            if country in ['indian', 'india']:
+                return country, 'india'
+            return country, country 
 
-    return potential_country, 'not_allowed'
+    potential_country_guess = line_after_from.split(',')[0].strip()
+    return potential_country_guess, 'not_allowed'
 
 # =============================
 # DETAIL & PERFORMANCE COMMANDS
