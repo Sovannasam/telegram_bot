@@ -51,6 +51,7 @@ DETAIL_GROUP_ID = int(os.getenv("DETAIL_GROUP_ID", "-1002598927727")) # Group fo
 
 
 # Whitelist of allowed countries (lowercase for case-insensitive matching)
+# MODIFIED: All countries are now lowercase to ensure correct matching.
 ALLOWED_COUNTRIES = {
     'morocco', 'panama', 'saudi arabia', 'united arab emirates', 'uae',
     'oman', 'jordan', 'italy', 'germany', 'indonesia', 'colombia',
@@ -2103,5 +2104,4 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
 
