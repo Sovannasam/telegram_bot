@@ -48,10 +48,13 @@ REQUEST_GROUP_ID = int(os.getenv("REQUEST_GROUP_ID", "-1002438185636")) # Group 
 CLEARING_GROUP_ID = int(os.getenv("CLEARING_GROUP_ID", "-1002624324856")) # Group for auto-clearing pendings
 CONFIRMATION_GROUP_ID = int(os.getenv("CONFIRMATION_GROUP_ID", "-1002694540582"))
 DETAIL_GROUP_ID = int(os.getenv("DETAIL_GROUP_ID", "-1002598927727")) # Group for 'my detail' reports
+# MODIFIED: Added a set of group IDs where 'my performance' is allowed
+PERFORMANCE_GROUP_IDS = {
+    -1002670785417, -1002659012767, -1002790753092, -1002520117752
+}
 
 
 # Whitelist of allowed countries (lowercase for case-insensitive matching)
-# MODIFIED: All countries are now lowercase to ensure correct matching.
 ALLOWED_COUNTRIES = {
     'morocco', 'panama', 'saudi arabia', 'united arab emirates', 'uae',
     'oman', 'jordan', 'italy', 'germany', 'indonesia', 'colombia',
@@ -208,6 +211,7 @@ COMMAND_PERMISSIONS = {
     'stop open', 'take customer', 'ban whatsapp', 'unban whatsapp', 'report',
     'owner report', 'performance', 'remind user', 'clear pending', 'clear all pending',
     'list owners', 'list disabled', 'list owner', 'detail user', 'list banned', 'list admins',
+    'list pending'
 }
 
 async def load_admins():
@@ -723,7 +727,6 @@ WHO_USING_REGEX = re.compile(
 )
 NEED_USERNAME_RX = re.compile(r"^\s*i\s*need\s*(?:user\s*name|username)\s*$", re.IGNORECASE)
 NEED_WHATSAPP_RX = re.compile(r"^\s*i\s*need\s*(?:id\s*)?whats?app\s*$", re.IGNORECASE)
-# MODIFIED: Regex now looks for 'app', 'add', or 'id' and allows any characters between it and the @mention
 APP_ID_RX = re.compile(r"\b(app|add|id)\b.*?\@([^\s]+)", re.IGNORECASE)
 EXTRACT_USERNAMES_RX = re.compile(r'@([a-zA-Z0-9_]{4,})')
 EXTRACT_PHONES_RX = re.compile(r'(\+?\d[\d\s\-()]{8,}\d)')
@@ -760,6 +763,7 @@ DELETE_ADMIN_RX       = re.compile(r"^\s*delete\s+admin\s+@?(\S+)\s*$", re.IGNOR
 ALLOW_ADMIN_CMD_RX    = re.compile(r"^\s*allow\s+@?(\S+)\s+to\s+use\s+command\s+(.+)\s*$", re.IGNORECASE)
 STOP_ALLOW_ADMIN_CMD_RX = re.compile(r"^\s*stop\s+allow\s+@?(\S+)\s+to\s+use\s+command\s+(.+)\s*$", re.IGNORECASE)
 LIST_ADMINS_RX        = re.compile(r"^\s*list\s+admins\s*$", re.IGNORECASE)
+LIST_PENDING_RX       = re.compile(r"^\s*list\s+pending\s*$", re.IGNORECASE)
 
 
 def _looks_like_phone(s: str) -> bool:
@@ -1005,6 +1009,36 @@ async def _get_owner_performance(owner_name: str, day: date) -> Tuple[int, int]:
     except Exception as e:
         log.warning(f"Owner performance read failed for {owner_name}: {e}")
         return (0, 0)
+        
+async def _get_owner_distribution_counts(owner_name: str, day: date) -> Tuple[int, int]:
+    """Fetches an owner's distribution stats for a given day from the audit log."""
+    start_ts = TIMEZONE.localize(datetime.combine(day, time(5, 30)))
+    end_ts = start_ts + timedelta(days=1)
+    tg_count = 0
+    wa_count = 0
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT kind, COUNT(*) as count
+                FROM audit_log
+                WHERE owner = $1
+                  AND action = 'issued'
+                  AND ts_local >= $2 AND ts_local < $3
+                GROUP BY kind;
+                """,
+                owner_name, start_ts, end_ts
+            )
+            for row in rows:
+                if row['kind'] == 'username':
+                    tg_count = row['count']
+                elif row['kind'] == 'whatsapp':
+                    wa_count = row['count']
+            return (tg_count, wa_count)
+    except Exception as e:
+        log.warning(f"Owner distribution count read failed for {owner_name}: {e}")
+        return (0, 0)
 
 async def _get_user_detail_text(user_id: int) -> str:
     user_info = state.get("user_names", {}).get(str(user_id), {})
@@ -1052,13 +1086,20 @@ async def _get_user_detail_text(user_id: int) -> str:
 async def _get_owner_performance_text(owner_name: str, day: date) -> str:
     """Generates a formatted string of an owner's daily performance and inventory."""
     # Daily Performance (from DB)
-    tg_count, wa_count = await _get_owner_performance(owner_name, day)
-    total_customers = tg_count + wa_count
+    tg_confirm_count, wa_confirm_count = await _get_owner_performance(owner_name, day)
+    total_customers = tg_confirm_count + wa_confirm_count
     
+    # NEW: Get distribution counts
+    tg_dist_count, wa_dist_count = await _get_owner_distribution_counts(owner_name, day)
+
     lines = [f"<b>📊 Performance for @{owner_name} on {day.isoformat()}</b>"]
-    lines.append(f"<b>- Customers via Telegram:</b> {tg_count}")
-    lines.append(f"<b>- Customers via WhatsApp:</b> {wa_count}")
-    lines.append(f"<b>- Total Customers:</b> {total_customers}")
+    lines.append(f"<b>- Customers via Telegram:</b> {tg_confirm_count}")
+    lines.append(f"<b>- Customers via WhatsApp:</b> {wa_confirm_count}")
+    lines.append(f"<b>- Total Customers Added:</b> {total_customers}")
+    lines.append("") # Spacer
+    lines.append("<b>🤖 Bot Distribution Stats</b>")
+    lines.append(f"<b>- Usernames Sent from Bot:</b> {tg_dist_count}")
+    lines.append(f"<b>- WhatsApps Sent from Bot:</b> {wa_dist_count}")
     lines.append("") # Spacer
 
     # Inventory Stats (from OWNER_DATA)
@@ -1321,6 +1362,7 @@ def _get_commands_text() -> str:
 <code>remind user</code>
 <code>clear pending @item_or_number</code>
 <code>clear all pending</code>
+<code>list pending</code> - List all pending App IDs.
 
 <b>--- Admin: Viewing Information ---</b>
 <code>list owners</code>
@@ -1686,6 +1728,42 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         command_list_text = _get_commands_text()
         return command_list_text
 
+    m = LIST_PENDING_RX.match(text)
+    if m:
+        if not _has_permission(user, 'list pending'):
+            return "You don't have permission to use this command."
+        
+        pending_apps = _issued_bucket("app_id")
+        if not pending_apps:
+            return "No pending App IDs found."
+
+        lines = ["<b>⏳ Pending App IDs by User:</b>"]
+        total_pending = 0
+        user_lines = []
+
+        for user_id_str, items in sorted(pending_apps.items()):
+            if not items:
+                continue
+            
+            user_id = int(user_id_str)
+            user_info = state.get("user_names", {}).get(user_id_str, {})
+            user_display = user_info.get('username') or user_info.get('first_name') or f"ID {user_id}"
+            if user_info.get('username'):
+                user_display = f"@{user_display}"
+            
+            user_app_ids = [f"  - <code>{item.get('value')}</code>" for item in items]
+            if user_app_ids:
+                user_lines.append(f"\n<b>{user_display}:</b>")
+                user_lines.extend(user_app_ids)
+                total_pending += len(user_app_ids)
+
+        if total_pending == 0:
+             return "No pending App IDs found."
+
+        lines.insert(1, f"<b>Total Pending:</b> {total_pending}")
+        lines.extend(user_lines)
+        return "\n".join(lines)
+
     m = DETAIL_USER_RX.match(text)
     if m:
         if not _has_permission(user, 'detail user'): return "You don't have permission to use this command."
@@ -1830,13 +1908,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Owner "my performance" command
         m_my_perf = MY_PERFORMANCE_RX.match(text)
         if m_my_perf:
-            if _is_owner(update.effective_user):
-                owner_name = _norm_owner_name(update.effective_user.username)
-                target_day = _parse_report_day(m_my_perf.group(1))
-                perf_text = await _get_owner_performance_text(owner_name, target_day)
-                await msg.reply_html(perf_text)
-            else:
-                await msg.reply_text("This command is only for registered owners.")
+            if chat_id in PERFORMANCE_GROUP_IDS:
+                if _is_owner(update.effective_user):
+                    owner_name = _norm_owner_name(update.effective_user.username)
+                    target_day = _parse_report_day(m_my_perf.group(1))
+                    perf_text = await _get_owner_performance_text(owner_name, target_day)
+                    await msg.reply_html(perf_text)
+                else:
+                    await msg.reply_text("This command is only for registered owners.")
             return
 
         # Admin: Report
