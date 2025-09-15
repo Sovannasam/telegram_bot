@@ -48,7 +48,6 @@ REQUEST_GROUP_ID = int(os.getenv("REQUEST_GROUP_ID", "-1002438185636")) # Group 
 CLEARING_GROUP_ID = int(os.getenv("CLEARING_GROUP_ID", "-1002624324856")) # Group for auto-clearing pendings
 CONFIRMATION_GROUP_ID = int(os.getenv("CONFIRMATION_GROUP_ID", "-1002694540582"))
 DETAIL_GROUP_ID = int(os.getenv("DETAIL_GROUP_ID", "-1002598927727")) # Group for 'my detail' reports
-# MODIFIED: Added a set of group IDs where 'my performance' is allowed
 PERFORMANCE_GROUP_IDS = {
     -1002670785417, -1002659012767, -1002790753092, -1002520117752
 }
@@ -740,11 +739,11 @@ DEL_OWNER_RX          = re.compile(r"^\s*delete\s+owner\s+@?(.+?)\s*$", re.IGNOR
 DEL_USERNAME_RX       = re.compile(r"^\s*delete\s+username\s+@([A-Za-z0-9_]{3,})\s*$", re.IGNORECASE)
 DEL_WHATSAPP_RX       = re.compile(r"^\s*delete\s+whats?app\s+(\+?\d[\d\s\-]{6,}\d)\s*$", re.IGNORECASE)
 LIST_OWNERS_RX        = re.compile(r"^\s*list\s+owners\s*$", re.IGNORECASE)
-LIST_OWNER_DETAIL_RX  = re.compile(r"^\s*list\s+owner\s+@?(.+?)\s*$", re.IGNORECASE)
+LIST_OWNER_DETAIL_RX  = re.compile(r"^\s*list\s+owner\s+@?([A-Za-z0-9_]{3,})\s*$", re.IGNORECASE)
 LIST_DISABLED_RX      = re.compile(r"^\s*list\s+disabled\s*$", re.IGNORECASE)
 SEND_REPORT_RX        = re.compile(r"^\s*(?:send\s+report|report)(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 PHONE_LIKE_RX         = re.compile(r"^\+?\d[\d\s\-]{6,}\d$")
-LIST_OWNER_ALIAS_RX   = re.compile(r"^\s*list\s+@?(.+?)\s*$", re.IGNORECASE)
+LIST_OWNER_ALIAS_RX   = re.compile(r"^\s*list\s+@?([A-Za-z0-9_]{3,})\s*$", re.IGNORECASE)
 REMIND_ALL_RX         = re.compile(r"^\s*remind\s+user\s*$", re.IGNORECASE)
 TAKE_CUSTOMER_RX      = re.compile(r"^\s*take\s+(\d+)\s+customer(?:s)?\s+to\s+owner\s+@?(.+?)(?:\s+(and\s+stop))?\s*$", re.IGNORECASE)
 CLEAR_PENDING_RX      = re.compile(r"^\s*clear\s+pending\s+(.+)\s*$", re.IGNORECASE)
@@ -1844,8 +1843,8 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                             if chat_id and value:
                                 label = "username" if kind == "username" else "WhatsApp"
                                 reminder_text = (
-                                    f"Hery I am so tired with you: {mention_user_html(user_id)}, "
-                                    f"្ខ្លួនឯងមិនទាន់ផ្ញើរInformation អាចាស់( {label} {value} ឲ្យគេផង គិតពីសុំគេអាថ្មី ពេលគេកាត់លុយមកខឹងBot "
+                                    f"សូមរំលឹក: {mention_user_html(user_id)}, "
+                                    f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ {label} {value} ដែលអ្នកបានស្នើសុំ។"
                                 )
                                 reminders_to_send.append({'chat_id': chat_id, 'text': reminder_text})
                                 item["last_reminder_ts"] = now.isoformat()
