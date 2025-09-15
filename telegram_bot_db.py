@@ -1844,8 +1844,8 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                             if chat_id and value:
                                 label = "username" if kind == "username" else "WhatsApp"
                                 reminder_text = (
-                                    f"សូមរំលឹក: {mention_user_html(user_id)}, "
-                                    f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ {label} {value} ដែលអ្នកបានស្នើសុំ។"
+                                    f"Hery I am so tired with you: {mention_user_html(user_id)}, "
+                                    f"្ខ្លួនឯងមិនទាន់ផ្ញើរInformation អាចាស់( {label} {value} ឲ្យគេផង គិតពីសុំគេអាថ្មី ពេលគេកាត់លុយមកខឹងBot "
                                 )
                                 reminders_to_send.append({'chat_id': chat_id, 'text': reminder_text})
                                 item["last_reminder_ts"] = now.isoformat()
