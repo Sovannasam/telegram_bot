@@ -59,8 +59,8 @@ ALLOWED_COUNTRIES = {
     'oman', 'jordan', 'italy', 'germany', 'indonesia', 'colombia',
     'bulgaria', 'brazil', 'spain', 'belgium', 'algeria', 'south africa',
     'philippines', 'indian', 'india', 'portugal', 'netherlands', 'poland', 
-'ghana', 'dominican republic', 'qata', 'france', 'switzerland', 'argentina','costa rica', 'pakistan','kuwait'
- 
+    'ghana', 'dominican republic', 'qata', 'france', 'switzerland', 'argentina',
+    'costa rica', 'pakistan', 'kuwait'
 }
 
 TIMEZONE = pytz.timezone("Asia/Phnom_Penh")
@@ -948,7 +948,7 @@ def _value_in_text(value: Optional[str], text: str) -> bool:
     else:
         v_digits = re.sub(r'\D', '', v_norm)
         text_digits = re.sub(r'\D', '', text_norm)
-        return v_digits and v_digits in text_digits
+        return v_digits and v_digits in text_norm
 
 def _find_closest_app_id(typed_id: str) -> Optional[str]:
     """Finds the most similar pending App ID using Levenshtein distance."""
@@ -1008,7 +1008,6 @@ def _find_age_in_text(text: str) -> Optional[int]:
     return None
 
 def _find_country_in_text(text: str) -> Tuple[Optional[str], Optional[str]]:
-    # MODIFIED: Reworked logic to be more robust
     match = re.search(r'\b(?:from|country)\s*:?\s*(.*)', text, re.IGNORECASE)
     if not match:
         return None, None
@@ -1019,6 +1018,8 @@ def _find_country_in_text(text: str) -> Tuple[Optional[str], Optional[str]]:
         if re.search(r'\b' + re.escape(country) + r'\b', line_after_from):
             if country in ['indian', 'india']:
                 return country, 'india'
+            if country == 'pakistan':
+                return country, 'pakistan'
             return country, country 
 
     potential_country_guess = line_after_from.split(',')[0].strip()
@@ -2103,7 +2104,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif chat_id == CLEARING_GROUP_ID:
             # Split the message into blocks, where each block starts with "App" or "ID"
             # The regex uses a positive lookahead (?=...) to split the text while keeping the delimiter
-            customer_blocks = re.split(r'(?=\b(?:App|ID|add)\b\s*:)', text, flags=re.IGNORECASE)
+            customer_blocks = re.split(r'(?=\b(?:App|ID|add)\b\s*[:\s])', text, flags=re.IGNORECASE)
 
             for block in customer_blocks:
                 block = block.strip()
@@ -2137,7 +2138,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 if app_id_match:
                     app_id_was_processed = True
-                    app_id = f"@{app_id_match.group(2)}" # This line is correct, no change needed here.
+                    app_id = f"@{app_id_match.group(2)}"
                     source_item_to_clear, source_kind = None, None
 
                     if values_found_in_message:
@@ -2198,8 +2199,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if country_status:
                         if country_status == 'not_allowed':
                             is_allowed, rejection_reason = False, f"Country '{found_country}' is not allowed."
-                        elif country_status == 'india' and (age is None or age < 30):
-                            is_allowed, rejection_reason = False, f"Age must be provided and 30 or older for India (got: {age})."
+                        elif country_status in ['india', 'pakistan'] and (age is None or age < 30):
+                            country_name = country_status.title()
+                            is_allowed, rejection_reason = False, f"Age must be provided and 30 or older for {country_name} (got: {age})."
                     
                     if not is_allowed:
                         first_offending_value = next(iter(values_found_in_message), app_id_match.group(2) if app_id_match else "this customer")
@@ -2209,7 +2211,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await msg.reply_html(reply_text)
                         log.warning(f"Rejected post from user {uid}. Reason: {rejection_reason}. Block content: {block[:100]}")
                     else:
-                        if country_status and country_status != 'not_allowed':
+                        if country_status and country_status not in ['not_allowed', 'india', 'pakistan']:
+                            await _increment_user_country_count(uid, country_status)
+                            log.info(f"Incremented country count for user {uid} for '{country_status}'")
+                        elif country_status in ['india', 'pakistan'] and is_allowed:
                             await _increment_user_country_count(uid, country_status)
                             log.info(f"Incremented country count for user {uid} for '{country_status}'")
             return
@@ -2306,8 +2311,4 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
-
-
-
 
