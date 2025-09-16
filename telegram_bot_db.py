@@ -783,7 +783,7 @@ WHO_USING_REGEX = re.compile(
 )
 NEED_USERNAME_RX = re.compile(r"^\s*i\s*need\s*(?:user\s*name|username)\s*$", re.IGNORECASE)
 NEED_WHATSAPP_RX = re.compile(r"^\s*i\s*need\s*(?:id\s*)?whats?app\s*$", re.IGNORECASE)
-APP_ID_RX = re.compile(r"\b(app|add|id)\b\s*[:\s]*\s*\@([^\s]+)", re.IGNORECASE | re.DOTALL)
+APP_ID_RX = re.compile(r"\b(app|add|id)\b\s*[:\s]*\s*@([^\s]+)", re.IGNORECASE | re.DOTALL)
 EXTRACT_USERNAMES_RX = re.compile(r'@([a-zA-Z0-9_]{4,})')
 EXTRACT_PHONES_RX = re.compile(r'(\+?\d[\d\s\-()]{8,}\d)')
 
@@ -2134,7 +2134,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 if app_id_match:
                     app_id_was_processed = True
-                    app_id = f"@{app_id_match.group(2)}"
+                    app_id = f"@{app_id_match.group(2)}" # This line is correct, no change needed here.
                     source_item_to_clear, source_kind = None, None
 
                     if values_found_in_message:
@@ -2305,4 +2305,7 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
+
+
 
