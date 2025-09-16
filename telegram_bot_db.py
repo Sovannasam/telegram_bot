@@ -514,21 +514,20 @@ async def _increment_owner_performance(owner_name: str, kind: Optional[str]):
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
-            if kind == 'username':
-                await conn.execute("""
-                    INSERT INTO owner_daily_performance (day, owner_name, telegram_count)
-                    VALUES ($1, $2, 1)
-                    ON CONFLICT (day, owner_name) DO UPDATE
-                    SET telegram_count = owner_daily_performance.telegram_count + 1;
-                """, _logical_day_today(), owner_name)
-            elif kind == 'whatsapp':
+            if kind == 'whatsapp':
                 await conn.execute("""
                     INSERT INTO owner_daily_performance (day, owner_name, whatsapp_count)
                     VALUES ($1, $2, 1)
                     ON CONFLICT (day, owner_name) DO UPDATE
                     SET whatsapp_count = owner_daily_performance.whatsapp_count + 1;
                 """, _logical_day_today(), owner_name)
-            # For kind == 'app_id' or None, there is no performance metric to update.
+            else: # Default to telegram for 'username', 'app_id', or None
+                await conn.execute("""
+                    INSERT INTO owner_daily_performance (day, owner_name, telegram_count)
+                    VALUES ($1, $2, 1)
+                    ON CONFLICT (day, owner_name) DO UPDATE
+                    SET telegram_count = owner_daily_performance.telegram_count + 1;
+                """, _logical_day_today(), owner_name)
     except Exception as e:
         log.warning(f"Owner performance write failed for {owner_name}: {e}")
 
@@ -1199,16 +1198,21 @@ async def _get_daily_data_summary_text() -> str:
     
     owner_performances = []
     
-    # Get all owner names from the loaded data
-    all_owners = [_norm_owner_name(o['owner']) for o in OWNER_DATA]
-    
-    for owner_name in all_owners:
-        tg_confirm_count, wa_confirm_count = await _get_owner_performance(owner_name, today)
-        total_customers = tg_confirm_count + wa_confirm_count
-        
-        if total_customers > 0:
-            owner_performances.append({'name': owner_name, 'total': total_customers})
-            
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT owner_name, telegram_count, whatsapp_count FROM owner_daily_performance WHERE day=$1",
+                today
+            )
+            for row in rows:
+                total_customers = row['telegram_count'] + row['whatsapp_count']
+                if total_customers > 0:
+                     owner_performances.append({'name': row['owner_name'], 'total': total_customers})
+    except Exception as e:
+        log.error(f"Failed to fetch data for 'data today' report: {e}")
+        return "Error fetching today's data."
+
     if not owner_performances:
         return "No owners have added customers today."
         
@@ -2300,6 +2304,8 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
+
 
 
 
