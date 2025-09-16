@@ -649,6 +649,58 @@ async def _decrement_priority_and_end_if_needed():
     else:
         await save_state()
 
+async def _get_bulk_owner_performance(owner_names: List[str], day: date) -> Dict[str, int]:
+    """Fetches performance for a list of owners and returns total confirmations."""
+    if not owner_names:
+        return {}
+    
+    performance_map = {name: 0 for name in owner_names}
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT owner_name, telegram_count, whatsapp_count FROM owner_daily_performance WHERE day=$1 AND owner_name = ANY($2)",
+                day, owner_names
+            )
+            for row in rows:
+                performance_map[row['owner_name']] = row['telegram_count'] + row['whatsapp_count']
+        return performance_map
+    except Exception as e:
+        log.warning(f"Bulk owner performance read failed: {e}")
+        return performance_map
+
+async def _get_next_owner_by_performance(pool: List[Dict], rr_idx_key: str) -> int:
+    """Selects the next owner from a pool based on the lowest number of daily confirmations."""
+    active_owners = [o['owner'] for o in pool]
+    if not active_owners:
+        return 0
+
+    # Get performance for all active owners in the pool
+    performance = await _get_bulk_owner_performance(active_owners, _logical_day_today())
+
+    # Find the minimum score
+    min_score = float('inf')
+    if performance:
+        min_score = min(performance.values())
+
+    # Find all owners with that minimum score
+    least_busy_owners = {owner for owner, score in performance.items() if score == min_score}
+
+    # If all owners have no score yet, just use the normal round-robin
+    if not least_busy_owners:
+        return state['rr'].get(rr_idx_key, 0) % len(pool)
+
+    # Use round-robin AMONG the least busy owners to ensure fair tie-breaking
+    current_rr_idx = state['rr'].get(rr_idx_key, 0)
+    for i in range(len(pool)):
+        next_idx = (current_rr_idx + i) % len(pool)
+        if pool[next_idx]['owner'] in least_busy_owners:
+            return next_idx # This is the chosen one
+
+    # Fallback to the first least busy owner if something goes wrong
+    return active_owners.index(list(least_busy_owners)[0])
+
+
 async def _next_from_username_pool() -> Optional[Dict[str, str]]:
     pq = state.get("priority_queue", {})
     if pq.get("active"):
@@ -665,20 +717,23 @@ async def _next_from_username_pool() -> Optional[Dict[str, str]]:
         log.warning(f"Priority owner {priority_owner} has no available usernames. Falling back to normal rotation for this request.")
 
     if not USERNAME_POOL: return None
-    rr = state["rr"]
-    idx = rr.get("username_owner_idx", 0) % len(USERNAME_POOL)
-    for _ in range(len(USERNAME_POOL)):
-        block = USERNAME_POOL[idx]
+    
+    # MODIFIED: Smart owner selection
+    owner_idx = await _get_next_owner_by_performance(USERNAME_POOL, "username_owner_idx")
+    
+    for i in range(len(USERNAME_POOL)):
+        current_idx = (owner_idx + i) % len(USERNAME_POOL)
+        block = USERNAME_POOL[current_idx]
         arr = block.get("usernames", [])
         if arr:
-            ei = rr["username_entry_idx"].get(block["owner"], 0) % len(arr)
+            ei = state["rr"]["username_entry_idx"].get(block["owner"], 0) % len(arr)
             result = {"owner": block["owner"], "username": arr[ei]}
-            rr["username_entry_idx"][block["owner"]] = (ei + 1) % len(arr)
-            rr["username_owner_idx"] = (idx + 1) % len(USERNAME_POOL)
+            state["rr"]["username_entry_idx"][block["owner"]] = (ei + 1) % len(arr)
+            state["rr"]["username_owner_idx"] = (current_idx + 1) % len(USERNAME_POOL)
             await save_state()
             return result
-        idx = (idx + 1) % len(USERNAME_POOL)
     return None
+
 
 async def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
     pq = state.get("priority_queue", {})
@@ -698,23 +753,25 @@ async def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
         log.warning(f"Priority owner {priority_owner} has no available WhatsApp numbers. Falling back to normal rotation for this request.")
 
     if not WHATSAPP_POOL: return None
-    rr = state["rr"]
-    owner_idx = rr.get("wa_owner_idx", 0) % len(WHATSAPP_POOL)
-    for _ in range(len(WHATSAPP_POOL)):
-        block = WHATSAPP_POOL[owner_idx]
+
+    # MODIFIED: Smart owner selection
+    owner_idx = await _get_next_owner_by_performance(WHATSAPP_POOL, "wa_owner_idx")
+    
+    for i in range(len(WHATSAPP_POOL)):
+        current_idx = (owner_idx + i) % len(WHATSAPP_POOL)
+        block = WHATSAPP_POOL[current_idx]
         owner = block["owner"]
         numbers = block.get("numbers", []) or []
         if numbers:
-            start = rr["wa_entry_idx"].get(owner, 0) % len(numbers)
+            start = state["rr"]["wa_entry_idx"].get(owner, 0) % len(numbers)
             for step in range(len(numbers)):
                 cand = numbers[(start + step) % len(numbers)]
                 if await _wa_quota_reached(cand):
                     continue
-                rr["wa_entry_idx"][owner] = ((start + step) + 1) % len(numbers)
-                rr["wa_owner_idx"] = (owner_idx + 1) % len(WHATSAPP_POOL)
+                state["rr"]["wa_entry_idx"][owner] = ((start + step) + 1) % len(numbers)
+                state["rr"]["wa_owner_idx"] = (current_idx + 1) % len(WHATSAPP_POOL)
                 await save_state()
                 return {"owner": owner, "number": cand}
-        owner_idx = (owner_idx + 1) % len(WHATSAPP_POOL)
     return None
 
 # =============================
