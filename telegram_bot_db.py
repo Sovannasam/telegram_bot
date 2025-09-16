@@ -54,7 +54,6 @@ PERFORMANCE_GROUP_IDS = {
 
 
 # Whitelist of allowed countries (lowercase for case-insensitive matching)
-# MODIFIED: All countries are now lowercase to ensure correct matching.
 ALLOWED_COUNTRIES = {
     'morocco', 'panama', 'saudi arabia', 'united arab emirates', 'uae',
     'oman', 'jordan', 'italy', 'germany', 'indonesia', 'colombia',
@@ -211,7 +210,7 @@ COMMAND_PERMISSIONS = {
     'stop open', 'take customer', 'ban whatsapp', 'unban whatsapp', 'report',
     'owner report', 'performance', 'remind user', 'clear pending', 'clear all pending',
     'list owners', 'list disabled', 'list owner', 'detail user', 'list banned', 'list admins',
-    'list pending'
+    'list pending', 'data today'
 }
 
 async def load_admins():
@@ -821,6 +820,7 @@ ALLOW_ADMIN_CMD_RX    = re.compile(r"^\s*allow\s+@?(\S+)\s+to\s+use\s+command\s+
 STOP_ALLOW_ADMIN_CMD_RX = re.compile(r"^\s*stop\s+allow\s+@?(\S+)\s+to\s+use\s+command\s+(.+)\s*$", re.IGNORECASE)
 LIST_ADMINS_RX        = re.compile(r"^\s*list\s+admins\s*$", re.IGNORECASE)
 LIST_PENDING_RX       = re.compile(r"^\s*list\s+pending\s*$", re.IGNORECASE)
+DATA_TODAY_RX         = re.compile(r"^\s*data\s+today\s*$", re.IGNORECASE)
 
 
 def _looks_like_phone(s: str) -> bool:
@@ -1190,6 +1190,35 @@ async def _get_owner_performance_text(owner_name: str, day: date) -> str:
 
     return "\n".join(lines)
 
+# NEW: Function to generate the 'data today' report
+async def _get_daily_data_summary_text() -> str:
+    """Generates a summary of all owners who have added customers today."""
+    today = _logical_day_today()
+    lines = [f"<b>📊 Daily Customer Summary for {today.isoformat()}</b>"]
+    
+    owner_performances = []
+    
+    # Get all owner names from the loaded data
+    all_owners = [_norm_owner_name(o['owner']) for o in OWNER_DATA]
+    
+    for owner_name in all_owners:
+        tg_confirm_count, wa_confirm_count = await _get_owner_performance(owner_name, today)
+        total_customers = tg_confirm_count + wa_confirm_count
+        
+        if total_customers > 0:
+            owner_performances.append({'name': owner_name, 'total': total_customers})
+            
+    if not owner_performances:
+        return "No owners have added customers today."
+        
+    # Sort by total customers, descending
+    owner_performances.sort(key=lambda x: x['total'], reverse=True)
+    
+    for perf in owner_performances:
+        lines.append(f"- @{perf['name']}: {perf['total']} customers")
+        
+    return "\n".join(lines)
+
 
 # =============================
 # EXCEL (reads audit_log)
@@ -1420,6 +1449,7 @@ def _get_commands_text() -> str:
 <code>clear pending @item_or_number</code>
 <code>clear all pending</code>
 <code>list pending</code> - List all pending App IDs.
+<code>data today</code> - Show today's customer summary by owner.
 
 <b>--- Admin: Viewing Information ---</b>
 <code>list owners</code>
@@ -1820,6 +1850,12 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         lines.insert(1, f"<b>Total Pending:</b> {total_pending}")
         lines.extend(user_lines)
         return "\n".join(lines)
+        
+    m = DATA_TODAY_RX.match(text)
+    if m:
+        if not _has_permission(user, 'data today'):
+            return "You don't have permission to use this command."
+        return await _get_daily_data_summary_text()
 
     m = DETAIL_USER_RX.match(text)
     if m:
