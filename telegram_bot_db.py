@@ -2125,6 +2125,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 app_id_match = APP_ID_RX.search(block)
                 app_id_was_processed = False
 
+                # NEW: Find country and age at the start of block processing
+                found_country, country_status = _find_country_in_text(block)
+                age = _find_age_in_text(block)
+
                 if app_id_match:
                     app_id_was_processed = True
                     app_id = f"@{app_id_match.group(2)}" # This line is correct, no change needed here.
@@ -2181,9 +2185,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             log.info(f"Auto-cleared pending whatsapp for user {uid} via direct mention: {whatsapp_to_clear}")
                 
                 # Country and Age validation logic (runs for each block)
-                if values_found_in_message or app_id_match: # Run validation if any useful info is in the block
-                    found_country, country_status = _find_country_in_text(block)
-                    age = _find_age_in_text(block)
+                if values_found_in_message or app_id_match or found_country: # MODIFIED: Added 'found_country' to the trigger condition
                     is_allowed = True
                     rejection_reason = ""
 
@@ -2298,6 +2300,7 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
 
 
 
