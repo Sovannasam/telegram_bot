@@ -446,13 +446,13 @@ def _logical_day_today() -> date:
     now = datetime.now(TIMEZONE)
     return (now - timedelta(hours=5, minutes=30)).date()
 
-async def _get_user_activity(user_id: int) -> Tuple[int, int]:
+async def _get_user_activity(user_id: int, day: date) -> Tuple[int, int]:
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT username_requests, whatsapp_requests FROM user_daily_activity WHERE day=$1 AND user_id=$2",
-                _logical_day_today(), user_id
+                day, user_id
             )
             return (row['username_requests'], row['whatsapp_requests']) if row else (0, 0)
     except Exception as e:
@@ -1026,27 +1026,27 @@ def _find_country_in_text(text: str) -> Tuple[Optional[str], Optional[str]]:
 # =============================
 # DETAIL & PERFORMANCE COMMANDS
 # =============================
-async def _get_user_country_counts(user_id: int) -> List[Tuple[str, int]]:
+async def _get_user_country_counts(user_id: int, day: date) -> List[Tuple[str, int]]:
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT country, count FROM user_daily_country_counts WHERE day=$1 AND user_id=$2 ORDER BY country",
-                _logical_day_today(), user_id
+                day, user_id
             )
             return [(row['country'], row['count']) for row in rows]
     except Exception as e:
         log.warning(f"User country count read failed for {user_id}: {e}")
         return []
 
-async def _get_user_confirmation_count(user_id: int) -> int:
-    """Fetches a user's successful confirmation count for the current logical day."""
+async def _get_user_confirmation_count(user_id: int, day: date) -> int:
+    """Fetches a user's successful confirmation count for a given logical day."""
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
             count = await conn.fetchval(
                 "SELECT confirm_count FROM user_daily_confirmations WHERE day=$1 AND user_id=$2",
-                _logical_day_today(), user_id
+                day, user_id
             )
             return int(count) if count is not None else 0
     except Exception as e:
@@ -1103,9 +1103,10 @@ async def _get_user_detail_text(user_id: int) -> str:
     if user_info.get('username'):
         user_display = f"@{user_display}"
 
-    username_reqs, whatsapp_reqs = await _get_user_activity(user_id)
-    country_counts = await _get_user_country_counts(user_id)
-    confirmation_count = await _get_user_confirmation_count(user_id)
+    today = _logical_day_today()
+    username_reqs, whatsapp_reqs = await _get_user_activity(user_id, today)
+    country_counts = await _get_user_country_counts(user_id, today)
+    confirmation_count = await _get_user_confirmation_count(user_id, today)
 
     pending_usernames = [item['value'] for item in _issued_bucket("username").get(str(user_id), [])]
     pending_whatsapps = [item['value'] for item in _issued_bucket("whatsapp").get(str(user_id), [])]
@@ -1251,10 +1252,12 @@ async def _compute_daily_summary(target_day: date) -> Tuple[List[dict], List[dic
         audit_users = await conn.fetch("SELECT DISTINCT user_id FROM audit_log WHERE ts_local >= $1 AND ts_local < $2 AND user_id IS NOT NULL", start_ts, end_ts)
         confirm_users = await conn.fetch("SELECT DISTINCT user_id FROM user_daily_confirmations WHERE day = $1", target_day)
         country_users = await conn.fetch("SELECT DISTINCT user_id FROM user_daily_country_counts WHERE day = $1", target_day)
+        activity_users = await conn.fetch("SELECT DISTINCT user_id FROM user_daily_activity WHERE day = $1", target_day)
 
         all_user_ids = {r['user_id'] for r in audit_users if r['user_id']}
         all_user_ids.update({r['user_id'] for r in confirm_users if r['user_id']})
         all_user_ids.update({r['user_id'] for r in country_users if r['user_id']})
+        all_user_ids.update({r['user_id'] for r in activity_users if r['user_id']})
 
         # Process data for each user
         out_users = []
@@ -1262,20 +1265,10 @@ async def _compute_daily_summary(target_day: date) -> Tuple[List[dict], List[dic
             user_info = state.get("user_names", {}).get(str(user_id), {})
             user_display = user_info.get('username') or user_info.get('first_name') or f"ID: {user_id}"
 
-            # Get request counts from audit log
-            username_reqs, whatsapp_reqs = 0, 0
-            req_rows = await conn.fetch("SELECT kind FROM audit_log WHERE ts_local >= $1 AND ts_local < $2 AND user_id = $3 AND action = 'issued'", start_ts, end_ts, user_id)
-            for row in req_rows:
-                if row['kind'] == 'username':
-                    username_reqs += 1
-                elif row['kind'] == 'whatsapp':
-                    whatsapp_reqs += 1
-
-            # Get confirmation counts
-            confirm_count = await _get_user_confirmation_count(user_id)
-            
-            # Get country submissions
-            country_counts = await _get_user_country_counts(user_id)
+            # Get request counts, confirmation counts, and country submissions using the corrected functions
+            username_reqs, whatsapp_reqs = await _get_user_activity(user_id, target_day)
+            confirm_count = await _get_user_confirmation_count(user_id, target_day)
+            country_counts = await _get_user_country_counts(user_id, target_day)
             country_str = ", ".join([f"{c.title()}: {n}" for c, n in country_counts])
 
             out_users.append({
@@ -1963,18 +1956,18 @@ async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
     async with db_lock:
         try:
             pool = await get_db_pool()
+            yesterday = _logical_day_today() - timedelta(days=1)
             async with pool.acquire() as conn:
-                await conn.execute("DELETE FROM wa_daily_usage;")
-                await conn.execute("DELETE FROM user_daily_activity;")
-                await conn.execute("DELETE FROM user_daily_country_counts;")
-                await conn.execute("DELETE FROM user_daily_confirmations;")
-                await conn.execute("DELETE FROM owner_daily_performance;") 
-                log.info("Cleared daily WhatsApp, user activity, country, confirmation, and performance quotas from database.")
+                await conn.execute("DELETE FROM wa_daily_usage WHERE day <= $1;", yesterday)
+                await conn.execute("DELETE FROM user_daily_activity WHERE day <= $1;", yesterday)
+                await conn.execute("DELETE FROM user_daily_country_counts WHERE day <= $1;", yesterday)
+                await conn.execute("DELETE FROM user_daily_confirmations WHERE day <= $1;", yesterday)
+                await conn.execute("DELETE FROM owner_daily_performance WHERE day <= $1;", yesterday)
+                log.info(f"Cleared daily data on and before {yesterday} from database.")
         except Exception as e:
             log.error(f"Failed to clear daily tables: {e}")
 
-        await save_state()
-        log.info("Daily reset complete. Pending items from previous days are preserved.")
+        log.info("Daily reset complete. Pending items are preserved.")
 
 # =============================
 # MESSAGE HANDLER
@@ -2229,7 +2222,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await msg.reply_text("អ្នកត្រូវបានហាមឃាត់ពីការស្នើសុំលេខ WhatsApp ។")
                     return
 
-                username_count, whatsapp_count = await _get_user_activity(uid)
+                username_count, whatsapp_count = await _get_user_activity(uid, _logical_day_today())
                 has_bonus = username_count > USERNAME_THRESHOLD_FOR_BONUS
 
                 if not has_bonus and whatsapp_count >= USER_WHATSAPP_LIMIT:
@@ -2305,6 +2298,7 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
 
 
 
