@@ -783,7 +783,7 @@ WHO_USING_REGEX = re.compile(
 )
 NEED_USERNAME_RX = re.compile(r"^\s*i\s*need\s*(?:user\s*name|username)\s*$", re.IGNORECASE)
 NEED_WHATSAPP_RX = re.compile(r"^\s*i\s*need\s*(?:id\s*)?whats?app\s*$", re.IGNORECASE)
-APP_ID_RX = re.compile(r"\b(app|add|id)\b.*?\@([^\s]+)", re.IGNORECASE)
+APP_ID_RX = re.compile(r"\b(app|add|id)\b\s*[:\s]*\s*\@([^\s]+)", re.IGNORECASE | re.DOTALL)
 EXTRACT_USERNAMES_RX = re.compile(r'@([a-zA-Z0-9_]{4,})')
 EXTRACT_PHONES_RX = re.compile(r'(\+?\d[\d\s\-()]{8,}\d)')
 
@@ -947,7 +947,7 @@ def _value_in_text(value: Optional[str], text: str) -> bool:
     else:
         v_digits = re.sub(r'\D', '', v_norm)
         text_digits = re.sub(r'\D', '', text_norm)
-        return v_digits and v_digits in text_norm
+        return v_digits and v_digits in text_digits
 
 def _find_closest_app_id(typed_id: str) -> Optional[str]:
     """Finds the most similar pending App ID using Levenshtein distance."""
@@ -2049,9 +2049,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if chat_id == CONFIRMATION_GROUP_ID:
             if '+1' in text:
+                # Try to find an ID with '@' first, then fall back to a plain number
                 match = re.search(r'@([^\s]+)', text)
+                if not match:
+                    # If no '@' found, look for a sequence of digits after '+1'
+                    match = re.search(r'\+1\s*(\d+)', text)
+
                 if match:
-                    app_id_confirmed_raw = f"@{match.group(1)}"
+                    app_id_from_msg = match.group(1)
+                    app_id_confirmed_raw = f"@{app_id_from_msg}"
                     found_and_counted = False
                     
                     # Search all users to find who this App ID belongs to
@@ -2076,6 +2082,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 break
                     
                     if not found_and_counted:
+                        # === MODIFICATION START ===
+                        log.warning(
+                            f"Confirmation failed for App ID '{app_id_confirmed_raw}' from {update.effective_user.username}. "
+                            f"Normalized to '{_normalize_app_id(app_id_confirmed_raw)}'. "
+                            f"Full message text: '{text}'"
+                        )
                         suggestion = _find_closest_app_id(app_id_confirmed_raw)
                         if suggestion:
                             reply_text = (
@@ -2085,8 +2097,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             )
                             await msg.reply_html(reply_text)
                         else:
-                            await msg.reply_text("Wrong ID, please check.")
-                        log.warning(f"Received confirmation for incorrect App ID '{app_id_confirmed_raw}' from {update.effective_user.username}.")
+                            await msg.reply_text("Wrong ID, please check. No close match found in pending list.")
+                        # === MODIFICATION END ===
             return
 
         elif chat_id == CLEARING_GROUP_ID:
@@ -2105,9 +2117,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Find a new App ID in the message
             app_id_match = APP_ID_RX.search(text)
+            app_id_was_processed = False
 
             # Reworked Logic: Link a new App ID to a source (explicitly or implicitly)
             if app_id_match:
+                app_id_was_processed = True
                 # The regex now has two groups: the keyword ('app', 'add', 'id') and the ID itself.
                 app_id = f"@{app_id_match.group(2)}"
                 source_item_to_clear, source_kind = None, None
@@ -2159,6 +2173,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"Recorded App ID '{app_id}' for user {uid} without a source item"
                     )
 
+            # === NEW LOGIC: Clear standalone items if no App ID was processed ===
+            if not app_id_was_processed:
+                for username_to_clear in cleared_items_this_message.get('username', []):
+                    if await _clear_one_issued(uid, "username", username_to_clear):
+                        await _log_event("username", "cleared", update, username_to_clear)
+                        log.info(f"Auto-cleared pending username for user {uid} via direct mention: {username_to_clear}")
+
+                for whatsapp_to_clear in cleared_items_this_message.get('whatsapp', []):
+                    if await _clear_one_issued(uid, "whatsapp", whatsapp_to_clear):
+                        await _log_event("whatsapp", "cleared", update, whatsapp_to_clear)
+                        log.info(f"Auto-cleared pending whatsapp for user {uid} via direct mention: {whatsapp_to_clear}")
+            # === END NEW LOGIC ===
 
             # Country and Age validation logic
             if values_found_in_message:
@@ -2276,4 +2302,6 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
+
 
