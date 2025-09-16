@@ -2102,112 +2102,115 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         elif chat_id == CLEARING_GROUP_ID:
-            # Find any pending items mentioned in the message
-            cleared_items_this_message = {'username': [], 'whatsapp': []}
-            pending_usernames = {item['value'] for item in _issued_bucket("username").get(str(uid), [])}
-            pending_whatsapps = {item['value'] for item in _issued_bucket("whatsapp").get(str(uid), [])}
-            found_usernames = {f"@{u}" for u in EXTRACT_USERNAMES_RX.findall(text)}
-            found_phones = EXTRACT_PHONES_RX.findall(text)
-            for u in found_usernames:
-                if u in pending_usernames: cleared_items_this_message['username'].append(u)
-            for p in found_phones:
-                for pending_p in pending_whatsapps:
-                    if _norm_phone(p) == _norm_phone(pending_p): cleared_items_this_message['whatsapp'].append(pending_p)
-            values_found_in_message = set(cleared_items_this_message['username'] + cleared_items_this_message['whatsapp'])
+            # Split the message into blocks, where each block starts with "App" or "ID"
+            # The regex uses a positive lookahead (?=...) to split the text while keeping the delimiter
+            customer_blocks = re.split(r'(?=\b(?:App|ID|add)\b\s*:)', text, flags=re.IGNORECASE)
 
-            # Find a new App ID in the message
-            app_id_match = APP_ID_RX.search(text)
-            app_id_was_processed = False
-
-            # Reworked Logic: Link a new App ID to a source (explicitly or implicitly)
-            if app_id_match:
-                app_id_was_processed = True
-                # The regex now has two groups: the keyword ('app', 'add', 'id') and the ID itself.
-                app_id = f"@{app_id_match.group(2)}"
-                source_item_to_clear, source_kind = None, None
-
-                # Priority 1: Link to an item explicitly mentioned in this message
-                if values_found_in_message:
-                    value = next(iter(values_found_in_message))
-                    kind = "whatsapp" if _looks_like_phone(value) else "username"
-                    for item in _issued_bucket(kind).get(str(uid), []):
-                        if item.get("value") == value:
-                            source_item_to_clear, source_kind = item, kind
-                            break
-                # Priority 2 (Fallback): Link to the most recently issued item for this user
-                else:
-                    last_item, last_ts = None, datetime.min.replace(tzinfo=TIMEZONE)
-                    for kind in ("username", "whatsapp"):
-                        user_items = _issued_bucket(kind).get(str(uid), [])
-                        if user_items:
-                            latest_in_kind = user_items[-1]
-                            item_ts = datetime.fromisoformat(latest_in_kind["ts"])
-                            if item_ts > last_ts:
-                                last_ts = item_ts
-                                last_item = latest_in_kind
-                                last_item['kind'] = kind # Store kind for later
-                    if last_item:
-                        source_item_to_clear, source_kind = last_item, last_item['kind']
-
-
-                # If we found a source item, log the new App ID and clear the source
-                if source_item_to_clear and source_kind:
-                    context_data = {
-                        "source_owner": source_item_to_clear.get("owner"),
-                        "source_kind": source_kind
-                    }
-                    value_to_clear = source_item_to_clear.get("value")
-                    await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
-                    await _log_event("app_id", "issued", update, app_id, owner=context_data.get("source_owner", ""))
-                    log.info(f"Recorded App ID '{app_id}' for user {uid}, linked to {source_kind} '{value_to_clear}'")
-                    if await _clear_one_issued(uid, source_kind, value_to_clear):
-                        await _log_event(source_kind, "cleared", update, value_to_clear)
-                        log.info(f"Auto-cleared pending {source_kind} for user {uid}: {value_to_clear}")
+            for block in customer_blocks:
+                block = block.strip()
+                if not block:
+                    continue
                 
-                else:
-                    # Treat unlinked App IDs as valid entries, storing them for later confirmation
-                    context_data = {"source_owner": "unknown", "source_kind": "app_id"}
-                    await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
-                    await _log_event("app_id", "issued", update, app_id)
-                    log.info(
-                        f"Recorded App ID '{app_id}' for user {uid} without a source item"
-                    )
+                log.info(f"Processing customer block for user {uid}: --- {block[:100]}... ---")
 
-            # === NEW LOGIC: Clear standalone items if no App ID was processed ===
-            if not app_id_was_processed:
-                for username_to_clear in cleared_items_this_message.get('username', []):
-                    if await _clear_one_issued(uid, "username", username_to_clear):
-                        await _log_event("username", "cleared", update, username_to_clear)
-                        log.info(f"Auto-cleared pending username for user {uid} via direct mention: {username_to_clear}")
+                # Find any pending items mentioned in this block
+                cleared_items_this_message = {'username': [], 'whatsapp': []}
+                pending_usernames = {item['value'] for item in _issued_bucket("username").get(str(uid), [])}
+                pending_whatsapps = {item['value'] for item in _issued_bucket("whatsapp").get(str(uid), [])}
+                found_usernames = {f"@{u}" for u in EXTRACT_USERNAMES_RX.findall(block)}
+                found_phones = EXTRACT_PHONES_RX.findall(block)
 
-                for whatsapp_to_clear in cleared_items_this_message.get('whatsapp', []):
-                    if await _clear_one_issued(uid, "whatsapp", whatsapp_to_clear):
-                        await _log_event("whatsapp", "cleared", update, whatsapp_to_clear)
-                        log.info(f"Auto-cleared pending whatsapp for user {uid} via direct mention: {whatsapp_to_clear}")
-            # === END NEW LOGIC ===
+                for u in found_usernames:
+                    if u in pending_usernames: cleared_items_this_message['username'].append(u)
+                for p in found_phones:
+                    for pending_p in pending_whatsapps:
+                        if _norm_phone(p) == _norm_phone(pending_p): cleared_items_this_message['whatsapp'].append(pending_p)
+                
+                values_found_in_message = set(cleared_items_this_message['username'] + cleared_items_this_message['whatsapp'])
 
-            # Country and Age validation logic
-            if values_found_in_message:
-                found_country, country_status = _find_country_in_text(text)
-                age = _find_age_in_text(text)
-                is_allowed = True
-                rejection_reason = ""
-                if country_status:
-                    if country_status == 'not_allowed':
-                        is_allowed, rejection_reason = False, f"Country '{found_country}' is not allowed."
-                    elif country_status == 'india' and (age is None or age < 30):
-                        is_allowed, rejection_reason = False, f"Age must be provided and 30 or older for India (got: {age})."
-                if not is_allowed:
-                    first_offending_value = next(iter(values_found_in_message))
-                    item_type = "username" if first_offending_value.startswith('@') else "whatsapp"
-                    reply_text = (f"{mention_user_html(uid)}, this country is not allowed. "
-                                  f"Please use that {item_type} (<code>{first_offending_value}</code>) for another customer.")
-                    await msg.reply_html(reply_text)
-                    log.warning(f"Rejected post from user {uid}. Reason: {rejection_reason}.")
-                else:
-                    if country_status and country_status != 'not_allowed':
-                        await _increment_user_country_count(uid, country_status)
-                        log.info(f"Incremented country count for user {uid} for '{country_status}'")
+                # Find a new App ID in the block
+                app_id_match = APP_ID_RX.search(block)
+                app_id_was_processed = False
+
+                if app_id_match:
+                    app_id_was_processed = True
+                    app_id = f"@{app_id_match.group(2)}"
+                    source_item_to_clear, source_kind = None, None
+
+                    if values_found_in_message:
+                        value = next(iter(values_found_in_message))
+                        kind = "whatsapp" if _looks_like_phone(value) else "username"
+                        for item in _issued_bucket(kind).get(str(uid), []):
+                            if item.get("value") == value:
+                                source_item_to_clear, source_kind = item, kind
+                                break
+                    else:
+                        last_item, last_ts = None, datetime.min.replace(tzinfo=TIMEZONE)
+                        for kind in ("username", "whatsapp"):
+                            user_items = _issued_bucket(kind).get(str(uid), [])
+                            if user_items:
+                                latest_in_kind = user_items[-1]
+                                item_ts = datetime.fromisoformat(latest_in_kind["ts"])
+                                if item_ts > last_ts:
+                                    last_ts = item_ts
+                                    last_item = latest_in_kind
+                                    last_item['kind'] = kind
+                        if last_item:
+                            source_item_to_clear, source_kind = last_item, last_item['kind']
+
+                    if source_item_to_clear and source_kind:
+                        context_data = {
+                            "source_owner": source_item_to_clear.get("owner"),
+                            "source_kind": source_kind
+                        }
+                        value_to_clear = source_item_to_clear.get("value")
+                        await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
+                        await _log_event("app_id", "issued", update, app_id, owner=context_data.get("source_owner", ""))
+                        log.info(f"Recorded App ID '{app_id}' for user {uid}, linked to {source_kind} '{value_to_clear}'")
+                        if await _clear_one_issued(uid, source_kind, value_to_clear):
+                            await _log_event(source_kind, "cleared", update, value_to_clear)
+                            log.info(f"Auto-cleared pending {source_kind} for user {uid}: {value_to_clear}")
+                    else:
+                        context_data = {"source_owner": "unknown", "source_kind": "app_id"}
+                        await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
+                        await _log_event("app_id", "issued", update, app_id)
+                        log.info(f"Recorded App ID '{app_id}' for user {uid} without a source item")
+
+                if not app_id_was_processed:
+                    for username_to_clear in cleared_items_this_message.get('username', []):
+                        if await _clear_one_issued(uid, "username", username_to_clear):
+                            await _log_event("username", "cleared", update, username_to_clear)
+                            log.info(f"Auto-cleared pending username for user {uid} via direct mention: {username_to_clear}")
+
+                    for whatsapp_to_clear in cleared_items_this_message.get('whatsapp', []):
+                        if await _clear_one_issued(uid, "whatsapp", whatsapp_to_clear):
+                            await _log_event("whatsapp", "cleared", update, whatsapp_to_clear)
+                            log.info(f"Auto-cleared pending whatsapp for user {uid} via direct mention: {whatsapp_to_clear}")
+                
+                # Country and Age validation logic (runs for each block)
+                if values_found_in_message or app_id_match: # Run validation if any useful info is in the block
+                    found_country, country_status = _find_country_in_text(block)
+                    age = _find_age_in_text(block)
+                    is_allowed = True
+                    rejection_reason = ""
+
+                    if country_status:
+                        if country_status == 'not_allowed':
+                            is_allowed, rejection_reason = False, f"Country '{found_country}' is not allowed."
+                        elif country_status == 'india' and (age is None or age < 30):
+                            is_allowed, rejection_reason = False, f"Age must be provided and 30 or older for India (got: {age})."
+                    
+                    if not is_allowed:
+                        first_offending_value = next(iter(values_found_in_message), app_id_match.group(2) if app_id_match else "this customer")
+                        item_type = "username" if first_offending_value.startswith('@') else "item"
+                        reply_text = (f"{mention_user_html(uid)}, the submission for {item_type} "
+                                      f"(<code>{first_offending_value}</code>) was rejected. Reason: {rejection_reason}")
+                        await msg.reply_html(reply_text)
+                        log.warning(f"Rejected post from user {uid}. Reason: {rejection_reason}. Block content: {block[:100]}")
+                    else:
+                        if country_status and country_status != 'not_allowed':
+                            await _increment_user_country_count(uid, country_status)
+                            log.info(f"Incremented country count for user {uid} for '{country_status}'")
             return
 
         elif chat_id == REQUEST_GROUP_ID:
@@ -2302,6 +2305,4 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
-
 
