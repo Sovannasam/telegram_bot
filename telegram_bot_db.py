@@ -54,6 +54,7 @@ PERFORMANCE_GROUP_IDS = {
 
 
 # Whitelist of allowed countries (lowercase for case-insensitive matching)
+# MODIFIED: All countries are now lowercase to ensure correct matching.
 ALLOWED_COUNTRIES = {
     'morocco', 'panama', 'saudi arabia', 'united arab emirates', 'uae',
     'oman', 'jordan', 'italy', 'germany', 'indonesia', 'colombia',
