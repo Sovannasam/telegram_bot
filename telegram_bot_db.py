@@ -59,7 +59,7 @@ ALLOWED_COUNTRIES = {
     'oman', 'jordan', 'italy', 'germany', 'indonesia', 'colombia',
     'bulgaria', 'brazil', 'spain', 'belgium', 'algeria', 'south africa',
     'philippines', 'indian', 'india', 'portugal', 'netherlands', 'poland', 
-    'ghana', 'dominican republic', 'qata', 'france', 'switzerland', 'argentina',
+    'ghana', 'dominican republic', 'qatar', 'france', 'switzerland', 'argentina',
     'costa rica', 'pakistan', 'kuwait'
 }
 
