@@ -179,6 +179,22 @@ async def setup_database():
                 permissions JSONB NOT NULL
             );
         """)
+        # === NEW TABLE FOR PENDING ITEMS ===
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_items (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                chat_id BIGINT NOT NULL,
+                kind TEXT NOT NULL,
+                value TEXT NOT NULL,
+                issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                context_data JSONB,
+                last_reminder_ts TIMESTAMPTZ,
+                UNIQUE (user_id, kind, value)
+            );
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_items_user_id_kind ON pending_items(user_id, kind);")
+
     log.info("Database schema is ready.")
 
 
@@ -191,7 +207,7 @@ BASE_STATE = {
         "username_owner_idx": 0, "username_entry_idx": {},
         "wa_owner_idx": 0, "wa_entry_idx": {},
     },
-    "issued": {"username": {}, "whatsapp": {}, "app_id": {}},
+    # "issued" is now removed and handled by the 'pending_items' table
     "priority_queue": {
         "active": False,
         "owner": None,
@@ -266,6 +282,9 @@ async def load_state():
                 loaded = json.loads(result)
                 temp_state = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
                 for key, value in loaded.items():
+                    # Do not load 'issued' from the old state
+                    if key == 'issued':
+                        continue
                     if isinstance(value, dict) and key in temp_state:
                         temp_state[key].update(value)
                     else:
@@ -281,9 +300,6 @@ async def load_state():
 
     state.setdefault("rr", {}).setdefault("username_entry_idx", {})
     state["rr"].setdefault("wa_entry_idx", {})
-    state.setdefault("issued", {}).setdefault("username", {})
-    state["issued"].setdefault("whatsapp", {})
-    state["issued"].setdefault("app_id", {})
     state.setdefault("priority_queue", BASE_STATE["priority_queue"])
 
 
@@ -291,33 +307,72 @@ async def save_state():
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
+            # Create a copy to avoid modifying the global state dict
+            state_to_save = state.copy()
+            # Ensure 'issued' key is not present
+            state_to_save.pop('issued', None)
+            
             await conn.execute("""
                 INSERT INTO kv_storage (key, data)
                 VALUES ('state', $1)
                 ON CONFLICT (key) DO UPDATE
                 SET data = EXCLUDED.data, updated_at = NOW();
-            """, json.dumps(state))
+            """, json.dumps(state_to_save))
     except Exception as e:
         log.warning("Failed to save state to DB: %s", e)
 
+# === NEW MIGRATION FUNCTION ===
+async def _migrate_issued_to_table_if_needed():
+    log.info("Checking if pending items need migration from state to DB table...")
+    
+    # Load the raw state from DB to check for the old 'issued' key
+    pool = await get_db_pool()
+    raw_state_data = await pool.fetchval("SELECT data FROM kv_storage WHERE key = 'state'")
+    if not raw_state_data:
+        log.info("No state found in DB, no migration needed.")
+        return
+        
+    old_state = json.loads(raw_state_data)
+    if "issued" not in old_state or not any(old_state["issued"].values()):
+        log.info("No pending items in old state format to migrate.")
+        return
 
-async def _migrate_state_if_needed():
-    log.info("Checking state structure for migration...")
-    state_was_changed = False
-    issued = state.setdefault("issued", {})
-    for kind in ("username", "whatsapp", "app_id"):
-        bucket = issued.setdefault(kind, {})
-        for user_id, item_or_list in bucket.items():
-            if isinstance(item_or_list, dict):
-                bucket[user_id] = [item_or_list]
-                state_was_changed = True
-                log.info(f"Migrated user {user_id}'s '{kind}' data to new list format.")
+    log.info("Old 'issued' data found. Starting migration...")
+    migrated_count = 0
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                for kind, user_buckets in old_state.get("issued", {}).items():
+                    for user_id_str, items in user_buckets.items():
+                        if not isinstance(items, list): # Handle old-old format
+                            items = [items]
+                        user_id = int(user_id_str)
+                        for item in items:
+                            value = item.get("value")
+                            chat_id = item.get("chat_id")
+                            ts = datetime.fromisoformat(item.get("ts")) if item.get("ts") else datetime.now(TIMEZONE)
+                            last_reminder = datetime.fromisoformat(item.get("last_reminder_ts")) if item.get("last_reminder_ts") else None
+                            context_data = {
+                                k: v for k, v in item.items()
+                                if k not in ['value', 'ts', 'chat_id', 'last_reminder_ts']
+                            }
 
-    if state_was_changed:
-        log.info("State structure was migrated. Saving new format to database.")
+                            if value and chat_id:
+                                await conn.execute("""
+                                    INSERT INTO pending_items (user_id, chat_id, kind, value, issued_at, context_data, last_reminder_ts)
+                                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                                    ON CONFLICT (user_id, kind, value) DO NOTHING
+                                """, user_id, chat_id, kind, value, ts, json.dumps(context_data or {}), last_reminder)
+                                migrated_count += 1
+        log.info(f"Successfully migrated {migrated_count} pending items to the new table.")
+        # Now that migration is successful, load the state and save it without the 'issued' key
+        state.pop('issued', None) 
         await save_state()
-    else:
-        log.info("State structure is already up-to-date.")
+        log.info("Cleared old 'issued' data from main state file.")
+
+    except Exception as e:
+        log.error(f"Failed during migration of pending items: {e}. The old data has been left intact for safety.")
+
 
 # =============================
 # OWNER DIRECTORY (DB-backed)
@@ -881,59 +936,56 @@ def mention_user_html(user_id: int) -> str:
     name = info.get("first_name") or info.get("username") or str(user_id)
     return f'<a href="tg://user?id={user_id}">{name}</a>'
 
-def _issued_bucket(kind: str) -> Dict[str, list]:
-    return state.setdefault("issued", {}).setdefault(kind, {})
-
+# === REFACTORED PENDING ITEM FUNCTIONS ===
 async def _set_issued(user_id: int, chat_id: int, kind: str, value: str, context_data: Optional[Dict] = None):
-    bucket = _issued_bucket(kind)
-    user_id_str = str(user_id)
-    if user_id_str not in bucket:
-        bucket[user_id_str] = []
-    
-    item_data = {
-        "value": value,
-        "ts": datetime.now(TIMEZONE).isoformat(),
-        "chat_id": chat_id
-    }
-    if context_data:
-        item_data.update(context_data)
-        
-    bucket[user_id_str].append(item_data)
-    await save_state()
+    """Atomically inserts or updates a pending item in the database."""
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO pending_items (user_id, chat_id, kind, value, context_data, issued_at)
+                VALUES ($1, $2, $3, $4, $5, NOW())
+                ON CONFLICT (user_id, kind, value) DO UPDATE SET
+                    issued_at = NOW(),
+                    context_data = EXCLUDED.context_data,
+                    last_reminder_ts = NULL
+            """, user_id, chat_id, kind, value, json.dumps(context_data or {}))
+    except Exception as e:
+        log.error(f"Failed to set issued item in DB for user {user_id}: {e}")
 
 async def _clear_issued(user_id: int, kind: str, value_to_clear: str) -> bool:
-    bucket = _issued_bucket(kind)
-    user_id_str = str(user_id)
-    if user_id_str in bucket:
-        original_len = len(bucket[user_id_str])
-        bucket[user_id_str] = [
-            item for item in bucket[user_id_str] if item.get("value") != value_to_clear
-        ]
-        if not bucket[user_id_str]:
-            del bucket[user_id_str]
-
-        if len(bucket.get(user_id_str, [])) < original_len:
-            await save_state()
-            return True
-    return False
+    """Atomically deletes all matching pending items for a user from the database."""
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            status = await conn.execute(
+                "DELETE FROM pending_items WHERE user_id = $1 AND kind = $2 AND value = $3",
+                user_id, kind, value_to_clear
+            )
+            return 'DELETE 0' not in status
+    except Exception as e:
+        log.error(f"Failed to clear issued items from DB for user {user_id}: {e}")
+        return False
 
 async def _clear_one_issued(user_id: int, kind: str, value_to_clear: str) -> bool:
-    bucket = _issued_bucket(kind)
-    user_id_str = str(user_id)
-    if user_id_str in bucket:
-        item_to_remove = None
-        for item in bucket[user_id_str]:
-            if item.get("value") == value_to_clear:
-                item_to_remove = item
-                break
-
-        if item_to_remove:
-            bucket[user_id_str].remove(item_to_remove)
-            if not bucket[user_id_str]:
-                del bucket[user_id_str]
-            await save_state()
-            return True
-    return False
+    """Atomically deletes the most recent matching pending item for a user from the database."""
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            result = await conn.fetchval("""
+                DELETE FROM pending_items
+                WHERE id = (
+                    SELECT id FROM pending_items
+                    WHERE user_id = $1 AND kind = $2 AND value = $3
+                    ORDER BY issued_at DESC
+                    LIMIT 1
+                )
+                RETURNING id;
+            """, user_id, kind, value_to_clear)
+            return result is not None
+    except Exception as e:
+        log.error(f"Failed to clear one issued item from DB for user {user_id}: {e}")
+        return False
 
 def _value_in_text(value: Optional[str], text: str) -> bool:
     if not value:
@@ -950,8 +1002,8 @@ def _value_in_text(value: Optional[str], text: str) -> bool:
         text_digits = re.sub(r'\D', '', text_norm)
         return v_digits and v_digits in text_norm
 
-def _find_closest_app_id(typed_id: str) -> Optional[str]:
-    """Finds the most similar pending App ID using Levenshtein distance."""
+async def _find_closest_app_id(typed_id: str) -> Optional[str]:
+    """Finds the most similar pending App ID using Levenshtein distance by querying the DB."""
     
     def levenshtein(s1, s2):
         if len(s1) < len(s2):
@@ -969,11 +1021,10 @@ def _find_closest_app_id(typed_id: str) -> Optional[str]:
             previous_row = current_row
         return previous_row[-1]
 
-    all_pending_ids = []
-    for _, items in _issued_bucket("app_id").items():
-        for item in items:
-            if item.get("value"):
-                all_pending_ids.append(item.get("value"))
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT value FROM pending_items WHERE kind = 'app_id'")
+        all_pending_ids = [row['value'] for row in rows]
 
     if not all_pending_ids:
         return None
@@ -1110,8 +1161,13 @@ async def _get_user_detail_text(user_id: int) -> str:
     country_counts = await _get_user_country_counts(user_id, today)
     confirmation_count = await _get_user_confirmation_count(user_id, today)
 
-    pending_usernames = [item['value'] for item in _issued_bucket("username").get(str(user_id), [])]
-    pending_whatsapps = [item['value'] for item in _issued_bucket("whatsapp").get(str(user_id), [])]
+    # Fetch pending items from the database
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        u_rows = await conn.fetch("SELECT value FROM pending_items WHERE user_id = $1 AND kind = 'username'", user_id)
+        w_rows = await conn.fetch("SELECT value FROM pending_items WHERE user_id = $1 AND kind = 'whatsapp'", user_id)
+        pending_usernames = [r['value'] for r in u_rows]
+        pending_whatsapps = [r['value'] for r in w_rows]
 
     lines = [f"<b>📊 Daily Detail for {user_display}</b>"]
     lines.append(f"<b>- Usernames Received:</b> {username_reqs}")
@@ -1714,47 +1770,37 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
     m = CLEAR_ALL_PENDING_RX.match(text)
     if m:
         if not _has_permission(user, 'clear all pending'): return "You don't have permission to use this command."
-        issued_data = state.setdefault("issued", {})
-        username_count = sum(len(items) for items in issued_data.get("username", {}).values())
-        whatsapp_count = sum(len(items) for items in issued_data.get("whatsapp", {}).values())
-        app_id_count = sum(len(items) for items in issued_data.get("app_id", {}).values())
-        
-        if username_count == 0 and whatsapp_count == 0 and app_id_count == 0:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            status = await conn.execute("DELETE FROM pending_items")
+            count = int(status.split(' ')[1])
+        if count == 0:
             return "There were no pending items to clear."
         
-        issued_data["username"] = {}
-        issued_data["whatsapp"] = {}
-        issued_data["app_id"] = {}
-        
-        await save_state()
-        log.info(f"Admin cleared all pending items. Removed {username_count} usernames, {whatsapp_count} whatsapps, {app_id_count} app IDs.")
-        return f"✅ All pending items have been cleared ({username_count} usernames, {whatsapp_count} whatsapps, {app_id_count} app IDs)."
+        log.info(f"Admin cleared all {count} pending items.")
+        return f"✅ All {count} pending items have been cleared."
 
 
     m = CLEAR_PENDING_RX.match(text)
     if m:
         if not _has_permission(user, 'clear pending'): return "You don't have permission to use this command."
         item_to_clear = m.group(1).strip()
-        for kind in ("username", "whatsapp", "app_id"):
-            for user_id_str, items in list(_issued_bucket(kind).items()):
-                for item in items:
-                    stored_value = item.get("value")
-                    match_found = False
-                    if kind in ("username", "app_id"):
-                        if stored_value and item_to_clear.lower() == stored_value.lower():
-                            match_found = True
-                    elif kind == "whatsapp":
-                        if stored_value and _norm_phone(item_to_clear) == _norm_phone(stored_value):
-                            match_found = True
-                    
-                    if match_found:
-                        user_id = int(user_id_str)
-                        if await _clear_issued(user_id, kind, stored_value):
-                            user_info = state.get("user_names", {}).get(user_id_str, {})
-                            user_name = user_info.get("username") or user_info.get("first_name") or f"ID {user_id}"
-                            return f"✅ Cleared pending {kind} <code>{stored_value}</code> for user {user_name}."
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            # Find the item to get the user_id before deleting
+            query_val = f"%{_norm_phone(item_to_clear)}%" if _looks_like_phone(item_to_clear) else item_to_clear
+            row = await conn.fetchrow("SELECT id, user_id, kind, value FROM pending_items WHERE value ILIKE $1 LIMIT 1", query_val)
 
-        return f"❌ Could not find any user with the pending item <code>{item_to_clear}</code>."
+            if not row:
+                return f"❌ Could not find any user with the pending item <code>{item_to_clear}</code>."
+
+            user_id, kind, value = row['id'], row['user_id'], row['kind'], row['value']
+            await conn.execute("DELETE FROM pending_items WHERE id = $1", id)
+            
+            user_info = state.get("user_names", {}).get(str(user_id), {})
+            user_name = user_info.get("username") or user_info.get("first_name") or f"ID {user_id}"
+            return f"✅ Cleared pending {kind} <code>{value}</code> for user {user_name}."
+
 
     m = BAN_WHATSAPP_RX.match(text)
     if m:
@@ -1820,35 +1866,33 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         if not _has_permission(user, 'list pending'):
             return "You don't have permission to use this command."
         
-        pending_apps = _issued_bucket("app_id")
-        if not pending_apps:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT user_id, value FROM pending_items WHERE kind = 'app_id' ORDER BY user_id")
+        
+        if not rows:
             return "No pending App IDs found."
 
         lines = ["<b>⏳ Pending App IDs by User:</b>"]
-        total_pending = 0
-        user_lines = []
+        lines.insert(1, f"<b>Total Pending:</b> {len(rows)}")
 
-        for user_id_str, items in sorted(pending_apps.items()):
-            if not items:
-                continue
-            
-            user_id = int(user_id_str)
-            user_info = state.get("user_names", {}).get(user_id_str, {})
+        pending_by_user = {}
+        for row in rows:
+            uid = row['user_id']
+            if uid not in pending_by_user:
+                pending_by_user[uid] = []
+            pending_by_user[uid].append(row['value'])
+
+        for user_id, items in sorted(pending_by_user.items()):
+            user_info = state.get("user_names", {}).get(str(user_id), {})
             user_display = user_info.get('username') or user_info.get('first_name') or f"ID {user_id}"
             if user_info.get('username'):
                 user_display = f"@{user_display}"
             
-            user_app_ids = [f"  - <code>{item.get('value')}</code>" for item in items]
-            if user_app_ids:
-                user_lines.append(f"\n<b>{user_display}:</b>")
-                user_lines.extend(user_app_ids)
-                total_pending += len(user_app_ids)
+            lines.append(f"\n<b>{user_display}:</b>")
+            for item_val in items:
+                lines.append(f"  - <code>{item_val}</code>")
 
-        if total_pending == 0:
-             return "No pending App IDs found."
-
-        lines.insert(1, f"<b>Total Pending:</b> {total_pending}")
-        lines.extend(user_lines)
         return "\n".join(lines)
         
     m = DATA_TODAY_RX.match(text)
@@ -1873,83 +1917,66 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 # REMINDER & RESET TASKS
 # =============================
 async def _send_all_pending_reminders(context: ContextTypes.DEFAULT_TYPE) -> str:
-    total_reminders_sent = 0
-    reminded_users = set()
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        # Fetch all pending usernames and whatsapps
+        rows = await conn.fetch("SELECT user_id, chat_id, kind, value FROM pending_items WHERE kind IN ('username', 'whatsapp')")
 
-    reminders_to_send = []
-    # MODIFIED: Removed 'app_id' from the reminder loop
-    for kind in ("username", "whatsapp"):
-        bucket = _issued_bucket(kind)
-        for user_id_str, items in bucket.items():
-            for item in items:
-                user_id = int(user_id_str)
-                chat_id = item.get("chat_id")
-                value = item.get("value")
-                if chat_id and value:
-                    label = "username" if kind == "username" else "WhatsApp"
-                    reminder_text = (
-                        f"សូមរំលឹក: {mention_user_html(user_id)}, "
-                        f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ {label} {value} ដែលអ្នកបានស្នើសុំ។"
-                    )
-                    reminders_to_send.append({'chat_id': chat_id, 'text': reminder_text, 'user_id': user_id})
-
-    if not reminders_to_send:
+    if not rows:
         return "No pending items found to send reminders for."
 
-    for r in reminders_to_send:
+    reminders_sent = 0
+    reminded_users = set()
+
+    for row in rows:
+        user_id, chat_id, kind, value = row['user_id'], row['chat_id'], row['kind'], row['value']
+        label = "username" if kind == "username" else "WhatsApp"
+        reminder_text = (
+            f"សូមរំលឹក: {mention_user_html(user_id)}, "
+            f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ {label} {value} ដែលអ្នកបានស្នើសុំ។"
+        )
         try:
             await context.bot.send_message(
-                chat_id=r['chat_id'],
-                text=r['text'],
+                chat_id=chat_id,
+                text=reminder_text,
                 parse_mode=ParseMode.HTML
             )
-            total_reminders_sent += 1
-            reminded_users.add(r['user_id'])
+            reminders_sent += 1
+            reminded_users.add(user_id)
         except Exception as e:
-            log.error(f"Error sending manual reminder for user {r['user_id']}: {e}")
+            log.error(f"Error sending manual reminder for user {user_id}: {e}")
 
-    return f"Successfully sent {total_reminders_sent} reminder(s) to {len(reminded_users)} user(s)."
+    return f"Successfully sent {reminders_sent} reminder(s) to {len(reminded_users)} user(s)."
 
 
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     reminders_to_send = []
-    state_changed = False
+    ids_to_update = []
+    
+    now = datetime.now(TIMEZONE)
+    threshold = now - timedelta(minutes=REMINDER_DELAY_MINUTES)
+    
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, user_id, chat_id, kind, value, issued_at, last_reminder_ts FROM pending_items WHERE kind IN ('username', 'whatsapp')"
+        )
+        
+        for row in rows:
+            base_ts = row['last_reminder_ts'] or row['issued_at']
+            if base_ts < threshold:
+                user_id, chat_id, kind, value = row['user_id'], row['chat_id'], row['kind'], row['value']
+                label = "username" if kind == "username" else "WhatsApp"
+                reminder_text = (
+                    f"សូមរំលឹក: {mention_user_html(user_id)}, "
+                    f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ {label} {value} ដែលអ្នកបានស្នើសុំ។"
+                )
+                reminders_to_send.append({'chat_id': chat_id, 'text': reminder_text})
+                ids_to_update.append(row['id'])
+                log.info(f"Queued recurring reminder for user {user_id} for {kind} '{value}' in chat {chat_id}")
 
-    async with db_lock:
-        now = datetime.now(TIMEZONE)
-
-        # MODIFIED: Removed 'app_id' from the reminder loop
-        for kind in ("username", "whatsapp"):
-            bucket = _issued_bucket(kind)
-            for user_id_str, items in list(bucket.items()):
-                for item in list(items):
-                    try:
-                        last_reminder_ts_str = item.get("last_reminder_ts")
-                        if last_reminder_ts_str:
-                            base_ts = datetime.fromisoformat(last_reminder_ts_str)
-                        else:
-                            base_ts = datetime.fromisoformat(item["ts"])
-
-                        if (now - base_ts) > timedelta(minutes=REMINDER_DELAY_MINUTES):
-                            user_id = int(user_id_str)
-                            chat_id = item.get("chat_id")
-                            value = item.get("value")
-                            if chat_id and value:
-                                label = "username" if kind == "username" else "WhatsApp"
-                                reminder_text = (
-                                    f"សូមរំលឹក: {mention_user_html(user_id)}, "
-                                    f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ {label} {value} ដែលអ្នកបានស្នើសុំ។"
-                                )
-                                reminders_to_send.append({'chat_id': chat_id, 'text': reminder_text})
-                                item["last_reminder_ts"] = now.isoformat()
-                                item.pop("reminder_sent", None)
-                                state_changed = True
-                                log.info(f"Queued recurring reminder for user {user_id} for {kind} '{value}' in chat {chat_id}")
-                    except Exception as e:
-                        log.error(f"Error processing recurring reminder for user {user_id_str}: {e}")
-
-        if state_changed:
-            await save_state()
+        if ids_to_update:
+            await conn.execute("UPDATE pending_items SET last_reminder_ts = $1 WHERE id = ANY($2::int[])", now, ids_to_update)
 
     for r in reminders_to_send:
         try:
@@ -2060,35 +2087,41 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     app_id_confirmed_raw = f"@{app_id_from_msg}"
                     found_and_counted = False
                     
-                    # Search all users to find who this App ID belongs to
-                    for user_id_str, items in list(_issued_bucket("app_id").items()):
-                        if found_and_counted: break
-                        for item in items:
-                            stored_app_id_raw = item.get("value", "")
-                            
-                            match_is_found = (_normalize_app_id(stored_app_id_raw) == _normalize_app_id(app_id_confirmed_raw))
-
-                            if match_is_found:
-                                user_id_of_item = int(user_id_str)
-                                confirming_owner_name = _norm_owner_name(update.effective_user.username)
-                                source_kind = item.get("source_kind")
-
-                                await _increment_user_confirmation_count(user_id_of_item)
-                                await _increment_owner_performance(confirming_owner_name, source_kind)
-                                await _log_event("app_id", "confirmed", update, stored_app_id_raw, owner=confirming_owner_name)
-                                await _clear_one_issued(user_id_of_item, "app_id", stored_app_id_raw)
-                                log.info(f"Owner {confirming_owner_name} confirmed App ID {stored_app_id_raw}. Counted and cleared for user {user_id_of_item}")
-                                found_and_counted = True
+                    pool = await get_db_pool()
+                    async with pool.acquire() as conn:
+                        # Find the matching App ID in the pending items table
+                        rows = await conn.fetch("SELECT id, user_id, value, context_data FROM pending_items WHERE kind = 'app_id'")
+                        
+                        item_to_process = None
+                        for row in rows:
+                            if _normalize_app_id(row['value']) == _normalize_app_id(app_id_confirmed_raw):
+                                item_to_process = row
                                 break
-                    
+
+                        if item_to_process:
+                            user_id_of_item = item_to_process['user_id']
+                            stored_app_id_raw = item_to_process['value']
+                            context_data = json.loads(item_to_process['context_data'] or '{}')
+                            source_kind = context_data.get("source_kind")
+                            confirming_owner_name = _norm_owner_name(update.effective_user.username)
+                            
+                            await _increment_user_confirmation_count(user_id_of_item)
+                            await _increment_owner_performance(confirming_owner_name, source_kind)
+                            await _log_event("app_id", "confirmed", update, stored_app_id_raw, owner=confirming_owner_name)
+                            
+                            # Clear the item by its primary key
+                            await conn.execute("DELETE FROM pending_items WHERE id = $1", item_to_process['id'])
+                            
+                            log.info(f"Owner {confirming_owner_name} confirmed App ID {stored_app_id_raw}. Counted and cleared for user {user_id_of_item}")
+                            found_and_counted = True
+
                     if not found_and_counted:
-                        # === MODIFICATION START ===
                         log.warning(
                             f"Confirmation failed for App ID '{app_id_confirmed_raw}' from {update.effective_user.username}. "
                             f"Normalized to '{_normalize_app_id(app_id_confirmed_raw)}'. "
                             f"Full message text: '{text}'"
                         )
-                        suggestion = _find_closest_app_id(app_id_confirmed_raw)
+                        suggestion = await _find_closest_app_id(app_id_confirmed_raw)
                         if suggestion:
                             reply_text = (
                                 f"Wrong ID. Did you mean <code>{suggestion}</code>?\n\n"
@@ -2098,12 +2131,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             await msg.reply_html(reply_text)
                         else:
                             await msg.reply_text("Wrong ID, please check. No close match found in pending list.")
-                        # === MODIFICATION END ===
             return
 
         elif chat_id == CLEARING_GROUP_ID:
-            # Split the message into blocks, where each block starts with "App" or "ID"
-            # The regex uses a positive lookahead (?=...) to split the text while keeping the delimiter
             customer_blocks = re.split(r'(?=\b(?:App|ID|add)\b\s*[:\s])', text, flags=re.IGNORECASE)
 
             for block in customer_blocks:
@@ -2113,10 +2143,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 log.info(f"Processing customer block for user {uid}: --- {block[:100]}... ---")
 
-                # Find any pending items mentioned in this block
+                pool = await get_db_pool()
+                async with pool.acquire() as conn:
+                    u_rows = await conn.fetch("SELECT value FROM pending_items WHERE user_id = $1 AND kind = 'username'", uid)
+                    w_rows = await conn.fetch("SELECT value FROM pending_items WHERE user_id = $1 AND kind = 'whatsapp'", uid)
+                    pending_usernames = {r['value'] for r in u_rows}
+                    pending_whatsapps = {r['value'] for r in w_rows}
+
                 cleared_items_this_message = {'username': [], 'whatsapp': []}
-                pending_usernames = {item['value'] for item in _issued_bucket("username").get(str(uid), [])}
-                pending_whatsapps = {item['value'] for item in _issued_bucket("whatsapp").get(str(uid), [])}
                 found_usernames = {f"@{u}" for u in EXTRACT_USERNAMES_RX.findall(block)}
                 found_phones = EXTRACT_PHONES_RX.findall(block)
 
@@ -2128,52 +2162,46 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 values_found_in_message = set(cleared_items_this_message['username'] + cleared_items_this_message['whatsapp'])
 
-                # Find a new App ID in the block
                 app_id_match = APP_ID_RX.search(block)
                 app_id_was_processed = False
 
-                # NEW: Find country and age at the start of block processing
                 found_country, country_status = _find_country_in_text(block)
                 age = _find_age_in_text(block)
 
                 if app_id_match:
                     app_id_was_processed = True
                     app_id = f"@{app_id_match.group(2)}"
+                    
                     source_item_to_clear, source_kind = None, None
+                    source_value = None
 
                     if values_found_in_message:
-                        value = next(iter(values_found_in_message))
-                        kind = "whatsapp" if _looks_like_phone(value) else "username"
-                        for item in _issued_bucket(kind).get(str(uid), []):
-                            if item.get("value") == value:
-                                source_item_to_clear, source_kind = item, kind
-                                break
-                    else:
-                        last_item, last_ts = None, datetime.min.replace(tzinfo=TIMEZONE)
-                        for kind in ("username", "whatsapp"):
-                            user_items = _issued_bucket(kind).get(str(uid), [])
-                            if user_items:
-                                latest_in_kind = user_items[-1]
-                                item_ts = datetime.fromisoformat(latest_in_kind["ts"])
-                                if item_ts > last_ts:
-                                    last_ts = item_ts
-                                    last_item = latest_in_kind
-                                    last_item['kind'] = kind
-                        if last_item:
-                            source_item_to_clear, source_kind = last_item, last_item['kind']
+                        source_value = next(iter(values_found_in_message))
+                        kind = "whatsapp" if _looks_like_phone(source_value) else "username"
+                        async with pool.acquire() as conn:
+                            row = await conn.fetchrow("SELECT context_data FROM pending_items WHERE user_id=$1 AND kind=$2 AND value=$3", uid, kind, source_value)
+                            if row:
+                                source_item_to_clear = json.loads(row['context_data'] or '{}')
+                                source_kind = kind
+                    else: # Find the latest username/whatsapp for this user
+                        async with pool.acquire() as conn:
+                            row = await conn.fetchrow("SELECT kind, value, context_data FROM pending_items WHERE user_id = $1 AND kind IN ('username', 'whatsapp') ORDER BY issued_at DESC LIMIT 1", uid)
+                            if row:
+                                source_value = row['value']
+                                source_kind = row['kind']
+                                source_item_to_clear = json.loads(row['context_data'] or '{}')
 
-                    if source_item_to_clear and source_kind:
+                    if source_item_to_clear is not None and source_kind and source_value:
                         context_data = {
                             "source_owner": source_item_to_clear.get("owner"),
                             "source_kind": source_kind
                         }
-                        value_to_clear = source_item_to_clear.get("value")
                         await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
                         await _log_event("app_id", "issued", update, app_id, owner=context_data.get("source_owner", ""))
-                        log.info(f"Recorded App ID '{app_id}' for user {uid}, linked to {source_kind} '{value_to_clear}'")
-                        if await _clear_one_issued(uid, source_kind, value_to_clear):
-                            await _log_event(source_kind, "cleared", update, value_to_clear)
-                            log.info(f"Auto-cleared pending {source_kind} for user {uid}: {value_to_clear}")
+                        log.info(f"Recorded App ID '{app_id}' for user {uid}, linked to {source_kind} '{source_value}'")
+                        if await _clear_one_issued(uid, source_kind, source_value):
+                            await _log_event(source_kind, "cleared", update, source_value)
+                            log.info(f"Auto-cleared pending {source_kind} for user {uid}: {source_value}")
                     else:
                         context_data = {"source_owner": "unknown", "source_kind": "app_id"}
                         await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
@@ -2191,8 +2219,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             await _log_event("whatsapp", "cleared", update, whatsapp_to_clear)
                             log.info(f"Auto-cleared pending whatsapp for user {uid} via direct mention: {whatsapp_to_clear}")
                 
-                # Country and Age validation logic (runs for each block)
-                if values_found_in_message or app_id_match or found_country: # MODIFIED: Added 'found_country' to the trigger condition
+                if values_found_in_message or app_id_match or found_country:
                     is_allowed = True
                     rejection_reason = ""
 
@@ -2283,7 +2310,7 @@ async def post_initialization(application: Application):
     await get_db_pool()
     await setup_database()
     await load_state()
-    await _migrate_state_if_needed()
+    await _migrate_issued_to_table_if_needed() # New migration step
     await load_owner_directory()
     await load_whatsapp_bans()
     await load_admins()
@@ -2311,4 +2338,3 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
