@@ -51,7 +51,7 @@ DETAIL_GROUP_ID = int(os.getenv("DETAIL_GROUP_ID", "-1002598927727")) # Group fo
 PERFORMANCE_GROUP_IDS = {
     -1002670785417, -1002659012767, -1002790753092, -1002520117752
 }
-CATCH_UP_LIMIT = int(os.getenv("CATCH_UP_LIMIT", "5")) # NEW: Limit for least-busy owner priority
+CATCH_UP_LIMIT = int(os.getenv("CATCH_UP_LIMIT", "5")) # Limit for least-busy owner priority
 
 
 # Whitelist of allowed countries (lowercase for case-insensitive matching)
@@ -1924,6 +1924,41 @@ async def _send_all_pending_reminders(context: ContextTypes.DEFAULT_TYPE) -> str
 
     return f"Successfully sent {total_reminders_sent} reminder(s) to {len(reminded_users)} user(s)."
 
+# NEW: Function to clear expired App IDs
+async def _clear_expired_app_ids(context: ContextTypes.DEFAULT_TYPE):
+    log.info("Running hourly check for expired App IDs...")
+    now = datetime.now(TIMEZONE)
+    forty_eight_hours = timedelta(hours=48)
+    state_changed = False
+    
+    pending_apps = _issued_bucket("app_id")
+    
+    for user_id_str, items in list(pending_apps.items()):
+        items_to_keep = []
+        for item in items:
+            try:
+                item_ts = datetime.fromisoformat(item["ts"])
+                if (now - item_ts) > forty_eight_hours:
+                    log.info(f"Expired App ID '{item['value']}' for user {user_id_str} removed after 48 hours.")
+                    state_changed = True
+                else:
+                    items_to_keep.append(item)
+            except Exception as e:
+                log.warning(f"Could not parse timestamp for item {item} for user {user_id_str}: {e}")
+                items_to_keep.append(item) # Keep item if timestamp is invalid
+        
+        if not items_to_keep:
+            if user_id_str in pending_apps:
+                del pending_apps[user_id_str]
+        else:
+            pending_apps[user_id_str] = items_to_keep
+
+    if state_changed:
+        await save_state()
+        log.info("Finished clearing expired App IDs. State saved.")
+    else:
+        log.info("No expired App IDs found.")
+
 
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     reminders_to_send = []
@@ -2284,6 +2319,8 @@ if __name__ == "__main__":
 
     if app.job_queue:
         app.job_queue.run_repeating(check_reminders, interval=60, first=60)
+        # NEW JOB for clearing expired IDs, runs every hour
+        app.job_queue.run_repeating(_clear_expired_app_ids, interval=3600, first=3600)
         reset_time = time(hour=5, minute=31, tzinfo=TIMEZONE)
         app.job_queue.run_daily(daily_reset, time=reset_time)
 
