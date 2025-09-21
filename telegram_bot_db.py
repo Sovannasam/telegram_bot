@@ -2306,7 +2306,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     
                     if now < ban_expires_ts:
                         remaining_time = ban_expires_ts - now
-                        minutes_left = round(remaining_time.total_seconds() / 30)
+                        minutes_left = round(remaining_time.total_seconds() / 60)
                         await msg.reply_text(f"អ្នកត្រូវបានហាមឃាត់ជាបណ្ដោះអាសន្ន។ សូមព្យាយាមម្តងទៀតក្នុងរយៈពេល {minutes_left} នាទីទៀត។")
                         return
                     else:
