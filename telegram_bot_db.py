@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import os
 import json
-import csv
 import asyncio
 import logging
 from datetime import datetime, timedelta, date, time
@@ -227,7 +226,7 @@ async def load_admins():
                 ADMIN_PERMISSIONS[row['username']] = json.loads(row['permissions'])
         log.info(f"Loaded {len(ADMIN_PERMISSIONS)} admins from database.")
     except Exception as e:
-        log.error(f"Failed to load admins from DB: %s", e)
+        log.error("Failed to load admins from DB: %s", e)
 
 def _is_super_admin(user: Optional[Update.effective_user]) -> bool:
     if not user: return False
@@ -255,7 +254,7 @@ async def load_whatsapp_bans():
                 WHATSAPP_BANNED_USERS.add(row['user_id'])
         log.info(f"Loaded {len(WHATSAPP_BANNED_USERS)} WhatsApp bans from database.")
     except Exception as e:
-        log.error(f"Failed to load WhatsApp bans from DB: %s", e)
+        log.error("Failed to load WhatsApp bans from DB: %s", e)
 
 async def load_state():
     global state
@@ -277,7 +276,7 @@ async def load_state():
                 state = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
                 await save_state()
     except Exception as e:
-        log.warning(f"Failed to load state from DB: %s. Using default state.", e)
+        log.warning("Failed to load state from DB: %s. Using default state.", e)
         state = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
 
     state.setdefault("rr", {}).setdefault("username_entry_idx", {})
@@ -948,7 +947,7 @@ def _value_in_text(value: Optional[str], text: str) -> bool:
     else:
         v_digits = re.sub(r'\D', '', v_norm)
         text_digits = re.sub(r'\D', '', text_norm)
-        return v_digits and v_digits in text_norm
+        return v_digits and v_digits in text_digits
 
 def _find_closest_app_id(typed_id: str) -> Optional[str]:
     """Finds the most similar pending App ID using Levenshtein distance."""
@@ -1858,7 +1857,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
                 total_pending += len(user_app_ids)
 
         if total_pending == 0:
-             return "No pending App IDs found."
+            return "No pending App IDs found."
 
         lines.insert(1, f"<b>Total Pending:</b> {total_pending}")
         lines.extend(user_lines)
