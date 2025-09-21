@@ -821,7 +821,7 @@ DELETE_ADMIN_RX       = re.compile(r"^\s*delete\s+admin\s+@?(\S+)\s*$", re.IGNOR
 ALLOW_ADMIN_CMD_RX    = re.compile(r"^\s*allow\s+@?(\S+)\s+to\s+use\s+command\s+(.+)\s*$", re.IGNORECASE)
 STOP_ALLOW_ADMIN_CMD_RX = re.compile(r"^\s*stop\s+allow\s+@?(\S+)\s+to\s+use\s+command\s+(.+)\s*$", re.IGNORECASE)
 LIST_ADMINS_RX        = re.compile(r"^\s*list\s+admins\s*$", re.IGNORECASE)
-LIST_PENDING_RX       = re.compile(r"^\s*list\s+pending\s*$", re.IGNORECASE)
+LIST_PENDING_RX = re.compile(r"^\s*/?\s*list\s+pending\s*$", re.IGNORECASE)
 DATA_TODAY_RX         = re.compile(r"^\s*data\s+today\s*$", re.IGNORECASE)
 
 
@@ -1829,7 +1829,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         command_list_text = _get_commands_text()
         return command_list_text
 
-    m = LIST_PENDING_RX.match(text)
+    m = LIST_PENDING_RX.search(text)
     if m:
         if not _has_permission(user, 'list pending'):
             return "You don't have permission to use this command."
