@@ -2020,11 +2020,11 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                         ban_until = now + timedelta(minutes=30)
                         state.setdefault("whatsapp_temp_bans", {})[user_id_str] = ban_until.isoformat()
                         
-                        ban_message_khmer = f"{mention_user_html(user_id)}, អ្នកត្រូវបានហាមឃាត់ជាបណ្ដោះអាសន្នពីការស្នើសុំលេខ WhatsApp រយៈពេល 30 នាទី ដោយសារតែអ្នកមិនបានផ្ដល់ព័ត៌មានសម្រាប់លេខមុនបន្ទាប់ពីរំលឹក។"
+                        ban_message_khmer = f"{mention_user_html(user_id)}, អ្នកត្រូវបានហាមឃាត់ជាបណ្ដោះអាសន្នពីការស្នើសុំលេខ WhatsApp រយៈពេល 30 នាទី ដោយសារតែអ្នកមិនបានផ្ដល់ព័ត៌មានសម្រាប់លេខមុនបន្ទាប់ពីได้รับการរំលឹក។"
                         reminders_to_send.append({'chat_id': item.get("chat_id"), 'text': ban_message_khmer})
                         
                         items_to_remove.append(item)
-                        log.info(f"User {user_id} temp-banned for 60 mins for not clearing WA '{item.get('value')}'")
+                        log.info(f"User {user_id} temp-banned for 30 mins for not clearing WA '{item.get('value')}'")
                         state_changed = True
                     
                     elif (now - datetime.fromisoformat(item["ts"])) > timedelta(minutes=REMINDER_DELAY_MINUTES):
