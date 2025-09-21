@@ -213,7 +213,7 @@ COMMAND_PERMISSIONS = {
     'stop open', 'take customer', 'ban whatsapp', 'unban whatsapp', 'report',
     'owner report', 'performance', 'remind user', 'clear pending', 'clear all pending',
     'list owners', 'list disabled', 'list owner', 'detail user', 'list banned', 'list admins',
-    'list pending', 'data today'
+    'list pending', 'data today', 'list enabled'
 }
 
 async def load_admins():
@@ -822,6 +822,7 @@ STOP_ALLOW_ADMIN_CMD_RX = re.compile(r"^\s*stop\s+allow\s+@?(\S+)\s+to\s+use\s+c
 LIST_ADMINS_RX        = re.compile(r"^\s*list\s+admins\s*$", re.IGNORECASE)
 LIST_PENDING_RX       = re.compile(r"^\s*list\s+pending\s*$", re.IGNORECASE)
 DATA_TODAY_RX         = re.compile(r"^\s*data\s+today\s*$", re.IGNORECASE)
+LIST_ENABLED_RX       = re.compile(r"^\s*list\s+enabled\s*$", re.IGNORECASE)
 
 
 def _looks_like_phone(s: str) -> bool:
@@ -1456,6 +1457,7 @@ def _get_commands_text() -> str:
 <b>--- Admin: Viewing Information ---</b>
 <code>list owners</code>
 <code>list disabled</code>
+<code>list enabled</code> - List all active owners.
 <code>list @owner</code>
 <code>detail @user</code> - See a user's daily stats.
 
@@ -1694,6 +1696,19 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
             reason = f" (until {o['disabled_until']})" if o.get("disabled_until") else ""
             lines.append(f"- <code>{o['owner']}</code>{reason}")
         return "\n".join(lines)
+
+    m = LIST_ENABLED_RX.match(text)
+    if m:
+        if not _has_permission(user, 'list enabled'): return "You don't have permission to use this command."
+        enabled = [o for o in OWNER_DATA if not _owner_is_paused(o)]
+        if not enabled: return "No owners are currently enabled/active."
+        lines = ["<b>Enabled/Active Owners:</b>"]
+        for o in enabled:
+            u_count = len([e for e in o.get("entries", []) if not e.get("disabled")])
+            w_count = len([w for w in o.get("whatsapp", []) if not w.get("disabled")])
+            lines.append(f"- <code>{o['owner']}</code>: {u_count} usernames, {w_count} whatsapps")
+        return "\n".join(lines)
+
 
     m = LIST_OWNER_DETAIL_RX.match(text) or LIST_OWNER_ALIAS_RX.match(text)
     if m:
