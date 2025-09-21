@@ -199,7 +199,8 @@ BASE_STATE = {
         "stop_after": False,
         "saved_rr_indices": {}
     },
-    "catch_up_assignments": {}
+    "catch_up_assignments": {},
+    "whatsapp_temp_bans": {}
 }
 state: Dict = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
 WHATSAPP_BANNED_USERS: set[int] = set()
@@ -286,6 +287,7 @@ async def load_state():
     state["issued"].setdefault("whatsapp", {})
     state["issued"].setdefault("app_id", {})
     state.setdefault("priority_queue", BASE_STATE["priority_queue"])
+    state.setdefault("whatsapp_temp_bans", {})
 
 
 async def save_state():
@@ -1981,36 +1983,68 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     async with db_lock:
         now = datetime.now(TIMEZONE)
 
-        # MODIFIED: Removed 'app_id' from the reminder loop
-        for kind in ("username", "whatsapp"):
-            bucket = _issued_bucket(kind)
-            for user_id_str, items in list(bucket.items()):
-                for item in list(items):
-                    try:
-                        last_reminder_ts_str = item.get("last_reminder_ts")
-                        if last_reminder_ts_str:
-                            base_ts = datetime.fromisoformat(last_reminder_ts_str)
-                        else:
-                            base_ts = datetime.fromisoformat(item["ts"])
+        # MODIFIED: Separated logic for usernames and whatsapps for clarity and new ban logic
+        # Handle username reminders (no change)
+        username_bucket = _issued_bucket("username")
+        for user_id_str, items in list(username_bucket.items()):
+            for item in list(items):
+                try:
+                    last_reminder_ts_str = item.get("last_reminder_ts")
+                    base_ts = datetime.fromisoformat(last_reminder_ts_str) if last_reminder_ts_str else datetime.fromisoformat(item["ts"])
 
-                        if (now - base_ts) > timedelta(minutes=REMINDER_DELAY_MINUTES):
-                            user_id = int(user_id_str)
-                            chat_id = item.get("chat_id")
-                            value = item.get("value")
-                            if chat_id and value:
-                                label = "username" if kind == "username" else "WhatsApp"
-                                reminder_text = (
-                                    f"សូមរំលឹក: {mention_user_html(user_id)}, "
-                                    f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ {label} {value} ដែលអ្នកបានស្នើសុំ។"
-                                )
-                                reminders_to_send.append({'chat_id': chat_id, 'text': reminder_text})
-                                item["last_reminder_ts"] = now.isoformat()
-                                item.pop("reminder_sent", None)
-                                state_changed = True
-                                log.info(f"Queued recurring reminder for user {user_id} for {kind} '{value}' in chat {chat_id}")
-                    except Exception as e:
-                        log.error(f"Error processing recurring reminder for user {user_id_str}: {e}")
+                    if (now - base_ts) > timedelta(minutes=REMINDER_DELAY_MINUTES):
+                        user_id = int(user_id_str)
+                        chat_id = item.get("chat_id")
+                        value = item.get("value")
+                        if chat_id and value:
+                            reminder_text = (
+                                f"សូមរំលឹក: {mention_user_html(user_id)}, "
+                                f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ username {value} ដែលអ្នកបានស្នើសុំ។"
+                            )
+                            reminders_to_send.append({'chat_id': chat_id, 'text': reminder_text})
+                            item["last_reminder_ts"] = now.isoformat()
+                            state_changed = True
+                            log.info(f"Queued recurring reminder for user {user_id} for username '{value}'")
+                except Exception as e:
+                    log.error(f"Error processing username reminder for user {user_id_str}: {e}")
 
+        # Handle WhatsApp reminders and temporary bans
+        whatsapp_bucket = _issued_bucket("whatsapp")
+        for user_id_str, items in list(whatsapp_bucket.items()):
+            user_id = int(user_id_str)
+            items_to_remove = []
+            for item in items:
+                try:
+                    # Check if a reminder has already been sent
+                    if item.get("reminder_sent"):
+                        ban_until = now + timedelta(minutes=60)
+                        state.setdefault("whatsapp_temp_bans", {})[user_id_str] = ban_until.isoformat()
+                        
+                        ban_message_khmer = f"{mention_user_html(user_id)}, អ្នកត្រូវបានហាមឃាត់ជាបណ្ដោះអាសន្នពីការស្នើសុំលេខ WhatsApp រយៈពេល 60 នាទី ដោយសារតែអ្នកមិនបានផ្ដល់ព័ត៌មានសម្រាប់លេខមុនបន្ទាប់ពីได้รับการរំលឹក។"
+                        reminders_to_send.append({'chat_id': item.get("chat_id"), 'text': ban_message_khmer})
+                        
+                        items_to_remove.append(item)
+                        log.info(f"User {user_id} temp-banned for 60 mins for not clearing WA '{item.get('value')}'")
+                        state_changed = True
+                    
+                    elif (now - datetime.fromisoformat(item["ts"])) > timedelta(minutes=REMINDER_DELAY_MINUTES):
+                        reminder_text = (
+                            f"សូមរំលឹក: {mention_user_html(user_id)}, "
+                            f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ WhatsApp {item.get('value')} ដែលអ្នកបានស្នើសុំ។"
+                        )
+                        reminders_to_send.append({'chat_id': item.get("chat_id"), 'text': reminder_text})
+                        item["reminder_sent"] = True
+                        state_changed = True
+                        log.info(f"Queued first reminder for user {user_id} for WA '{item.get('value')}'")
+
+                except Exception as e:
+                    log.error(f"Error processing reminder/ban for user {user_id_str}: {e}")
+
+            if items_to_remove:
+                whatsapp_bucket[user_id_str] = [i for i in items if i not in items_to_remove]
+                if not whatsapp_bucket[user_id_str]:
+                    del whatsapp_bucket[user_id_str]
+        
         if state_changed:
             await save_state()
 
@@ -2018,7 +2052,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(chat_id=r['chat_id'], text=r['text'], parse_mode=ParseMode.HTML)
         except Exception as e:
-            log.error(f"Failed to send recurring reminder to chat {r['chat_id']}: {e}")
+            log.error(f"Failed to send reminder/ban message to chat {r['chat_id']}: {e}")
 
 
 async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
@@ -2261,9 +2295,26 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if NEED_WHATSAPP_RX.match(text):
                 if uid in WHATSAPP_BANNED_USERS:
-                    await msg.reply_text("អ្នកត្រូវបានហាមឃាត់ពីការស្នើសុំលេខ WhatsApp ។")
+                    await msg.reply_text("អ្នកត្រូវបានហាមឃាត់ជាអចិន្ត្រៃយ៍ពីការស្នើសុំលេខ WhatsApp ។")
                     return
 
+                # Check for temporary bans
+                temp_bans = state.get("whatsapp_temp_bans", {})
+                if str(uid) in temp_bans:
+                    ban_expires_ts = datetime.fromisoformat(temp_bans[str(uid)])
+                    now = datetime.now(TIMEZONE)
+                    
+                    if now < ban_expires_ts:
+                        remaining_time = ban_expires_ts - now
+                        minutes_left = round(remaining_time.total_seconds() / 60)
+                        await msg.reply_text(f"អ្នកត្រូវបានហាមឃាត់ជាបណ្ដោះអាសន្ន។ សូមព្យាយាមម្តងទៀតក្នុងរយៈពេល {minutes_left} នាទីទៀត។")
+                        return
+                    else:
+                        # Ban has expired, remove it
+                        del temp_bans[str(uid)]
+                        await save_state()
+                        log.info(f"Temporary WhatsApp ban for user {uid} has expired and been removed.")
+                
                 username_count, whatsapp_count = await _get_user_activity(uid)
                 has_bonus = username_count > USERNAME_THRESHOLD_FOR_BONUS
 
