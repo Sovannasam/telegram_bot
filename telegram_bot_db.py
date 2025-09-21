@@ -59,9 +59,8 @@ ALLOWED_COUNTRIES = {
     'morocco', 'panama', 'saudi arabia', 'united arab emirates', 'uae',
     'oman', 'jordan', 'italy', 'germany', 'indonesia', 'colombia',
     'bulgaria', 'brazil', 'spain', 'belgium', 'algeria', 'south africa',
-    'philippines', 'indian', 'india', 'portugal', 'netherlands', 'poland', 
-    'ghana', 'dominican republic', 'qatar', 'france', 'switzerland', 'argentina',
-    'costa rica', 'pakistan', 'kuwait'
+    'philippines', 'indian', 'india', 'portugal', 'netherlands', 'poland', 'ghana', 'dominican republic',
+    'qatar', 'france', 'switzerland', 'argentina', 'costa rica', 'pakistan', 'kuwait'
 }
 
 TIMEZONE = pytz.timezone("Asia/Phnom_Penh")
@@ -821,7 +820,7 @@ DELETE_ADMIN_RX       = re.compile(r"^\s*delete\s+admin\s+@?(\S+)\s*$", re.IGNOR
 ALLOW_ADMIN_CMD_RX    = re.compile(r"^\s*allow\s+@?(\S+)\s+to\s+use\s+command\s+(.+)\s*$", re.IGNORECASE)
 STOP_ALLOW_ADMIN_CMD_RX = re.compile(r"^\s*stop\s+allow\s+@?(\S+)\s+to\s+use\s+command\s+(.+)\s*$", re.IGNORECASE)
 LIST_ADMINS_RX        = re.compile(r"^\s*list\s+admins\s*$", re.IGNORECASE)
-LIST_PENDING_RX = re.compile(r"^\s*/?\s*list\s+pending\s*$", re.IGNORECASE)
+LIST_PENDING_RX       = re.compile(r"^\s*list\s+pending\s*$", re.IGNORECASE)
 DATA_TODAY_RX         = re.compile(r"^\s*data\s+today\s*$", re.IGNORECASE)
 
 
@@ -1700,7 +1699,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
     if m:
         if not _has_permission(user, 'list owner'): return "You don't have permission to use this command."
         name = m.group(1).strip()
-        if name.lower() in ("owners", "disabled"): return None
+        if name.lower() in ("owners", "disabled", "pending"): return None
         owner = _find_owner_group(name)
         if not owner: return f"Owner '{name}' not found."
 
@@ -1829,7 +1828,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         command_list_text = _get_commands_text()
         return command_list_text
 
-    m = LIST_PENDING_RX.search(text)
+    m = LIST_PENDING_RX.match(text)
     if m:
         if not _has_permission(user, 'list pending'):
             return "You don't have permission to use this command."
