@@ -1599,13 +1599,13 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
             await _rebuild_pools_preserving_rotation()
             return f"{'Stopped' if is_stop else 'Opened'} all usernames — changed {changed}/{total}."
 
-        # MODIFIED: Added 'stop all owners' logic
         if t == "all owners":
             total = changed = 0
             for owner in OWNER_DATA:
                 total += 1
-                if not owner.get("disabled"):
+                if owner.get("disabled", False) != is_stop:
                     owner["disabled"] = is_stop
+                    owner.pop("disabled_until", None) # Also clear any timed pauses
                     changed += 1
             await _rebuild_pools_preserving_rotation()
             return f"{'Stopped' if is_stop else 'Opened'} all owners — changed {changed}/{total}."
@@ -2541,6 +2541,7 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
 
 
 
