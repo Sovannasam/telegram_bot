@@ -200,7 +200,8 @@ BASE_STATE = {
         "saved_rr_indices": {}
     },
     "catch_up_assignments": {},
-    "whatsapp_temp_bans": {}
+    "whatsapp_temp_bans": {},
+    "whatsapp_last_request_ts": {}
 }
 state: Dict = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
 WHATSAPP_BANNED_USERS: set[int] = set()
@@ -288,6 +289,7 @@ async def load_state():
     state["issued"].setdefault("app_id", {})
     state.setdefault("priority_queue", BASE_STATE["priority_queue"])
     state.setdefault("whatsapp_temp_bans", {})
+    state.setdefault("whatsapp_last_request_ts", {})
 
 
 async def save_state():
@@ -370,7 +372,7 @@ def _ensure_owner_shape(g: dict) -> dict:
     g.setdefault("managed_by", None)
     g.setdefault("entries", [])
     g.setdefault("whatsapp", [])
-    
+
     norm_entries = []
     for e in g.get("entries", []):
         if isinstance(e, dict):
@@ -381,7 +383,7 @@ def _ensure_owner_shape(g: dict) -> dict:
             e_copy.setdefault("managed_by", None)
             norm_entries.append(e_copy)
     g["entries"] = norm_entries
-    
+
     norm_wa = []
     for w in g.get("whatsapp", []):
         entry = {}
@@ -390,12 +392,12 @@ def _ensure_owner_shape(g: dict) -> dict:
             entry.setdefault("number", w.get("number") or w.get("phone") or "")
         elif isinstance(w, str) and w.strip():
             entry["number"] = w
-            
+
         if (entry.get("number") or "").strip():
             entry.setdefault("disabled", False)
             entry.setdefault("managed_by", None)
             norm_wa.append(entry)
-            
+
     g["whatsapp"] = norm_wa
     return g
 
@@ -2463,6 +2465,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await save_state()
                         log.info(f"Temporary WhatsApp ban for user {uid} has expired and been removed.")
 
+                # Cooldown check
+                now = datetime.now(TIMEZONE)
+                last_req_ts_str = state.setdefault("whatsapp_last_request_ts", {}).get(str(uid))
+                if last_req_ts_str:
+                    last_req_ts = datetime.fromisoformat(last_req_ts_str)
+                    if (now - last_req_ts) < timedelta(minutes=1):
+                        await msg.reply_text("អ្នកអាចស្នើសុំលេខ WhatsApp បានតែម្តងគត់ក្នុងមួយនាទី។ សូមរង់ចាំ។")
+                        return
+
                 username_count, whatsapp_count = await _get_user_activity(uid)
                 has_bonus = username_count > USERNAME_THRESHOLD_FOR_BONUS
 
@@ -2482,6 +2493,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.reply_text(reply)
                 if rec:
                     await _wa_inc_count(_norm_phone(rec["number"]), _logical_day_today())
+                    # Record the time of this successful request before saving state
+                    state.setdefault("whatsapp_last_request_ts", {})[str(uid)] = now.isoformat()
                     await _set_issued(uid, chat_id, "whatsapp", rec["number"], context_data={"owner": rec["owner"]})
                     await _log_event("whatsapp", "issued", update, rec["number"], owner=rec["owner"])
                     await _increment_user_activity(uid, "whatsapp")
@@ -2540,8 +2553,6 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.ALL, on_message))
 
     log.info("Bot is starting...")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
-
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)" that is currently open on my right hand side of the screen.
 
 
