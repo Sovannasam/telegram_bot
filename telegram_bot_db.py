@@ -2553,6 +2553,6 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.ALL, on_message))
 
     log.info("Bot is starting...")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)" that is currently open on my right hand side of the screen.
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)" 
 
 
