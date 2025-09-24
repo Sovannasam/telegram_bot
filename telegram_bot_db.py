@@ -201,7 +201,9 @@ BASE_STATE = {
     },
     "catch_up_assignments": {},
     "whatsapp_temp_bans": {},
-    "whatsapp_last_request_ts": {}
+    "whatsapp_last_request_ts": {},
+    "username_last_request_ts": {},
+    "whatsapp_offense_count": {}
 }
 state: Dict = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
 WHATSAPP_BANNED_USERS: set[int] = set()
@@ -290,6 +292,8 @@ async def load_state():
     state.setdefault("priority_queue", BASE_STATE["priority_queue"])
     state.setdefault("whatsapp_temp_bans", {})
     state.setdefault("whatsapp_last_request_ts", {})
+    state.setdefault("username_last_request_ts", {})
+    state.setdefault("whatsapp_offense_count", {})
 
 
 async def save_state():
@@ -2113,16 +2117,16 @@ async def _clear_expired_app_ids(context: ContextTypes.DEFAULT_TYPE):
 
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     """
-    Handles sending reminders for pending items.
-    - Usernames get repeated reminders every 30 minutes.
-    - WhatsApp gets a reminder, then subsequent reminders are paired with a 30-minute ban.
-      The pending item is NOT cleared until the user provides details.
+    Handles sending reminders and applying escalating bans for non-compliance.
+    - Usernames get repeated reminders.
+    - WhatsApp failures escalate from 30min ban -> 2hr ban -> permanent ban.
     """
     reminders_to_send = []
     state_changed = False
 
     async with db_lock:
         now = datetime.now(TIMEZONE)
+        pool = await get_db_pool() # For permanent bans
 
         # Handle username reminders (sends a reminder every `REMINDER_DELAY_MINUTES`)
         username_bucket = _issued_bucket("username")
@@ -2148,49 +2152,81 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     log.error(f"Error processing username reminder for user {user_id_str}: {e}")
 
-        # Handle WhatsApp reminders and temporary bans in a repeating cycle
+        # Handle WhatsApp reminders and escalating bans
         whatsapp_bucket = _issued_bucket("whatsapp")
         for user_id_str, items in list(whatsapp_bucket.items()):
             user_id = int(user_id_str)
+            items_to_remove = []
             for item in items:
                 try:
-                    item_ts = datetime.fromisoformat(item["ts"])
-                    last_action_ts_str = item.get("last_action_ts")
-                    base_ts = datetime.fromisoformat(last_action_ts_str) if last_action_ts_str else item_ts
-                    reminder_count = item.get("reminder_count", 0)
+                    # Case 1: A reminder was already sent. Check if it's time to ban.
+                    if item.get("reminder_sent"):
+                        reminder_ts = datetime.fromisoformat(item.get("reminder_ts"))
+                        if (now - reminder_ts) > timedelta(minutes=30):
+                            # This user failed to comply after a reminder. It's an offense.
+                            offense_counts = state.setdefault("whatsapp_offense_count", {})
+                            offense_count = offense_counts.get(user_id_str, 0) + 1
+                            offense_counts[user_id_str] = offense_count
+                            log.info(f"User {user_id} failed to clear WA. Offense count is now {offense_count}.")
 
-                    # Check if 30 minutes have passed since the last action
-                    if (now - base_ts) > timedelta(minutes=REMINDER_DELAY_MINUTES):
-                        if reminder_count == 0:
-                            # First time triggered: Send only a reminder
-                            reminder_text = (
-                                f"សូមរំលឹក: {mention_user_html(user_id)}, "
-                                f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ WhatsApp {item.get('value')} ដែលអ្នកបានស្នើសុំ។"
-                            )
-                            reminders_to_send.append({'chat_id': item.get("chat_id"), 'text': reminder_text})
-                            item['reminder_count'] = 1
-                            item['last_action_ts'] = now.isoformat()
+                            ban_message_khmer = ""
+                            if offense_count == 1:
+                                # First offense: 30-minute ban
+                                ban_duration_minutes = 30
+                                ban_until = now + timedelta(minutes=ban_duration_minutes)
+                                state.setdefault("whatsapp_temp_bans", {})[user_id_str] = ban_until.isoformat()
+                                ban_message_khmer = (
+                                    f"{mention_user_html(user_id)}, អ្នកត្រូវបានហាមឃាត់ជាបណ្ដោះអាសន្នពីការស្នើសុំលេខ WhatsApp រយៈពេល {ban_duration_minutes} នាទី "
+                                    f"ដោយសារតែអ្នកមិនបានផ្ដល់ព័ត៌មានសម្រាប់លេខមុនបន្ទាប់ពីរំលឹក។"
+                                )
+                                log.info(f"User {user_id} temp-banned for {ban_duration_minutes} mins.")
+                            elif offense_count == 2:
+                                # Second offense: 2-hour ban
+                                ban_duration_minutes = 120
+                                ban_until = now + timedelta(minutes=ban_duration_minutes)
+                                state.setdefault("whatsapp_temp_bans", {})[user_id_str] = ban_until.isoformat()
+                                ban_message_khmer = (
+                                    f"{mention_user_html(user_id)}, ដោយសារអ្នកបានធ្វើកំហុសដដែលម្តងទៀត, "
+                                    f"អ្នកត្រូវបានហាមឃាត់ពីការស្នើសុំលេខ WhatsApp រយៈពេល 2 ម៉ោង។"
+                                )
+                                log.info(f"User {user_id} temp-banned for {ban_duration_minutes} mins (2nd offense).")
+                            else: # 3rd or more offense
+                                # Third offense: Permanent ban
+                                WHATSAPP_BANNED_USERS.add(user_id)
+                                async with pool.acquire() as conn:
+                                    await conn.execute("INSERT INTO whatsapp_bans (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id)
+                                ban_message_khmer = (
+                                    f"{mention_user_html(user_id)}, ដោយសារតែការមិនគោរពតាមការរំលឹកជាច្រើនដង, "
+                                    f"អ្នកត្រូវបានហាមឃាត់ជាអចិន្ត្រៃយ៍ពីការស្នើសុំលេខ WhatsApp។"
+                                )
+                                log.info(f"User {user_id} permanently banned from WhatsApp requests (3rd+ offense).")
+
+                            if ban_message_khmer:
+                                reminders_to_send.append({'chat_id': item.get("chat_id"), 'text': ban_message_khmer})
+
+                            # The offense has been punished. Clear the item that caused it.
+                            items_to_remove.append(item)
                             state_changed = True
-                            log.info(f"Queued first reminder for user {user_id} for WA '{item.get('value')}'")
-                        else:
-                            # Subsequent triggers: Remind AND ban for 30 minutes
-                            ban_duration_minutes = 30
-                            ban_until = now + timedelta(minutes=ban_duration_minutes)
-                            state.setdefault("whatsapp_temp_bans", {})[user_id_str] = ban_until.isoformat()
 
-                            ban_message_khmer = (
-                                f"សូមរំលឹកម្តងទៀត: {mention_user_html(user_id)}, អ្នកនៅតែមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ WhatsApp {item.get('value')}។\n"
-                                f"អ្នកត្រូវបានហាមឃាត់ជាបណ្ដោះអាសន្នពីការស្នើសុំលេខ WhatsApp បន្ថែមទៀតសម្រាប់រយៈពេល {ban_duration_minutes} នាទី។"
-                            )
-                            reminders_to_send.append({'chat_id': item.get("chat_id"), 'text': ban_message_khmer})
-
-                            item['reminder_count'] += 1
-                            item['last_action_ts'] = now.isoformat()
-                            state_changed = True
-                            log.info(f"User {user_id} reminded again (count: {item['reminder_count']}) and temp-banned for {ban_duration_minutes} mins for not clearing WA '{item.get('value')}'")
+                    # Case 2: No reminder sent yet. Check if it's time to send the first one.
+                    elif (now - datetime.fromisoformat(item["ts"])) > timedelta(minutes=REMINDER_DELAY_MINUTES):
+                        reminder_text = (
+                            f"សូមរំលឹក: {mention_user_html(user_id)}, "
+                            f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ WhatsApp {item.get('value')} ដែលអ្នកបានស្នើសុំ។"
+                        )
+                        reminders_to_send.append({'chat_id': item.get("chat_id"), 'text': reminder_text})
+                        item["reminder_sent"] = True
+                        item["reminder_ts"] = now.isoformat()
+                        state_changed = True
+                        log.info(f"Queued first reminder for user {user_id} for WA '{item.get('value')}'")
 
                 except Exception as e:
                     log.error(f"Error processing reminder/ban for user {user_id_str}: {e}")
+
+            if items_to_remove:
+                whatsapp_bucket[user_id_str] = [i for i in items if i not in items_to_remove]
+                if not whatsapp_bucket[user_id_str]:
+                    del whatsapp_bucket[user_id_str]
 
         if state_changed:
             await save_state()
@@ -2208,7 +2244,8 @@ async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
     log.info("Performing daily reset...")
     async with db_lock:
         state['catch_up_assignments'] = {}
-        log.info("Resetting daily catch-up assignments.")
+        state['whatsapp_offense_count'] = {} # Reset offense counts daily
+        log.info("Resetting daily catch-up assignments and WhatsApp offense counters.")
         try:
             pool = await get_db_pool()
             async with pool.acquire() as conn:
@@ -2434,10 +2471,21 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif chat_id == REQUEST_GROUP_ID:
             if NEED_USERNAME_RX.match(text):
+                # Cooldown check for usernames
+                now = datetime.now(TIMEZONE)
+                last_req_ts_str = state.setdefault("username_last_request_ts", {}).get(str(uid))
+                if last_req_ts_str:
+                    last_req_ts = datetime.fromisoformat(last_req_ts_str)
+                    if (now - last_req_ts) < timedelta(minutes=1):
+                        await msg.reply_text("អ្នកអាចស្នើសុំ username បានតែម្តងគត់ក្នុងមួយនាទី។ សូមរង់ចាំ។")
+                        return
+
                 rec = await _next_from_username_pool()
                 reply = "No available username." if not rec else f"@{rec['owner']}\n{rec['username']}"
                 await msg.reply_text(reply)
                 if rec:
+                    # Record the time of this successful request
+                    state.setdefault("username_last_request_ts", {})[str(uid)] = now.isoformat()
                     await _set_issued(uid, chat_id, "username", rec["username"], context_data={"owner": rec["owner"]})
                     await _log_event("username", "issued", update, rec["username"], owner=rec["owner"])
                     await _increment_user_activity(uid, "username")
@@ -2554,5 +2602,4 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
 
