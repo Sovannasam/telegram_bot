@@ -41,7 +41,7 @@ BOT_TOKEN = get_env_variable("BOT_TOKEN")
 DATABASE_URL = get_env_variable("DATABASE_URL")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "excelmerge")  # telegram username (without @)
 WA_DAILY_LIMIT = int(os.getenv("WA_DAILY_LIMIT", "2"))      # max sends per number per logical day
-REMINDER_DELAY_MINUTES = int(os.getenv("REMINDER_DELAY_MINUTES", "15")) # Delay for reminders
+REMINDER_DELAY_MINUTES = int(os.getenv("REMINDER_DELAY_MINUTES", "30")) # Delay for reminders
 USER_WHATSAPP_LIMIT = int(os.getenv("USER_WHATSAPP_LIMIT", "10"))
 USERNAME_THRESHOLD_FOR_BONUS = int(os.getenv("USERNAME_THRESHOLD_FOR_BONUS", "35"))
 REQUEST_GROUP_ID = int(os.getenv("REQUEST_GROUP_ID", "-1002438185636")) # Group for 'i need ...' commands
@@ -148,6 +148,11 @@ async def setup_database():
             );
         """)
         await conn.execute("""
+            CREATE TABLE IF NOT EXISTS whitelisted_users (
+                user_id BIGINT PRIMARY KEY
+            );
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS user_daily_country_counts (
                 day DATE NOT NULL,
                 user_id BIGINT NOT NULL,
@@ -207,6 +212,7 @@ BASE_STATE = {
 }
 state: Dict = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
 WHATSAPP_BANNED_USERS: set[int] = set()
+WHITELISTED_USERS: set[int] = set()
 ADMIN_PERMISSIONS: Dict[str, List[str]] = {}
 
 # =============================
@@ -217,7 +223,7 @@ COMMAND_PERMISSIONS = {
     'stop open', 'take customer', 'ban whatsapp', 'unban whatsapp', 'report',
     'owner report', 'performance', 'remind user', 'clear pending', 'clear all pending',
     'list owners', 'list disabled', 'list owner', 'detail user', 'list banned', 'list admins',
-    'list pending', 'data today', 'list enabled'
+    'list pending', 'data today', 'list enabled', 'add user', 'delete user'
 }
 
 async def load_admins():
@@ -260,6 +266,19 @@ async def load_whatsapp_bans():
         log.info(f"Loaded {len(WHATSAPP_BANNED_USERS)} WhatsApp bans from database.")
     except Exception as e:
         log.error(f"Failed to load WhatsApp bans from DB: %s", e)
+
+async def load_whitelisted_users():
+    global WHITELISTED_USERS
+    WHITELISTED_USERS = set()
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT user_id FROM whitelisted_users")
+            for row in rows:
+                WHITELISTED_USERS.add(row['user_id'])
+        log.info(f"Loaded {len(WHITELISTED_USERS)} whitelisted users from database.")
+    except Exception as e:
+        log.error(f"Failed to load whitelisted users from DB: %s", e)
 
 async def load_state():
     global state
@@ -843,6 +862,8 @@ LIST_ADMINS_RX        = re.compile(r"^\s*list\s+admins\s*$", re.IGNORECASE)
 LIST_PENDING_RX       = re.compile(r"^\s*list\s+pending\s*$", re.IGNORECASE)
 DATA_TODAY_RX         = re.compile(r"^\s*data\s+today\s*$", re.IGNORECASE)
 LIST_ENABLED_RX       = re.compile(r"^\s*list\s+enabled\s*$", re.IGNORECASE)
+ADD_USER_RX           = re.compile(r"^\s*add\s+user\s+@?(\S+)\s*$", re.IGNORECASE)
+DELETE_USER_RX        = re.compile(r"^\s*delete\s+user\s+@?(\S+)\s*$", re.IGNORECASE)
 
 
 def _looks_like_phone(s: str) -> bool:
@@ -1436,8 +1457,8 @@ def _get_commands_text() -> str:
 <b>--- User Commands ---</b>
 <code>i need username</code> - Request a username.
 <code>i need whatsapp</code> - Request a WhatsApp number.
-<code>who's using @item</code> - Check the owner of an item.
 <code>my detail</code> - See your own daily stats.
+<code>who's using @item</code> - Check the owner of an item.
 <code>my performance</code> - See your daily customer stats (owners only).
 
 <b>--- Admin: Owner & Item Management ---</b>
@@ -1455,7 +1476,8 @@ def _get_commands_text() -> str:
 <code>open all usernames</code>
 <code>stop all whatsapp</code>
 <code>open all whatsapp</code>
-<code>stop all owners</code> - Pause all owners.
+<code>stop all owners</code>
+<code>open all owners</code>
 
 <b>--- Admin: Priority & User Management ---</b>
 <code>take 5 customer to owner @owner</code>
@@ -1487,6 +1509,8 @@ def _get_commands_text() -> str:
 <code>allow @user to use command [command]</code>
 <code>stop allow @user to use command [command]</code>
 <code>list admins</code>
+<code>add user @user</code>
+<code>delete user @user</code>
 """
 
 async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, update: Update) -> Optional[str]:
@@ -1502,6 +1526,31 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
                 await conn.execute("INSERT INTO admins (username, permissions) VALUES ($1, '[]') ON CONFLICT(username) DO NOTHING", name)
             await load_admins()
             return f"Admin '{name}' added with no permissions."
+        
+        m_add_user = ADD_USER_RX.match(text)
+        if m_add_user:
+            name = m_add_user.group(1)
+            user_id = _find_user_id_by_name(name)
+            if not user_id:
+                return f"User '{name}' not found. They must interact with the bot once to be added."
+            pool = await get_db_pool()
+            async with pool.acquire() as conn:
+                await conn.execute("INSERT INTO whitelisted_users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id)
+            await load_whitelisted_users()
+            return f"User '{name}' has been whitelisted."
+        
+        m_del_user = DELETE_USER_RX.match(text)
+        if m_del_user:
+            name = m_del_user.group(1)
+            user_id = _find_user_id_by_name(name)
+            if not user_id:
+                return f"User '{name}' not found."
+            pool = await get_db_pool()
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM whitelisted_users WHERE user_id = $1", user_id)
+            await load_whitelisted_users()
+            return f"User '{name}' has been removed from the whitelist."
+
 
         m_del_admin = DELETE_ADMIN_RX.match(text)
         if m_del_admin:
@@ -2176,7 +2225,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                             ban_until = now + timedelta(minutes=ban_duration_minutes)
                             state.setdefault("whatsapp_temp_bans", {})[user_id_str] = ban_until.isoformat()
                             ban_message_khmer = (
-                                f"សូមរំលឹក: {mention_user_html(user_id)}, អ្នកមិនបានផ្តល់ព័ត៌មានសម្រាប់ WhatsApp {item.get('value')} ہے۔\n"
+                                f"សូមរំលឹក: {mention_user_html(user_id)}, អ្នកមិនបានផ្តល់ព័ត៌មានសម្រាប់ WhatsApp {item.get('value')}\n"
                                 f"អ្នកត្រូវបានហាមឃាត់ជាបណ្ដោះអាសន្នពីការស្នើសុំលេខ WhatsApp រយៈពេល {ban_duration_minutes} នាទី។"
                             )
                             log.info(f"User {user_id} temp-banned for {ban_duration_minutes} mins (1st offense).")
@@ -2267,6 +2316,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # User "my detail" command
         if MY_DETAIL_RX.match(text):
             if chat_id == DETAIL_GROUP_ID:
+                if uid not in WHITELISTED_USERS and not _is_admin(update.effective_user):
+                    return
                 detail_text = await _get_user_detail_text(uid)
                 await msg.reply_html(detail_text)
             return
@@ -2466,6 +2517,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return # End of processing for this group
 
         elif chat_id == REQUEST_GROUP_ID:
+            if uid not in WHITELISTED_USERS and not _is_admin(update.effective_user):
+                return
+                
             if NEED_USERNAME_RX.match(text):
                 # Cooldown check for usernames
                 now = datetime.now(TIMEZONE)
@@ -2572,6 +2626,7 @@ async def post_initialization(application: Application):
     await load_owner_directory()
     await load_whatsapp_bans()
     await load_admins()
+    await load_whitelisted_users()
 
 async def post_shutdown(application: Application):
     """Runs once before the bot shuts down."""
