@@ -41,7 +41,7 @@ BOT_TOKEN = get_env_variable("BOT_TOKEN")
 DATABASE_URL = get_env_variable("DATABASE_URL")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "excelmerge")  # telegram username (without @)
 WA_DAILY_LIMIT = int(os.getenv("WA_DAILY_LIMIT", "2"))      # max sends per number per logical day
-REMINDER_DELAY_MINUTES = int(os.getenv("REMINDER_DELAY_MINUTES", "20")) # Delay for reminders
+REMINDER_DELAY_MINUTES = int(os.getenv("REMINDER_DELAY_MINUTES", "30")) # Delay for reminders
 USER_WHATSAPP_LIMIT = int(os.getenv("USER_WHATSAPP_LIMIT", "10"))
 USERNAME_THRESHOLD_FOR_BONUS = int(os.getenv("USERNAME_THRESHOLD_FOR_BONUS", "35"))
 REQUEST_GROUP_ID = int(os.getenv("REQUEST_GROUP_ID", "-1002438185636")) # Group for 'i need ...' commands
@@ -2376,24 +2376,56 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif chat_id == CLEARING_GROUP_ID:
             # Find any pending items mentioned in the message
-            cleared_items_this_message = {'username': [], 'whatsapp': []}
             pending_usernames = {item['value'] for item in _issued_bucket("username").get(str(uid), [])}
             pending_whatsapps = {item['value'] for item in _issued_bucket("whatsapp").get(str(uid), [])}
             found_usernames = {f"@{u}" for u in EXTRACT_USERNAMES_RX.findall(text)}
             found_phones = EXTRACT_PHONES_RX.findall(text)
+
+            values_found_in_message = set()
             for u in found_usernames:
-                if u in pending_usernames: cleared_items_this_message['username'].append(u)
+                if u in pending_usernames:
+                    values_found_in_message.add(u)
             for p in found_phones:
                 for pending_p in pending_whatsapps:
-                    if _norm_phone(p) == _norm_phone(pending_p): cleared_items_this_message['whatsapp'].append(pending_p)
-            values_found_in_message = set(cleared_items_this_message['username'] + cleared_items_this_message['whatsapp'])
+                    if _norm_phone(p) == _norm_phone(pending_p):
+                        values_found_in_message.add(pending_p)
+
+
+            # If a pending item is mentioned, we must validate country/age first.
+            if values_found_in_message:
+                found_country, country_status = _find_country_in_text(text)
+                age = _find_age_in_text(text)
+                is_allowed = True
+                rejection_reason = ""
+
+                if country_status:
+                    if country_status == 'not_allowed':
+                        is_allowed, rejection_reason = False, f"Country '{found_country}' is not allowed."
+                    elif country_status == 'india' and (age is None or age < 30):
+                        is_allowed, rejection_reason = False, f"Age must be provided and 30 or older for India (got: {age})."
+                
+                if not is_allowed:
+                    first_offending_value = next(iter(values_found_in_message))
+                    item_type = "username" if first_offending_value.startswith('@') else "whatsapp"
+                    reply_text = (f"{mention_user_html(uid)}, this country is not allowed. "
+                                  f"Please use that {item_type} (<code>{first_offending_value}</code>) for another customer.")
+                    await msg.reply_html(reply_text)
+                    log.warning(f"Rejected post from user {uid}. Reason: {rejection_reason}. Pending item was NOT cleared.")
+                    return # Exit immediately, do not clear anything.
+                else:
+                    # Validation passed, log the country if it was found and valid
+                    if country_status and country_status != 'not_allowed':
+                        await _increment_user_country_count(uid, country_status)
+                        log.info(f"Incremented country count for user {uid} for '{country_status}'")
+
+
+            # --- From this point, the post is considered valid ---
 
             # Find a new App ID in the message
             app_id_match = APP_ID_RX.search(text)
-
-            # Reworked Logic: Link a new App ID to a source (explicitly or implicitly)
+            
+            # Logic to link a new App ID to a source (explicitly or implicitly)
             if app_id_match:
-                # The regex now has two groups: the keyword ('app', 'add', 'id') and the ID itself.
                 app_id = f"@{app_id_match.group(2)}"
                 source_item_to_clear, source_kind = None, None
 
@@ -2434,7 +2466,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if await _clear_one_issued(uid, source_kind, value_to_clear):
                         await _log_event(source_kind, "cleared", update, value_to_clear)
                         log.info(f"Auto-cleared pending {source_kind} for user {uid}: {value_to_clear}")
-
+                
                 else:
                     # Treat unlinked App IDs as valid entries, storing them for later confirmation
                     context_data = {"source_owner": "unknown", "source_kind": "app_id"}
@@ -2443,31 +2475,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     log.info(
                         f"Recorded App ID '{app_id}' for user {uid} without a source item"
                     )
-
-
-            # Country and Age validation logic
-            if values_found_in_message:
-                found_country, country_status = _find_country_in_text(text)
-                age = _find_age_in_text(text)
-                is_allowed = True
-                rejection_reason = ""
-                if country_status:
-                    if country_status == 'not_allowed':
-                        is_allowed, rejection_reason = False, f"Country '{found_country}' is not allowed."
-                    elif country_status == 'india' and (age is None or age < 30):
-                        is_allowed, rejection_reason = False, f"Age must be provided and 30 or older for India (got: {age})."
-                if not is_allowed:
-                    first_offending_value = next(iter(values_found_in_message))
-                    item_type = "username" if first_offending_value.startswith('@') else "whatsapp"
-                    reply_text = (f"{mention_user_html(uid)}, this country is not allowed. "
-                                  f"Please use that {item_type} (<code>{first_offending_value}</code>) for another customer.")
-                    await msg.reply_html(reply_text)
-                    log.warning(f"Rejected post from user {uid}. Reason: {rejection_reason}.")
-                else:
-                    if country_status and country_status != 'not_allowed':
-                        await _increment_user_country_count(uid, country_status)
-                        log.info(f"Incremented country count for user {uid} for '{country_status}'")
-            return
+            return # End of processing for this group
 
         elif chat_id == REQUEST_GROUP_ID:
             if NEED_USERNAME_RX.match(text):
