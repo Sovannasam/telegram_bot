@@ -2159,66 +2159,54 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             items_to_remove = []
             for item in items:
                 try:
-                    # Case 1: A reminder was already sent. Check if it's time to ban.
-                    if item.get("reminder_sent"):
-                        reminder_ts = datetime.fromisoformat(item.get("reminder_ts"))
-                        if (now - reminder_ts) > timedelta(minutes=30):
-                            # This user failed to comply after a reminder. It's an offense.
-                            offense_counts = state.setdefault("whatsapp_offense_count", {})
-                            offense_count = offense_counts.get(user_id_str, 0) + 1
-                            offense_counts[user_id_str] = offense_count
-                            log.info(f"User {user_id} failed to clear WA. Offense count is now {offense_count}.")
+                    item_ts = datetime.fromisoformat(item["ts"])
+                    
+                    # Check if 30 minutes have passed since the item was issued
+                    if (now - item_ts) > timedelta(minutes=REMINDER_DELAY_MINUTES):
+                        # This item is overdue. Time to remind AND ban.
+                        offense_counts = state.setdefault("whatsapp_offense_count", {})
+                        offense_count = offense_counts.get(user_id_str, 0) + 1
+                        offense_counts[user_id_str] = offense_count
+                        log.info(f"User {user_id} failed to clear WA '{item.get('value')}'. Offense count is now {offense_count}.")
 
-                            ban_message_khmer = ""
-                            if offense_count == 1:
-                                # First offense: 30-minute ban
-                                ban_duration_minutes = 30
-                                ban_until = now + timedelta(minutes=ban_duration_minutes)
-                                state.setdefault("whatsapp_temp_bans", {})[user_id_str] = ban_until.isoformat()
-                                ban_message_khmer = (
-                                    f"{mention_user_html(user_id)}, អ្នកត្រូវបានហាមឃាត់ជាបណ្ដោះអាសន្នពីការស្នើសុំលេខ WhatsApp រយៈពេល {ban_duration_minutes} នាទី "
-                                    f"ដោយសារតែអ្នកមិនបានផ្ដល់ព័ត៌មានសម្រាប់លេខមុនបន្ទាប់ពីរំលឹក។"
-                                )
-                                log.info(f"User {user_id} temp-banned for {ban_duration_minutes} mins.")
-                            elif offense_count == 2:
-                                # Second offense: 2-hour ban
-                                ban_duration_minutes = 120
-                                ban_until = now + timedelta(minutes=ban_duration_minutes)
-                                state.setdefault("whatsapp_temp_bans", {})[user_id_str] = ban_until.isoformat()
-                                ban_message_khmer = (
-                                    f"{mention_user_html(user_id)}, ដោយសារអ្នកបានធ្វើកំហុសដដែលម្តងទៀត, "
-                                    f"អ្នកត្រូវបានហាមឃាត់ពីការស្នើសុំលេខ WhatsApp រយៈពេល 2 ម៉ោង។"
-                                )
-                                log.info(f"User {user_id} temp-banned for {ban_duration_minutes} mins (2nd offense).")
-                            else: # 3rd or more offense
-                                # Third offense: Permanent ban
-                                WHATSAPP_BANNED_USERS.add(user_id)
-                                async with pool.acquire() as conn:
-                                    await conn.execute("INSERT INTO whatsapp_bans (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id)
-                                ban_message_khmer = (
-                                    f"{mention_user_html(user_id)}, ដោយសារតែការមិនគោរពតាមការរំលឹកជាច្រើនដង, "
-                                    f"អ្នកត្រូវបានហាមឃាត់ជាអចិន្ត្រៃយ៍ពីការស្នើសុំលេខ WhatsApp។"
-                                )
-                                log.info(f"User {user_id} permanently banned from WhatsApp requests (3rd+ offense).")
+                        ban_message_khmer = ""
+                        if offense_count == 1:
+                            # First offense: 30-minute ban
+                            ban_duration_minutes = 30
+                            ban_until = now + timedelta(minutes=ban_duration_minutes)
+                            state.setdefault("whatsapp_temp_bans", {})[user_id_str] = ban_until.isoformat()
+                            ban_message_khmer = (
+                                f"សូមរំលឹក: {mention_user_html(user_id)}, អ្នកមិនបានផ្តល់ព័ត៌មានសម្រាប់ WhatsApp {item.get('value')} ہے۔\n"
+                                f"អ្នកត្រូវបានហាមឃាត់ជាបណ្ដោះអាសន្នពីការស្នើសុំលេខ WhatsApp រយៈពេល {ban_duration_minutes} នាទី។"
+                            )
+                            log.info(f"User {user_id} temp-banned for {ban_duration_minutes} mins (1st offense).")
+                        elif offense_count == 2:
+                            # Second offense: 2-hour ban
+                            ban_duration_minutes = 120
+                            ban_until = now + timedelta(minutes=ban_duration_minutes)
+                            state.setdefault("whatsapp_temp_bans", {})[user_id_str] = ban_until.isoformat()
+                            ban_message_khmer = (
+                                f"{mention_user_html(user_id)}, ដោយសារអ្នកបានធ្វើកំហុសដដែលម្តងទៀត, "
+                                f"អ្នកត្រូវបានហាមឃាត់ពីការស្នើសុំលេខ WhatsApp រយៈពេល 2 ម៉ោង។"
+                            )
+                            log.info(f"User {user_id} temp-banned for {ban_duration_minutes} mins (2nd offense).")
+                        else: # 3rd or more offense
+                            # Third offense: Permanent ban
+                            WHATSAPP_BANNED_USERS.add(user_id)
+                            async with pool.acquire() as conn:
+                                await conn.execute("INSERT INTO whatsapp_bans (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id)
+                            ban_message_khmer = (
+                                f"{mention_user_html(user_id)}, ដោយសារតែការមិនគោរពតាមការរំលឹកជាច្រើនដង, "
+                                f"អ្នកត្រូវបានហាមឃាត់ជាអចិន្ត្រៃយ៍ពីការស្នើសុំលេខ WhatsApp។"
+                            )
+                            log.info(f"User {user_id} permanently banned from WhatsApp requests (3rd+ offense).")
 
-                            if ban_message_khmer:
-                                reminders_to_send.append({'chat_id': item.get("chat_id"), 'text': ban_message_khmer})
+                        if ban_message_khmer:
+                            reminders_to_send.append({'chat_id': item.get("chat_id"), 'text': ban_message_khmer})
 
-                            # The offense has been punished. Clear the item that caused it.
-                            items_to_remove.append(item)
-                            state_changed = True
-
-                    # Case 2: No reminder sent yet. Check if it's time to send the first one.
-                    elif (now - datetime.fromisoformat(item["ts"])) > timedelta(minutes=REMINDER_DELAY_MINUTES):
-                        reminder_text = (
-                            f"សូមរំលឹក: {mention_user_html(user_id)}, "
-                            f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ WhatsApp {item.get('value')} ដែលអ្នកបានស្នើសុំ។"
-                        )
-                        reminders_to_send.append({'chat_id': item.get("chat_id"), 'text': reminder_text})
-                        item["reminder_sent"] = True
-                        item["reminder_ts"] = now.isoformat()
+                        # The offense has been punished. Clear the item that caused it.
+                        items_to_remove.append(item)
                         state_changed = True
-                        log.info(f"Queued first reminder for user {user_id} for WA '{item.get('value')}'")
 
                 except Exception as e:
                     log.error(f"Error processing reminder/ban for user {user_id_str}: {e}")
