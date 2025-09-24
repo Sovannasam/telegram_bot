@@ -2518,8 +2518,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 last_req_ts_str = state.setdefault("whatsapp_last_request_ts", {}).get(str(uid))
                 if last_req_ts_str:
                     last_req_ts = datetime.fromisoformat(last_req_ts_str)
-                    if (now - last_req_ts) < timedelta(minutes=1):
-                        await msg.reply_text("អ្នកអាចស្នើសុំលេខ WhatsApp បានតែម្តងគត់ក្នុងមួយនាទី។ សូមរង់ចាំ។")
+                    if (now - last_req_ts) < timedelta(minutes=3):
+                        await msg.reply_text("អ្នកអាចស្នើសុំលេខ WhatsApp បានតែម្តងគត់ក្នុងរយៈពេល 3 នាទី។ សូមរង់ចាំ។")
                         return
 
                 username_count, whatsapp_count = await _get_user_activity(uid)
@@ -2602,4 +2602,5 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
 
