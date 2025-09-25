@@ -2206,6 +2206,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     Handles sending reminders and applying escalating bans for non-compliance.
     - Usernames get repeated reminders.
     - WhatsApp failures escalate from 30min ban -> 2hr ban -> permanent ban.
+    - Overdue WhatsApp items are NOT cleared automatically, but are marked to prevent repeat punishments.
     """
     reminders_to_send = []
     state_changed = False
@@ -2242,13 +2243,12 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
         whatsapp_bucket = _issued_bucket("whatsapp")
         for user_id_str, items in list(whatsapp_bucket.items()):
             user_id = int(user_id_str)
-            items_to_remove = []
             for item in items:
                 try:
                     item_ts = datetime.fromisoformat(item["ts"])
                     
-                    # Check if 30 minutes have passed since the item was issued
-                    if (now - item_ts) > timedelta(minutes=REMINDER_DELAY_MINUTES):
+                    # Check if item is overdue AND has not already been punished for this offense
+                    if (now - item_ts) > timedelta(minutes=REMINDER_DELAY_MINUTES) and not item.get("punished"):
                         # This item is overdue. Time to remind AND ban.
                         offense_counts = state.setdefault("whatsapp_offense_count", {})
                         offense_count = offense_counts.get(user_id_str, 0) + 1
@@ -2290,17 +2290,12 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                         if ban_message_khmer:
                             reminders_to_send.append({'chat_id': item.get("chat_id"), 'text': ban_message_khmer})
 
-                        # The offense has been punished. Clear the item that caused it.
-                        items_to_remove.append(item)
+                        # Mark the item as punished to prevent re-punishing, but DO NOT clear it.
+                        item["punished"] = True
                         state_changed = True
 
                 except Exception as e:
                     log.error(f"Error processing reminder/ban for user {user_id_str}: {e}")
-
-            if items_to_remove:
-                whatsapp_bucket[user_id_str] = [i for i in items if i not in items_to_remove]
-                if not whatsapp_bucket[user_id_str]:
-                    del whatsapp_bucket[user_id_str]
 
         if state_changed:
             await save_state()
@@ -2691,4 +2686,6 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
+
 
