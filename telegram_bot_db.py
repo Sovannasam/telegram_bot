@@ -40,7 +40,7 @@ def get_env_variable(var_name: str) -> str:
 BOT_TOKEN = get_env_variable("BOT_TOKEN")
 DATABASE_URL = get_env_variable("DATABASE_URL")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "excelmerge")  # telegram username (without @)
-WA_DAILY_LIMIT = int(os.getenv("WA_DAILY_LIMIT", "2"))      # max sends per number per logical day
+WA_DAILY_LIMIT = int(os.getenv("WA_DAILY_LIMIT", "2"))       # max sends per number per logical day
 REMINDER_DELAY_MINUTES = int(os.getenv("REMINDER_DELAY_MINUTES", "30")) # Delay for reminders
 USER_WHATSAPP_LIMIT = int(os.getenv("USER_WHATSAPP_LIMIT", "10"))
 USERNAME_THRESHOLD_FOR_BONUS = int(os.getenv("USERNAME_THRESHOLD_FOR_BONUS", "35"))
@@ -52,6 +52,7 @@ PERFORMANCE_GROUP_IDS = {
     -1002670785417, -1002659012767, -1002790753092, -1002520117752
 }
 CATCH_UP_LIMIT = int(os.getenv("CATCH_UP_LIMIT", "5")) # Limit for least-busy owner priority
+CATCH_UP_COOLDOWN_MINUTES = int(os.getenv("CATCH_UP_COOLDOWN_MINUTES", "60")) # Cooldown in minutes after hitting catch-up limit
 
 
 # Whitelist of allowed countries (lowercase for case-insensitive matching)
@@ -205,6 +206,7 @@ BASE_STATE = {
         "saved_rr_indices": {}
     },
     "catch_up_assignments": {},
+    "catch_up_cooldowns": {},
     "whatsapp_temp_bans": {},
     "whatsapp_last_request_ts": {},
     "username_last_request_ts": {},
@@ -309,6 +311,7 @@ async def load_state():
     state["issued"].setdefault("whatsapp", {})
     state["issued"].setdefault("app_id", {})
     state.setdefault("priority_queue", BASE_STATE["priority_queue"])
+    state.setdefault("catch_up_cooldowns", {})
     state.setdefault("whatsapp_temp_bans", {})
     state.setdefault("whatsapp_last_request_ts", {})
     state.setdefault("username_last_request_ts", {})
@@ -597,7 +600,7 @@ async def _wa_inc_count(number_norm: str, day: date):
                 VALUES ($1, $2, 1, $3)
                 ON CONFLICT (day, number_norm)
                 DO UPDATE SET sent_count = wa_daily_usage.sent_count + 1,
-                              last_sent = EXCLUDED.last_sent
+                                last_sent = EXCLUDED.last_sent
             """, day, number_norm, datetime.now(TIMEZONE))
     except Exception as e:
         log.warning("Quota write failed: %s", e)
@@ -615,7 +618,7 @@ def _preserve_owner_pointer(old_list: List[str], new_list: List[str], old_idx: i
     if not new_list: return 0
     old_list = list(old_list or [])
     if not old_list: return 0
-    old_idx = old_idx % len(old_list)
+    if old_idx >= len(old_list): old_idx = 0 # Bounds check
     start_owner = old_list[old_idx]
     if start_owner in new_list: return new_list.index(start_owner)
     n = len(old_list)
@@ -692,7 +695,7 @@ async def _decrement_priority_and_end_if_needed():
         await save_state()
 
 async def _get_bulk_owner_performance(owner_names: List[str], day: date) -> Dict[str, int]:
-    """Fetches performance for a list of owners and returns total confirmations."""
+    """Fetches performance for a list of owners based on successful confirmations."""
     if not owner_names:
         return {}
 
@@ -712,35 +715,67 @@ async def _get_bulk_owner_performance(owner_names: List[str], day: date) -> Dict
         return performance_map
 
 async def _get_next_owner_by_performance(pool: List[Dict], rr_idx_key: str) -> int:
-    """Selects the next owner from a pool based on the lowest number of daily confirmations, with a catch-up limit."""
+    """
+    Selects the next owner using a tiered approach based on performance,
+    now with a time-based cooldown after hitting the catch-up limit.
+    """
     active_owners = [o['owner'] for o in pool]
     if not active_owners:
         return 0
 
     performance = await _get_bulk_owner_performance(active_owners, _logical_day_today())
-    min_score = min(performance.values()) if performance else 0
-    least_busy_owners = {owner for owner, score in performance.items() if score == min_score}
-
-    # Filter out least busy owners who have reached their catch-up limit
-    eligible_least_busy = {
-        owner for owner in least_busy_owners
-        if state.get("catch_up_assignments", {}).get(owner, 0) < CATCH_UP_LIMIT
-    }
-
+    sorted_scores = sorted(list(set(performance.values())))
     current_rr_idx = state['rr'].get(rr_idx_key, 0)
 
-    # If there are eligible least busy owners, use them
-    if eligible_least_busy:
-        for i in range(len(pool)):
-            next_idx = (current_rr_idx + i) % len(pool)
-            owner_name = pool[next_idx]['owner']
-            if owner_name in eligible_least_busy:
-                state.setdefault("catch_up_assignments", {})
-                state["catch_up_assignments"][owner_name] = state["catch_up_assignments"].get(owner_name, 0) + 1
-                return next_idx
+    # Get relevant state dictionaries
+    catch_up_assignments = state.setdefault("catch_up_assignments", {})
+    catch_up_cooldowns = state.setdefault("catch_up_cooldowns", {})
+    now = datetime.now(TIMEZONE)
 
-    # If no least busy owners are eligible, fall back to standard round-robin for the whole pool
-    return current_rr_idx % len(pool)
+    # 1. First, process any expired cooldowns for all owners in the pool.
+    # This makes them eligible again *before* we start selecting.
+    for owner_name in active_owners:
+        cooldown_ts_str = catch_up_cooldowns.get(owner_name)
+        if cooldown_ts_str:
+            cooldown_ts = datetime.fromisoformat(cooldown_ts_str)
+            if now >= cooldown_ts + timedelta(minutes=CATCH_UP_COOLDOWN_MINUTES):
+                log.info(f"Cooldown for owner {owner_name} expired. They are eligible again.")
+                # Reset their assignment count and remove cooldown
+                catch_up_assignments[owner_name] = 0
+                catch_up_cooldowns.pop(owner_name, None)
+
+    # 2. Iterate through performance tiers to find the best candidate.
+    for score in sorted_scores:
+        owners_at_this_level = {owner for owner, s in performance.items() if s == score}
+        
+        # Check which of these owners are actually eligible
+        eligible_owners_in_tier = {
+            owner for owner in owners_at_this_level
+            if owner not in catch_up_cooldowns and catch_up_assignments.get(owner, 0) < CATCH_UP_LIMIT
+        }
+
+        if eligible_owners_in_tier:
+            # Found an eligible tier. Pick one using round-robin.
+            for i in range(len(pool)):
+                next_idx = (current_rr_idx + i) % len(pool)
+                owner_name = pool[next_idx]['owner']
+
+                if owner_name in eligible_owners_in_tier:
+                    # This is our owner. Increment their assignment count.
+                    new_assignment_count = catch_up_assignments.get(owner_name, 0) + 1
+                    catch_up_assignments[owner_name] = new_assignment_count
+                    
+                    # If this new assignment makes them hit the limit, start their cooldown.
+                    if new_assignment_count >= CATCH_UP_LIMIT:
+                        log.info(f"Owner {owner_name} has now hit the catch-up limit. Starting a {CATCH_UP_COOLDOWN_MINUTES}-minute cooldown.")
+                        catch_up_cooldowns[owner_name] = now.isoformat()
+
+                    # Return the index. The calling function will save the state.
+                    return next_idx
+
+    # Fallback: If no one is eligible in any tier (e.g., everyone is on cooldown)
+    log.warning("No eligible owners found in any performance tier. Falling back to simple round-robin as a last resort.")
+    return current_rr_idx % len(pool) if pool else 0
 
 
 async def _next_from_username_pool() -> Optional[Dict[str, str]]:
@@ -762,6 +797,7 @@ async def _next_from_username_pool() -> Optional[Dict[str, str]]:
 
     owner_idx = await _get_next_owner_by_performance(USERNAME_POOL, "username_owner_idx")
 
+    # Start searching from the selected owner's index
     for i in range(len(USERNAME_POOL)):
         current_idx = (owner_idx + i) % len(USERNAME_POOL)
         block = USERNAME_POOL[current_idx]
@@ -797,6 +833,7 @@ async def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
 
     owner_idx = await _get_next_owner_by_performance(WHATSAPP_POOL, "wa_owner_idx")
 
+    # Start searching from the selected owner's index
     for i in range(len(WHATSAPP_POOL)):
         current_idx = (owner_idx + i) % len(WHATSAPP_POOL)
         block = WHATSAPP_POOL[current_idx]
@@ -2281,8 +2318,9 @@ async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
     log.info("Performing daily reset...")
     async with db_lock:
         state['catch_up_assignments'] = {}
+        state['catch_up_cooldowns'] = {}
         state['whatsapp_offense_count'] = {} # Reset offense counts daily
-        log.info("Resetting daily catch-up assignments and WhatsApp offense counters.")
+        log.info("Resetting daily catch-up assignments, cooldowns, and WhatsApp offense counters.")
         try:
             pool = await get_db_pool()
             async with pool.acquire() as conn:
