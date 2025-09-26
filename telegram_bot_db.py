@@ -185,6 +185,14 @@ async def setup_database():
                 permissions JSONB NOT NULL
             );
         """)
+        # NEW TABLE FOR USER-SPECIFIC COUNTRY BANS
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_country_bans (
+                user_id BIGINT NOT NULL,
+                country TEXT NOT NULL,
+                PRIMARY KEY (user_id, country)
+            );
+        """)
     log.info("Database schema is ready.")
 
 
@@ -216,6 +224,7 @@ state: Dict = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STAT
 WHATSAPP_BANNED_USERS: set[int] = set()
 WHITELISTED_USERS: set[int] = set()
 ADMIN_PERMISSIONS: Dict[str, List[str]] = {}
+USER_COUNTRY_BANS: Dict[int, set[str]] = {}
 
 # =============================
 # PERMISSIONS & ADMINS
@@ -225,7 +234,8 @@ COMMAND_PERMISSIONS = {
     'stop open', 'take customer', 'ban whatsapp', 'unban whatsapp', 'report',
     'owner report', 'performance', 'remind user', 'clear pending', 'clear all pending',
     'list owners', 'list disabled', 'list owner', 'detail user', 'list banned', 'list admins',
-    'list pending', 'data today', 'list enabled', 'add user', 'delete user'
+    'list pending', 'data today', 'list enabled', 'add user', 'delete user',
+    'ban country', 'unban country', 'list country bans'
 }
 
 async def load_admins():
@@ -268,6 +278,23 @@ async def load_whatsapp_bans():
         log.info(f"Loaded {len(WHATSAPP_BANNED_USERS)} WhatsApp bans from database.")
     except Exception as e:
         log.error(f"Failed to load WhatsApp bans from DB: %s", e)
+
+async def load_user_country_bans():
+    global USER_COUNTRY_BANS
+    USER_COUNTRY_BANS = {}
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT user_id, country FROM user_country_bans")
+            for row in rows:
+                user_id = row['user_id']
+                country = row['country'].lower()
+                if user_id not in USER_COUNTRY_BANS:
+                    USER_COUNTRY_BANS[user_id] = set()
+                USER_COUNTRY_BANS[user_id].add(country)
+        log.info(f"Loaded {sum(len(c) for c in USER_COUNTRY_BANS.values())} user-country bans from database.")
+    except Exception as e:
+        log.error(f"Failed to load user-country bans from DB: %s", e)
 
 async def load_whitelisted_users():
     global WHITELISTED_USERS
@@ -901,6 +928,9 @@ DATA_TODAY_RX         = re.compile(r"^\s*data\s+today\s*$", re.IGNORECASE)
 LIST_ENABLED_RX       = re.compile(r"^\s*list\s+enabled\s*$", re.IGNORECASE)
 ADD_USER_RX           = re.compile(r"^\s*add\s+user\s+@?(\S+)\s*$", re.IGNORECASE)
 DELETE_USER_RX        = re.compile(r"^\s*delete\s+user\s+@?(\S+)\s*$", re.IGNORECASE)
+BAN_COUNTRY_RX        = re.compile(r"^\s*ban\s+country\s+([a-zA-Z\s]+)\s+for\s+@?(\S+)\s*$", re.IGNORECASE)
+UNBAN_COUNTRY_RX      = re.compile(r"^\s*unban\s+country\s+([a-zA-Z\s]+)\s+for\s+@?(\S+)\s*$", re.IGNORECASE)
+LIST_COUNTRY_BANS_RX  = re.compile(r"^\s*list\s+country\s+bans(?:\s+@?(\S+))?\s*$", re.IGNORECASE)
 
 
 def _looks_like_phone(s: str) -> bool:
@@ -1522,6 +1552,9 @@ def _get_commands_text() -> str:
 <code>ban whatsapp @user</code>
 <code>unban whatsapp @user</code>
 <code>list banned</code>
+<code>ban country [country] for @user</code>
+<code>unban country [country] for @user</code>
+<code>list country bans [@user]</code>
 
 <b>--- Admin: Reports & Manual Actions ---</b>
 <code>report [today|yesterday|YYYY-MM-DD]</code>
@@ -2052,6 +2085,73 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
             user_display = user_info.get('username') or user_info.get('first_name') or f"ID: {user_id}"
             lines.append(f"- {user_display}")
         return "\n".join(lines)
+        
+    m = BAN_COUNTRY_RX.match(text)
+    if m:
+        if not _has_permission(user, 'ban country'): return "You don't have permission to use this command."
+        country_raw, target_name = m.groups()
+        country = country_raw.strip().lower()
+        
+        target_user_id = _find_user_id_by_name(target_name)
+        if not target_user_id:
+            return f"User '{target_name}' not found."
+            
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("INSERT INTO user_country_bans (user_id, country) VALUES ($1, $2) ON CONFLICT (user_id, country) DO NOTHING", target_user_id, country)
+
+        await load_user_country_bans() # Reload the cache
+        return f"User {target_name} is now banned from submitting for country: '{country}'."
+
+    m = UNBAN_COUNTRY_RX.match(text)
+    if m:
+        if not _has_permission(user, 'unban country'): return "You don't have permission to use this command."
+        country_raw, target_name = m.groups()
+        country = country_raw.strip().lower()
+        
+        target_user_id = _find_user_id_by_name(target_name)
+        if not target_user_id:
+            return f"User '{target_name}' not found."
+
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM user_country_bans WHERE user_id = $1 AND country = $2", target_user_id, country)
+        
+        await load_user_country_bans() # Reload the cache
+        return f"User {target_name} has been unbanned from submitting for country: '{country}'."
+
+    m = LIST_COUNTRY_BANS_RX.match(text)
+    if m:
+        if not _has_permission(user, 'list country bans'): return "You don't have permission to use this command."
+        target_name = m.group(1)
+        
+        if target_name:
+            target_user_id = _find_user_id_by_name(target_name)
+            if not target_user_id:
+                return f"User '{target_name}' not found."
+            
+            user_bans = USER_COUNTRY_BANS.get(target_user_id, set())
+            if not user_bans:
+                return f"User {target_name} has no country bans."
+            
+            lines = [f"<b>Country bans for {target_name}:</b>"]
+            lines.extend(f"- {c.title()}" for c in sorted(list(user_bans)))
+            return "\n".join(lines)
+        else:
+            if not USER_COUNTRY_BANS:
+                return "No users have country-specific bans."
+            
+            lines = ["<b>All User-Specific Country Bans:</b>"]
+            for user_id, banned_countries in sorted(USER_COUNTRY_BANS.items()):
+                user_info = state.get("user_names", {}).get(str(user_id), {})
+                user_display = user_info.get('username') or user_info.get('first_name') or f"ID: {user_id}"
+                if user_info.get('username'):
+                    user_display = f"@{user_display}"
+                
+                countries_str = ", ".join(sorted([c.title() for c in banned_countries]))
+                lines.append(f"- <b>{user_display}</b>: {countries_str}")
+            return "\n".join(lines)
+
 
     m = OWNER_REPORT_RX.match(text)
     if m:
@@ -2470,23 +2570,29 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 is_allowed = True
                 rejection_reason = ""
 
-                if country_status:
-                    if country_status == 'not_allowed':
-                        is_allowed, rejection_reason = False, f"Country '{found_country}' is not allowed."
+                # Tiered validation checks
+                if country_status == 'not_allowed':
+                    is_allowed = False
+                    rejection_reason = f"Country '{found_country}' is not on the allowed list."
+                elif country_status: # If it's a known country
+                    user_bans = USER_COUNTRY_BANS.get(uid, set())
+                    if country_status in user_bans:
+                        is_allowed = False
+                        rejection_reason = f"You are specifically not allowed to submit for the country '{found_country}'."
                     elif country_status == 'india' and (age is None or age < 30):
-                        is_allowed, rejection_reason = False, f"Age must be provided and 30 or older for India (got: {age})."
-                
+                        is_allowed = False
+                        rejection_reason = f"Age must be provided and must be 30 or older for India (found: {age})."
+
                 if not is_allowed:
                     first_offending_value = next(iter(values_found_in_message))
                     item_type = "username" if first_offending_value.startswith('@') else "whatsapp"
-                    reply_text = (f"{mention_user_html(uid)}, this country is not allowed. "
+                    reply_text = (f"{mention_user_html(uid)}, your submission was rejected. Reason: {rejection_reason}\n"
                                   f"Please use that {item_type} (<code>{first_offending_value}</code>) for another customer.")
                     await msg.reply_html(reply_text)
                     log.warning(f"Rejected post from user {uid}. Reason: {rejection_reason}. Pending item was NOT cleared.")
-                    return # Exit immediately, do not clear anything.
+                    return
                 else:
-                    # Validation passed, log the country if it was found and valid
-                    if country_status and country_status != 'not_allowed':
+                    if country_status:
                         await _increment_user_country_count(uid, country_status)
                         log.info(f"Incremented country count for user {uid} for '{country_status}'")
 
@@ -2658,6 +2764,7 @@ async def post_initialization(application: Application):
     await _migrate_state_if_needed()
     await load_owner_directory()
     await load_whatsapp_bans()
+    await load_user_country_bans() # NEW: Load country bans
     await load_admins()
     await load_whitelisted_users()
 
@@ -2686,6 +2793,4 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
-
 
