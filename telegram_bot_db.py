@@ -235,7 +235,7 @@ COMMAND_PERMISSIONS = {
     'owner report', 'performance', 'remind user', 'clear pending', 'clear all pending',
     'list owners', 'list disabled', 'list owner', 'detail user', 'list banned', 'list admins',
     'list pending', 'data today', 'list enabled', 'add user', 'delete user',
-    'ban country', 'unban country', 'list country bans'
+    'ban country', 'unban country', 'list country bans', 'user performance', 'user stats'
 }
 
 async def load_admins():
@@ -931,6 +931,8 @@ DELETE_USER_RX        = re.compile(r"^\s*delete\s+user\s+@?(\S+)\s*$", re.IGNORE
 BAN_COUNTRY_RX        = re.compile(r"^\s*ban\s+country\s+([a-zA-Z\s]+)\s+for\s+@?(\S+)\s*$", re.IGNORECASE)
 UNBAN_COUNTRY_RX      = re.compile(r"^\s*unban\s+country\s+([a-zA-Z\s]+)\s+for\s+@?(\S+)\s*$", re.IGNORECASE)
 LIST_COUNTRY_BANS_RX  = re.compile(r"^\s*list\s+country\s+bans(?:\s+@?(\S+))?\s*$", re.IGNORECASE)
+USER_PERFORMANCE_RX   = re.compile(r"^\s*user\s+performance(?:\s+(today|yesterday|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
+USER_STATS_RX         = re.compile(r"^\s*user\s+stats(?:\s+(today|yesterday|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 
 
 def _looks_like_phone(s: str) -> bool:
@@ -1206,6 +1208,110 @@ async def _get_owner_distribution_counts(owner_name: str, day: date) -> Tuple[in
     except Exception as e:
         log.warning(f"Owner distribution count read failed for {owner_name}: {e}")
         return (0, 0)
+
+async def _get_user_performance_text(day: date) -> str:
+    """Generates a ranked list of users by their successful customer confirmations."""
+    lines = [f"<b>🏆 User Performance for {day.isoformat()}</b>"]
+    
+    user_performances = []
+    
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT user_id, confirm_count 
+                FROM user_daily_confirmations 
+                WHERE day = $1 AND confirm_count > 0
+                ORDER BY confirm_count DESC;
+                """,
+                day
+            )
+            
+            for row in rows:
+                user_id = row['user_id']
+                count = row['confirm_count']
+                
+                user_info = state.get("user_names", {}).get(str(user_id), {})
+                user_display = user_info.get('username') or user_info.get('first_name') or f"ID: {user_id}"
+                if user_info.get('username'):
+                    user_display = f"@{user_display}"
+
+                user_performances.append({'name': user_display, 'count': count})
+
+    except Exception as e:
+        log.error(f"Failed to get user performance data: {e}")
+        return "An error occurred while fetching user performance data."
+
+    if not user_performances:
+        return f"No users added any customers on {day.isoformat()}."
+
+    rank = 1
+    for perf in user_performances:
+        lines.append(f"<b>{rank}.</b> {perf['name']}: {perf['count']} customers")
+        rank += 1
+        
+    return "\n".join(lines)
+
+async def _get_user_stats_text(day: date) -> str:
+    """Generates a ranked list of users by their success rate."""
+    lines = [f"<b>📊 User Success Rate for {day.isoformat()}</b>"]
+    user_stats = []
+    
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            # Fetch all activity and confirmations for the day
+            activity_rows = await conn.fetch("SELECT user_id, username_requests, whatsapp_requests FROM user_daily_activity WHERE day = $1", day)
+            confirm_rows = await conn.fetch("SELECT user_id, confirm_count FROM user_daily_confirmations WHERE day = $1", day)
+            
+            # Process into dictionaries for easy lookup
+            activities = {r['user_id']: {'u': r['username_requests'], 'w': r['whatsapp_requests']} for r in activity_rows}
+            confirmations = {r['user_id']: r['confirm_count'] for r in confirm_rows}
+            
+            # Get a set of all unique user IDs who were active
+            all_user_ids = set(activities.keys()) | set(confirmations.keys())
+
+            if not all_user_ids:
+                return f"No user activity found for {day.isoformat()}."
+
+            for user_id in all_user_ids:
+                activity = activities.get(user_id, {'u': 0, 'w': 0})
+                confirm_count = confirmations.get(user_id, 0)
+                
+                total_reqs = activity['u'] + activity['w']
+                
+                if total_reqs > 0:
+                    rate = (confirm_count / total_reqs) * 100
+                else:
+                    rate = 0.0 # User had confirmations but no recorded requests (unlikely but possible)
+                
+                user_info = state.get("user_names", {}).get(str(user_id), {})
+                user_display = user_info.get('username') or user_info.get('first_name') or f"ID: {user_id}"
+                if user_info.get('username'):
+                    user_display = f"@{user_display}"
+                    
+                user_stats.append({
+                    'name': user_display,
+                    'rate': rate,
+                    'confirm': confirm_count,
+                    'reqs': total_reqs
+                })
+
+    except Exception as e:
+        log.error(f"Failed to get user stats data: {e}")
+        return "An error occurred while fetching user stats."
+
+    # Sort users by success rate, from highest to lowest
+    user_stats.sort(key=lambda x: x['rate'], reverse=True)
+    
+    rank = 1
+    for stats in user_stats:
+        lines.append(f"<b>{rank}.</b> {stats['name']}: <b>{stats['rate']:.1f}%</b> ({stats['confirm']} / {stats['reqs']})")
+        rank += 1
+        
+    return "\n".join(lines)
+
 
 async def _get_user_detail_text(user_id: int) -> str:
     user_info = state.get("user_names", {}).get(str(user_id), {})
@@ -1559,6 +1665,8 @@ def _get_commands_text() -> str:
 <b>--- Admin: Reports & Manual Actions ---</b>
 <code>report [today|yesterday|YYYY-MM-DD]</code>
 <code>owner report [today|yesterday|YYYY-MM-DD]</code>
+<code>user performance [day]</code> - See ranked list of users by customers added.
+<code>user stats [day]</code> - See user success rates.
 <code>performance @owner [day]</code> - See owner's customer stats.
 <code>remind user</code>
 <code>clear pending @item_or_number</code>
@@ -2166,6 +2274,18 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
             lines.append(f"- <b>{row['Owner']}</b>: {row['Customers total']} total ({row['Customers via Telegram']} usernames, {row['Customers via WhatsApp']} whatsapps)")
         return "\n".join(lines)
 
+    m = USER_PERFORMANCE_RX.match(text)
+    if m:
+        if not _has_permission(user, 'user performance'): return "You don't have permission to use this command."
+        target_day = _parse_report_day(m.group(1))
+        return await _get_user_performance_text(target_day)
+
+    m = USER_STATS_RX.match(text)
+    if m:
+        if not _has_permission(user, 'user stats'): return "You don't have permission to use this command."
+        target_day = _parse_report_day(m.group(1))
+        return await _get_user_stats_text(target_day)
+
     if COMMANDS_RX.match(text):
         command_list_text = _get_commands_text()
         return command_list_text
@@ -2407,6 +2527,54 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.error(f"Failed to send reminder/ban message to chat {r['chat_id']}: {e}")
 
+async def check_request_ratio_and_stop_whatsapp(context: ContextTypes.DEFAULT_TYPE):
+    """Checks the ratio of WA to Username requests and stops all WA if the ratio is too high."""
+    log.info("Running 40-minute check of request ratio...")
+    
+    now = datetime.now(TIMEZONE)
+    forty_minutes_ago = now - timedelta(minutes=40)
+    
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            wa_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM audit_log WHERE kind = 'whatsapp' AND action = 'issued' AND ts_local >= $1",
+                forty_minutes_ago
+            )
+            username_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM audit_log WHERE kind = 'username' AND action = 'issued' AND ts_local >= $1",
+                forty_minutes_ago
+            )
+    except Exception as e:
+        log.error(f"Failed to query audit log for request ratio check: {e}")
+        return
+
+    log.info(f"Request ratio check: {wa_count} WhatsApps, {username_count} Usernames in the last 40 minutes.")
+
+    if wa_count > username_count:
+        log.warning(f"WhatsApp requests ({wa_count}) exceeded username requests ({username_count}). Stopping all WhatsApp numbers.")
+        
+        changed = 0
+        async with db_lock:
+            for owner in OWNER_DATA:
+                for w_entry in owner.get("whatsapp", []):
+                    if not w_entry.get("disabled"):
+                        w_entry["disabled"] = True
+                        changed += 1
+            
+            if changed > 0:
+                await _rebuild_pools_preserving_rotation()
+                
+                notification_text = (
+                    f"⚠️ <b>Automatic Action</b> ⚠️\n\n"
+                    f"All WhatsApp numbers have been temporarily disabled because WhatsApp requests ({wa_count}) "
+                    f"have exceeded username requests ({username_count}) in the last 40 minutes.\n\n"
+                    f"An admin can re-enable them using the <code>open all whatsapp</code> or <code>open [number]</code> command."
+                )
+                try:
+                    await context.bot.send_message(chat_id=REQUEST_GROUP_ID, text=notification_text, parse_mode=ParseMode.HTML)
+                except Exception as e:
+                    log.error(f"Failed to send request ratio notification: {e}")
 
 
 async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
@@ -2784,6 +2952,7 @@ if __name__ == "__main__":
 
     if app.job_queue:
         app.job_queue.run_repeating(check_reminders, interval=60, first=60)
+        app.job_queue.run_repeating(check_request_ratio_and_stop_whatsapp, interval=2400, first=2400) # Every 40 mins
         # NEW JOB for clearing expired IDs, runs every hour
         app.job_queue.run_repeating(_clear_expired_app_ids, interval=3600, first=3600)
         reset_time = time(hour=5, minute=31, tzinfo=TIMEZONE)
@@ -2793,4 +2962,5 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
 
