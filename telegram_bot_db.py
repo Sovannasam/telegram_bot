@@ -235,7 +235,8 @@ COMMAND_PERMISSIONS = {
     'owner report', 'performance', 'remind user', 'clear pending', 'clear all pending',
     'list owners', 'list disabled', 'list owner', 'detail user', 'list banned', 'list admins',
     'list pending', 'data today', 'list enabled', 'add user', 'delete user',
-    'ban country', 'unban country', 'list country bans', 'user performance', 'user stats'
+    'ban country', 'unban country', 'list country bans', 'user performance', 'user stats',
+    'inventory', 'request stats'
 }
 
 async def load_admins():
@@ -933,6 +934,8 @@ UNBAN_COUNTRY_RX      = re.compile(r"^\s*unban\s+country\s+([a-zA-Z\s]+)\s+for\s
 LIST_COUNTRY_BANS_RX  = re.compile(r"^\s*list\s+country\s+bans(?:\s+@?(\S+))?\s*$", re.IGNORECASE)
 USER_PERFORMANCE_RX   = re.compile(r"^\s*user\s+performance(?:\s+(today|yesterday|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 USER_STATS_RX         = re.compile(r"^\s*user\s+stats(?:\s+(today|yesterday|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
+INVENTORY_RX          = re.compile(r"^\s*inventory\s*$", re.IGNORECASE)
+REQUEST_STATS_RX      = re.compile(r"^\s*request\s+stats\s*$", re.IGNORECASE)
 
 
 def _looks_like_phone(s: str) -> bool:
@@ -1667,6 +1670,7 @@ def _get_commands_text() -> str:
 <code>owner report [today|yesterday|YYYY-MM-DD]</code>
 <code>user performance [day]</code> - See ranked list of users by customers added.
 <code>user stats [day]</code> - See user success rates.
+<code>request stats</code> - See current request ratio for auto-shutdown.
 <code>performance @owner [day]</code> - See owner's customer stats.
 <code>remind user</code>
 <code>clear pending @item_or_number</code>
@@ -1680,6 +1684,7 @@ def _get_commands_text() -> str:
 <code>list enabled</code> - List all active owners.
 <code>list @owner</code>
 <code>detail @user</code> - See a user's daily stats.
+<code>inventory</code> - See total counts of active/paused items.
 
 <b>--- Super Admin ---</b>
 <code>add admin @user</code>
@@ -1690,6 +1695,71 @@ def _get_commands_text() -> str:
 <code>add user @user</code>
 <code>delete user @user</code>
 """
+
+async def _get_request_stats_text() -> str:
+    """Generates a real-time report on the request ratio for the last 60 minutes."""
+    now = datetime.now(TIMEZONE)
+    sixty_minutes_ago = now - timedelta(minutes=60)
+    
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            wa_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM audit_log WHERE kind = 'whatsapp' AND action = 'issued' AND ts_local >= $1",
+                sixty_minutes_ago
+            )
+            username_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM audit_log WHERE kind = 'username' AND action = 'issued' AND ts_local >= $1",
+                sixty_minutes_ago
+            )
+    except Exception as e:
+        log.error(f"Failed to query audit log for request stats: {e}")
+        return "Error fetching request stats from the database."
+
+    # Calculate time until next check (runs every hour on the hour)
+    minutes_until_next_check = 60 - now.minute
+    if minutes_until_next_check == 60: minutes_until_next_check = 0 # It just ran
+
+    lines = [f"<b>⏱️ Request Ratio Status (Last 60 mins)</b>"]
+    lines.append(f"<b>- Time Until Next Auto-Check:</b> {minutes_until_next_check} minutes")
+    lines.append("")
+    lines.append(f"<b>- Username Requests:</b> {username_count}")
+    lines.append(f"<b>- WhatsApp Requests:</b> {wa_count}")
+    lines.append("")
+
+    if wa_count > username_count:
+        status = "🔴 HIGH - WhatsApp numbers will be automatically stopped on the next check."
+    else:
+        status = "🟢 NORMAL - Ratio is stable."
+        
+    lines.append(f"<b>- Current Status:</b> {status}")
+    
+    return "\n".join(lines)
+
+
+def _get_inventory_text() -> str:
+    """Generates a summary of the total number of items in the bot."""
+    total_usernames = 0
+    active_usernames = 0
+    total_wa = 0
+    active_wa = 0
+
+    for owner_group in OWNER_DATA:
+        for entry in owner_group.get("entries", []):
+            total_usernames += 1
+            if not entry.get("disabled"):
+                active_usernames += 1
+        for wa_entry in owner_group.get("whatsapp", []):
+            total_wa += 1
+            if not wa_entry.get("disabled"):
+                active_wa += 1
+    
+    lines = ["<b>📋 Bot Inventory Summary</b>"]
+    lines.append(f"<b>- Usernames:</b> {active_usernames} active / {total_usernames} total")
+    lines.append(f"<b>- WhatsApp Numbers:</b> {active_wa} active / {total_wa} total")
+    
+    return "\n".join(lines)
+
 
 async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, update: Update) -> Optional[str]:
     user = update.effective_user
@@ -2285,6 +2355,14 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         if not _has_permission(user, 'user stats'): return "You don't have permission to use this command."
         target_day = _parse_report_day(m.group(1))
         return await _get_user_stats_text(target_day)
+        
+    if INVENTORY_RX.match(text):
+        if not _has_permission(user, 'inventory'): return "You don't have permission to use this command."
+        return _get_inventory_text()
+
+    if REQUEST_STATS_RX.match(text):
+        if not _has_permission(user, 'request stats'): return "You don't have permission to use this command."
+        return await _get_request_stats_text()
 
     if COMMANDS_RX.match(text):
         command_list_text = _get_commands_text()
@@ -2940,6 +3018,7 @@ async def post_shutdown(application: Application):
     """Runs once before the bot shuts down."""
     await close_db_pool()
 
+
 if __name__ == "__main__":
     app = (
         Application.builder()
@@ -2961,6 +3040,4 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
-
 
