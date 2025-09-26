@@ -40,7 +40,7 @@ def get_env_variable(var_name: str) -> str:
 BOT_TOKEN = get_env_variable("BOT_TOKEN")
 DATABASE_URL = get_env_variable("DATABASE_URL")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "excelmerge")  # telegram username (without @)
-WA_DAILY_LIMIT = int(os.getenv("WA_DAILY_LIMIT", "2"))       # max sends per number per logical day
+WA_DAILY_LIMIT = int(os.getenv("WA_DAILY_LIMIT", "2"))        # max sends per number per logical day
 REMINDER_DELAY_MINUTES = int(os.getenv("REMINDER_DELAY_MINUTES", "30")) # Delay for reminders
 USER_WHATSAPP_LIMIT = int(os.getenv("USER_WHATSAPP_LIMIT", "10"))
 USERNAME_THRESHOLD_FOR_BONUS = int(os.getenv("USERNAME_THRESHOLD_FOR_BONUS", "35"))
@@ -533,6 +533,8 @@ async def _get_user_activity(user_id: int) -> Tuple[int, int]:
         return (0, 0)
 
 async def _increment_user_activity(user_id: int, kind: str):
+    # This function correctly only increments the counts and is called only on a successful request.
+    # No changes are needed here as it aligns with the user's request.
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
@@ -628,7 +630,7 @@ async def _wa_inc_count(number_norm: str, day: date):
                 VALUES ($1, $2, 1, $3)
                 ON CONFLICT (day, number_norm)
                 DO UPDATE SET sent_count = wa_daily_usage.sent_count + 1,
-                                last_sent = EXCLUDED.last_sent
+                              last_sent = EXCLUDED.last_sent
             """, day, number_norm, datetime.now(TIMEZONE))
     except Exception as e:
         log.warning("Quota write failed: %s", e)
@@ -1697,30 +1699,31 @@ def _get_commands_text() -> str:
 """
 
 async def _get_request_stats_text() -> str:
-    """Generates a real-time report on the request ratio for the last 60 minutes."""
+    """Generates a real-time report on the request ratio for the last 30 minutes."""
+    # MODIFIED: Changed window from 60 to 30 minutes.
     now = datetime.now(TIMEZONE)
-    sixty_minutes_ago = now - timedelta(minutes=60)
+    thirty_minutes_ago = now - timedelta(minutes=30)
     
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
             wa_count = await conn.fetchval(
                 "SELECT COUNT(*) FROM audit_log WHERE kind = 'whatsapp' AND action = 'issued' AND ts_local >= $1",
-                sixty_minutes_ago
+                thirty_minutes_ago
             )
             username_count = await conn.fetchval(
                 "SELECT COUNT(*) FROM audit_log WHERE kind = 'username' AND action = 'issued' AND ts_local >= $1",
-                sixty_minutes_ago
+                thirty_minutes_ago
             )
     except Exception as e:
         log.error(f"Failed to query audit log for request stats: {e}")
         return "Error fetching request stats from the database."
 
-    # Calculate time until next check (runs every hour on the hour)
-    minutes_until_next_check = 60 - now.minute
-    if minutes_until_next_check == 60: minutes_until_next_check = 0 # It just ran
+    # MODIFIED: Changed window from 60 to 30 minutes.
+    minutes_until_next_check = 30 - (now.minute % 30)
+    if minutes_until_next_check == 30: minutes_until_next_check = 0 # It just ran
 
-    lines = [f"<b>⏱️ Request Ratio Status (Last 60 mins)</b>"]
+    lines = [f"<b>⏱️ Request Ratio Status (Last 30 mins)</b>"]
     lines.append(f"<b>- Time Until Next Auto-Check:</b> {minutes_until_next_check} minutes")
     lines.append("")
     lines.append(f"<b>- Username Requests:</b> {username_count}")
@@ -2607,27 +2610,28 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
 
 async def check_request_ratio_and_stop_whatsapp(context: ContextTypes.DEFAULT_TYPE):
     """Checks the ratio of WA to Username requests and stops all WA if the ratio is too high."""
-    log.info("Running 60-minute check of request ratio...")
+    # MODIFIED: Changed window from 60 to 30 minutes.
+    log.info("Running 30-minute check of request ratio...")
     
     now = datetime.now(TIMEZONE)
-    sixty_minutes_ago = now - timedelta(minutes=60)
+    thirty_minutes_ago = now - timedelta(minutes=30)
     
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
             wa_count = await conn.fetchval(
                 "SELECT COUNT(*) FROM audit_log WHERE kind = 'whatsapp' AND action = 'issued' AND ts_local >= $1",
-                sixty_minutes_ago
+                thirty_minutes_ago
             )
             username_count = await conn.fetchval(
                 "SELECT COUNT(*) FROM audit_log WHERE kind = 'username' AND action = 'issued' AND ts_local >= $1",
-                sixty_minutes_ago
+                thirty_minutes_ago
             )
     except Exception as e:
         log.error(f"Failed to query audit log for request ratio check: {e}")
         return
 
-    log.info(f"Request ratio check: {wa_count} WhatsApps, {username_count} Usernames in the last 60 minutes.")
+    log.info(f"Request ratio check: {wa_count} WhatsApps, {username_count} Usernames in the last 30 minutes.")
 
     if wa_count > username_count:
         log.warning(f"WhatsApp requests ({wa_count}) exceeded username requests ({username_count}). Stopping all WhatsApp numbers.")
@@ -2643,10 +2647,11 @@ async def check_request_ratio_and_stop_whatsapp(context: ContextTypes.DEFAULT_TY
             if changed > 0:
                 await _rebuild_pools_preserving_rotation()
                 
+                # MODIFIED: Changed notification text to reflect 30 minutes.
                 notification_text = (
                     f"⚠️ <b>Automatic Action</b> ⚠️\n\n"
                     f"All WhatsApp numbers have been temporarily disabled because WhatsApp requests ({wa_count}) "
-                    f"have exceeded username requests ({username_count}) in the last 60 minutes.\n\n"
+                    f"have exceeded username requests ({username_count}) in the last 30 minutes.\n\n"
                     f"An admin can re-enable them using the <code>open all whatsapp</code> or <code>open [number]</code> command."
                 )
                 try:
@@ -3030,7 +3035,8 @@ if __name__ == "__main__":
 
     if app.job_queue:
         app.job_queue.run_repeating(check_reminders, interval=60, first=60)
-        app.job_queue.run_repeating(check_request_ratio_and_stop_whatsapp, interval=3600, first=3600) # Every 60 mins
+        # MODIFIED: Changed the check interval from 60 minutes (3600s) to 30 minutes (1800s).
+        app.job_queue.run_repeating(check_request_ratio_and_stop_whatsapp, interval=1800, first=1800)
         # NEW JOB for clearing expired IDs, runs every hour
         app.job_queue.run_repeating(_clear_expired_app_ids, interval=3600, first=3600)
         reset_time = time(hour=5, minute=31, tzinfo=TIMEZONE)
@@ -3040,4 +3046,3 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
