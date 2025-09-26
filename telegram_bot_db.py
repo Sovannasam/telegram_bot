@@ -1699,13 +1699,10 @@ def _get_commands_text() -> str:
 """
 
 async def _get_request_stats_text() -> str:
-    """Generates a real-time report on the request ratio for the current 30-minute block."""
+    """Generates a real-time report on the request ratio for the current 60-minute block."""
     now = datetime.now(TIMEZONE)
-    # Use fixed 30-minute blocks (xx:00 to xx:30 and xx:30 to xx:00)
-    if now.minute < 30:
-        start_time = now.replace(minute=0, second=0, microsecond=0)
-    else:
-        start_time = now.replace(minute=30, second=0, microsecond=0)
+    # Use fixed 60-minute blocks (starting at the top of each hour)
+    start_time = now.replace(minute=0, second=0, microsecond=0)
 
     try:
         pool = await get_db_pool()
@@ -1722,7 +1719,7 @@ async def _get_request_stats_text() -> str:
         log.error(f"Failed to query audit log for request stats: {e}")
         return "Error fetching request stats from the database."
 
-    minutes_until_next_block = 30 - (now.minute % 30)
+    minutes_until_next_block = 60 - now.minute
     block_start_str = start_time.strftime('%I:%M %p')
 
     lines = [f"<b>⏱️ Request Ratio Status (Block starts {block_start_str})</b>"]
@@ -2620,20 +2617,15 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             log.error(f"Failed to send reminder/ban message to chat {r['chat_id']}: {e}")
 
 async def check_request_ratio_and_stop_whatsapp(context: ContextTypes.DEFAULT_TYPE):
-    """Checks the ratio of WA to Username requests for the previous 30-min block and stops all WA if the ratio is too high."""
-    log.info("Running 30-minute check of request ratio...")
+    """Checks the ratio of WA to Username requests for the previous 60-min block and stops all WA if the ratio is too high."""
+    log.info("Running 60-minute check of request ratio...")
     
     now = datetime.now(TIMEZONE)
     
-    # Determine the start and end of the 30-minute block that just concluded.
-    if now.minute < 30:
-        # We are in the 0-29 block (e.g., job runs at xx:00), so check the previous hour's 30-59 block.
-        end_time = now.replace(minute=0, second=0, microsecond=0)
-        start_time = end_time - timedelta(minutes=30)
-    else:
-        # We are in the 30-59 block (e.g., job runs at xx:30), so check the first half of the current hour.
-        end_time = now.replace(minute=30, second=0, microsecond=0)
-        start_time = end_time - timedelta(minutes=30)
+    # Determine the start and end of the 60-minute block that just concluded.
+    # Check the previous full hour
+    end_time = now.replace(minute=0, second=0, microsecond=0)
+    start_time = end_time - timedelta(minutes=60)
     
     try:
         pool = await get_db_pool()
@@ -2670,7 +2662,7 @@ async def check_request_ratio_and_stop_whatsapp(context: ContextTypes.DEFAULT_TY
                 notification_text = (
                     f"⚠️ <b>Automatic Action</b> ⚠️\n\n"
                     f"All WhatsApp numbers have been temporarily disabled because WhatsApp requests ({wa_count}) "
-                    f"exceeded username requests ({username_count}) in the last 30-minute block.\n\n"
+                    f"exceeded username requests ({username_count}) in the last 60-minute block.\n\n"
                     f"An admin can re-enable them using the <code>open all whatsapp</code> or <code>open [number]</code> command."
                 )
                 try:
@@ -3054,8 +3046,8 @@ if __name__ == "__main__":
 
     if app.job_queue:
         app.job_queue.run_repeating(check_reminders, interval=60, first=60)
-        # MODIFIED: Changed the check interval from 60 minutes (3600s) to 30 minutes (1800s).
-        app.job_queue.run_repeating(check_request_ratio_and_stop_whatsapp, interval=1800, first=1800)
+        # MODIFIED: Changed the check interval from 30 minutes (1800s) to 60 minutes (3600s).
+        app.job_queue.run_repeating(check_request_ratio_and_stop_whatsapp, interval=3600, first=3600)
         # NEW JOB for clearing expired IDs, runs every hour
         app.job_queue.run_repeating(_clear_expired_app_ids, interval=3600, first=3600)
         reset_time = time(hour=5, minute=31, tzinfo=TIMEZONE)
