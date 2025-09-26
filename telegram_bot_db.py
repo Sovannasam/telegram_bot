@@ -2529,27 +2529,27 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
 
 async def check_request_ratio_and_stop_whatsapp(context: ContextTypes.DEFAULT_TYPE):
     """Checks the ratio of WA to Username requests and stops all WA if the ratio is too high."""
-    log.info("Running 40-minute check of request ratio...")
+    log.info("Running 60-minute check of request ratio...")
     
     now = datetime.now(TIMEZONE)
-    forty_minutes_ago = now - timedelta(minutes=40)
+    sixty_minutes_ago = now - timedelta(minutes=60)
     
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
             wa_count = await conn.fetchval(
                 "SELECT COUNT(*) FROM audit_log WHERE kind = 'whatsapp' AND action = 'issued' AND ts_local >= $1",
-                forty_minutes_ago
+                sixty_minutes_ago
             )
             username_count = await conn.fetchval(
                 "SELECT COUNT(*) FROM audit_log WHERE kind = 'username' AND action = 'issued' AND ts_local >= $1",
-                forty_minutes_ago
+                sixty_minutes_ago
             )
     except Exception as e:
         log.error(f"Failed to query audit log for request ratio check: {e}")
         return
 
-    log.info(f"Request ratio check: {wa_count} WhatsApps, {username_count} Usernames in the last 40 minutes.")
+    log.info(f"Request ratio check: {wa_count} WhatsApps, {username_count} Usernames in the last 60 minutes.")
 
     if wa_count > username_count:
         log.warning(f"WhatsApp requests ({wa_count}) exceeded username requests ({username_count}). Stopping all WhatsApp numbers.")
@@ -2568,7 +2568,7 @@ async def check_request_ratio_and_stop_whatsapp(context: ContextTypes.DEFAULT_TY
                 notification_text = (
                     f"⚠️ <b>Automatic Action</b> ⚠️\n\n"
                     f"All WhatsApp numbers have been temporarily disabled because WhatsApp requests ({wa_count}) "
-                    f"have exceeded username requests ({username_count}) in the last 40 minutes.\n\n"
+                    f"have exceeded username requests ({username_count}) in the last 60 minutes.\n\n"
                     f"An admin can re-enable them using the <code>open all whatsapp</code> or <code>open [number]</code> command."
                 )
                 try:
@@ -2940,7 +2940,6 @@ async def post_shutdown(application: Application):
     """Runs once before the bot shuts down."""
     await close_db_pool()
 
-
 if __name__ == "__main__":
     app = (
         Application.builder()
@@ -2952,7 +2951,7 @@ if __name__ == "__main__":
 
     if app.job_queue:
         app.job_queue.run_repeating(check_reminders, interval=60, first=60)
-        app.job_queue.run_repeating(check_request_ratio_and_stop_whatsapp, interval=2400, first=2400) # Every 40 mins
+        app.job_queue.run_repeating(check_request_ratio_and_stop_whatsapp, interval=3600, first=3600) # Every 60 mins
         # NEW JOB for clearing expired IDs, runs every hour
         app.job_queue.run_repeating(_clear_expired_app_ids, interval=3600, first=3600)
         reset_time = time(hour=5, minute=31, tzinfo=TIMEZONE)
@@ -2962,5 +2961,6 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
 
 
