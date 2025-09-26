@@ -1699,39 +1699,41 @@ def _get_commands_text() -> str:
 """
 
 async def _get_request_stats_text() -> str:
-    """Generates a real-time report on the request ratio for the last 30 minutes."""
-    # MODIFIED: Changed window from 60 to 30 minutes.
+    """Generates a real-time report on the request ratio for the current 30-minute block."""
     now = datetime.now(TIMEZONE)
-    thirty_minutes_ago = now - timedelta(minutes=30)
-    
+    # Use fixed 30-minute blocks (xx:00 to xx:30 and xx:30 to xx:00)
+    if now.minute < 30:
+        start_time = now.replace(minute=0, second=0, microsecond=0)
+    else:
+        start_time = now.replace(minute=30, second=0, microsecond=0)
+
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
             wa_count = await conn.fetchval(
                 "SELECT COUNT(*) FROM audit_log WHERE kind = 'whatsapp' AND action = 'issued' AND ts_local >= $1",
-                thirty_minutes_ago
+                start_time
             )
             username_count = await conn.fetchval(
                 "SELECT COUNT(*) FROM audit_log WHERE kind = 'username' AND action = 'issued' AND ts_local >= $1",
-                thirty_minutes_ago
+                start_time
             )
     except Exception as e:
         log.error(f"Failed to query audit log for request stats: {e}")
         return "Error fetching request stats from the database."
 
-    # MODIFIED: Changed window from 60 to 30 minutes.
-    minutes_until_next_check = 30 - (now.minute % 30)
-    if minutes_until_next_check == 30: minutes_until_next_check = 0 # It just ran
+    minutes_until_next_block = 30 - (now.minute % 30)
+    block_start_str = start_time.strftime('%I:%M %p')
 
-    lines = [f"<b>⏱️ Request Ratio Status (Last 30 mins)</b>"]
-    lines.append(f"<b>- Time Until Next Auto-Check:</b> {minutes_until_next_check} minutes")
+    lines = [f"<b>⏱️ Request Ratio Status (Block starts {block_start_str})</b>"]
+    lines.append(f"<b>- Time Until Next Block:</b> {minutes_until_next_block} minutes")
     lines.append("")
     lines.append(f"<b>- Username Requests:</b> {username_count}")
     lines.append(f"<b>- WhatsApp Requests:</b> {wa_count}")
     lines.append("")
 
     if wa_count > username_count:
-        status = "🔴 HIGH - WhatsApp numbers will be automatically stopped on the next check."
+        status = "🔴 HIGH - WhatsApp numbers will be automatically stopped if this ratio persists."
     else:
         status = "🟢 NORMAL - Ratio is stable."
         
@@ -2376,35 +2378,44 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         if not _has_permission(user, 'list pending'):
             return "You don't have permission to use this command."
 
-        pending_apps = _issued_bucket("app_id")
-        if not pending_apps:
-            return "No pending App IDs found."
-
-        lines = ["<b>⏳ Pending App IDs by User:</b>"]
+        lines = ["<b>⏳ All Pending Items by User:</b>"]
         total_pending = 0
-        user_lines = []
 
-        for user_id_str, items in sorted(pending_apps.items()):
-            if not items:
+        # Check all kinds of pending items
+        for kind, label in [("username", "Usernames"), ("whatsapp", "WhatsApps"), ("app_id", "App IDs")]:
+            pending_bucket = _issued_bucket(kind)
+            if not pending_bucket:
                 continue
 
-            user_id = int(user_id_str)
-            user_info = state.get("user_names", {}).get(user_id_str, {})
-            user_display = user_info.get('username') or user_info.get('first_name') or f"ID {user_id}"
-            if user_info.get('username'):
-                user_display = f"@{user_display}"
+            kind_lines = []
+            kind_total = 0
 
-            user_app_ids = [f"  - <code>{item.get('value')}</code>" for item in items]
-            if user_app_ids:
-                user_lines.append(f"\n<b>{user_display}:</b>")
-                user_lines.extend(user_app_ids)
-                total_pending += len(user_app_ids)
+            for user_id_str, items in sorted(pending_bucket.items()):
+                if not items:
+                    continue
+
+                user_id = int(user_id_str)
+                user_info = state.get("user_names", {}).get(user_id_str, {})
+                user_display = user_info.get('username') or user_info.get('first_name') or f"ID {user_id}"
+                if user_info.get('username'):
+                    user_display = f"@{user_display}"
+                
+                user_item_lines = [f"  - <code>{item.get('value')}</code>" for item in items if item.get('value')]
+                
+                if user_item_lines:
+                    kind_lines.append(f"\n<b>{user_display}:</b>")
+                    kind_lines.extend(user_item_lines)
+                    kind_total += len(user_item_lines)
+            
+            if kind_total > 0:
+                lines.append(f"\n\n<b>--- {label} ({kind_total}) ---</b>")
+                lines.extend(kind_lines)
+                total_pending += kind_total
 
         if total_pending == 0:
-             return "No pending App IDs found."
+            return "No pending items found."
 
-        lines.insert(1, f"<b>Total Pending:</b> {total_pending}")
-        lines.extend(user_lines)
+        lines.insert(1, f"<b>Total Pending Items:</b> {total_pending}")
         return "\n".join(lines)
 
     m = DATA_TODAY_RX.match(text)
@@ -2609,32 +2620,41 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             log.error(f"Failed to send reminder/ban message to chat {r['chat_id']}: {e}")
 
 async def check_request_ratio_and_stop_whatsapp(context: ContextTypes.DEFAULT_TYPE):
-    """Checks the ratio of WA to Username requests and stops all WA if the ratio is too high."""
-    # MODIFIED: Changed window from 60 to 30 minutes.
+    """Checks the ratio of WA to Username requests for the previous 30-min block and stops all WA if the ratio is too high."""
     log.info("Running 30-minute check of request ratio...")
     
     now = datetime.now(TIMEZONE)
-    thirty_minutes_ago = now - timedelta(minutes=30)
+    
+    # Determine the start and end of the 30-minute block that just concluded.
+    if now.minute < 30:
+        # We are in the 0-29 block (e.g., job runs at xx:00), so check the previous hour's 30-59 block.
+        end_time = now.replace(minute=0, second=0, microsecond=0)
+        start_time = end_time - timedelta(minutes=30)
+    else:
+        # We are in the 30-59 block (e.g., job runs at xx:30), so check the first half of the current hour.
+        end_time = now.replace(minute=30, second=0, microsecond=0)
+        start_time = end_time - timedelta(minutes=30)
     
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
+            # Query for the specific, fixed block
             wa_count = await conn.fetchval(
-                "SELECT COUNT(*) FROM audit_log WHERE kind = 'whatsapp' AND action = 'issued' AND ts_local >= $1",
-                thirty_minutes_ago
+                "SELECT COUNT(*) FROM audit_log WHERE kind = 'whatsapp' AND action = 'issued' AND ts_local >= $1 AND ts_local < $2",
+                start_time, end_time
             )
             username_count = await conn.fetchval(
-                "SELECT COUNT(*) FROM audit_log WHERE kind = 'username' AND action = 'issued' AND ts_local >= $1",
-                thirty_minutes_ago
+                "SELECT COUNT(*) FROM audit_log WHERE kind = 'username' AND action = 'issued' AND ts_local >= $1 AND ts_local < $2",
+                start_time, end_time
             )
     except Exception as e:
         log.error(f"Failed to query audit log for request ratio check: {e}")
         return
 
-    log.info(f"Request ratio check: {wa_count} WhatsApps, {username_count} Usernames in the last 30 minutes.")
+    log.info(f"Request ratio check for block {start_time.strftime('%H:%M')}-{end_time.strftime('%H:%M')}: {wa_count} WhatsApps, {username_count} Usernames.")
 
     if wa_count > username_count:
-        log.warning(f"WhatsApp requests ({wa_count}) exceeded username requests ({username_count}). Stopping all WhatsApp numbers.")
+        log.warning(f"WhatsApp requests ({wa_count}) exceeded username requests ({username_count}) in the last block. Stopping all WhatsApp numbers.")
         
         changed = 0
         async with db_lock:
@@ -2647,11 +2667,10 @@ async def check_request_ratio_and_stop_whatsapp(context: ContextTypes.DEFAULT_TY
             if changed > 0:
                 await _rebuild_pools_preserving_rotation()
                 
-                # MODIFIED: Changed notification text to reflect 30 minutes.
                 notification_text = (
                     f"⚠️ <b>Automatic Action</b> ⚠️\n\n"
                     f"All WhatsApp numbers have been temporarily disabled because WhatsApp requests ({wa_count}) "
-                    f"have exceeded username requests ({username_count}) in the last 30 minutes.\n\n"
+                    f"exceeded username requests ({username_count}) in the last 30-minute block.\n\n"
                     f"An admin can re-enable them using the <code>open all whatsapp</code> or <code>open [number]</code> command."
                 )
                 try:
