@@ -744,7 +744,7 @@ async def _get_bulk_owner_performance(owner_names: List[str], day: date) -> Dict
         log.warning(f"Bulk owner performance read failed: {e}")
         return performance_map
 
-async def _get_next_owner_by_performance(pool: List[Dict], rr_idx_key: str) -> int:
+async def _get_next_owner_by_performance(pool: List[Dict], rr_idx_key: str) -> Optional[int]:
     """
     Selects the next owner using a tiered approach based on performance,
     now with a time-based cooldown after hitting the catch-up limit.
@@ -804,8 +804,8 @@ async def _get_next_owner_by_performance(pool: List[Dict], rr_idx_key: str) -> i
                     return next_idx
 
     # Fallback: If no one is eligible in any tier (e.g., everyone is on cooldown)
-    log.warning("No eligible owners found in any performance tier. Falling back to simple round-robin as a last resort.")
-    return current_rr_idx % len(pool) if pool else 0
+    log.warning("No eligible owners found in any performance tier. All active owners may be on cooldown.")
+    return None
 
 
 async def _next_from_username_pool() -> Optional[Dict[str, str]]:
@@ -826,6 +826,10 @@ async def _next_from_username_pool() -> Optional[Dict[str, str]]:
     if not USERNAME_POOL: return None
 
     owner_idx = await _get_next_owner_by_performance(USERNAME_POOL, "username_owner_idx")
+
+    if owner_idx is None:
+        log.warning("Could not find an eligible owner for username request. All may be on cooldown.")
+        return None
 
     # Start searching from the selected owner's index
     for i in range(len(USERNAME_POOL)):
@@ -863,6 +867,10 @@ async def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
 
     owner_idx = await _get_next_owner_by_performance(WHATSAPP_POOL, "wa_owner_idx")
 
+    if owner_idx is None:
+        log.warning("Could not find an eligible owner for WhatsApp request. All may be on cooldown.")
+        return None
+
     # Start searching from the selected owner's index
     for i in range(len(WHATSAPP_POOL)):
         current_idx = (owner_idx + i) % len(WHATSAPP_POOL)
@@ -890,7 +898,6 @@ WHO_USING_REGEX = re.compile(
 )
 NEED_USERNAME_RX = re.compile(r"^\s*i\s*need\s*(?:user\s*name|username)\s*$", re.IGNORECASE)
 NEED_WHATSAPP_RX = re.compile(r"^\s*i\s*need\s*(?:id\s*)?whats?app\s*$", re.IGNORECASE)
-APP_ID_RX = re.compile(r"\b(app|add|id)\b.*?\@([^\s]+)", re.IGNORECASE)
 EXTRACT_USERNAMES_RX = re.compile(r'@([a-zA-Z0-9_]{4,})')
 EXTRACT_PHONES_RX = re.compile(r'(\+?\d[\d\s\-()]{8,}\d)')
 
@@ -938,6 +945,8 @@ USER_PERFORMANCE_RX   = re.compile(r"^\s*user\s+performance(?:\s+(today|yesterda
 USER_STATS_RX         = re.compile(r"^\s*user\s+stats(?:\s+(today|yesterday|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 INVENTORY_RX          = re.compile(r"^\s*inventory\s*$", re.IGNORECASE)
 REQUEST_STATS_RX      = re.compile(r"^\s*request\s+stats\s*$", re.IGNORECASE)
+TRANSFER_OWNER_RX     = re.compile(r"^\s*transfer\s+owner\s+@?(\S+)\s+to\s+@?(\S+)\s*$", re.IGNORECASE)
+RESET_COOLDOWN_RX     = re.compile(r"^\s*reset\s+cooldown\s+@?(\S+)\s*$", re.IGNORECASE)
 
 
 def _looks_like_phone(s: str) -> bool:
@@ -1696,6 +1705,8 @@ def _get_commands_text() -> str:
 <code>list admins</code>
 <code>add user @user</code>
 <code>delete user @user</code>
+<code>transfer owner @TargetOwner to @NewManager</code>
+<code>reset cooldown @owner</code>
 """
 
 async def _get_request_stats_text() -> str:
@@ -1852,6 +1863,53 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
             for name, perms in ADMIN_PERMISSIONS.items():
                 lines.append(f"- <code>{name}</code>: {', '.join(perms) or 'No permissions'}")
             return "\n".join(lines)
+            
+        m_transfer = TRANSFER_OWNER_RX.match(text)
+        if m_transfer:
+            target_owner_name, new_manager_name = m_transfer.groups()
+            target_owner_norm = _norm_owner_name(target_owner_name)
+            new_manager_norm = _norm_owner_name(new_manager_name)
+
+            if target_owner_norm == new_manager_norm:
+                return "Cannot transfer an owner to themselves."
+
+            target_owner_group = _find_owner_group(target_owner_norm)
+            if not target_owner_group:
+                return f"Target owner '@{target_owner_name}' not found."
+
+            # Check if the new manager exists as an owner
+            new_manager_group = _find_owner_group(new_manager_norm)
+            if not new_manager_group:
+                return f"New manager '@{new_manager_name}' is not a valid owner."
+
+            target_owner_group['managed_by'] = new_manager_norm
+            await _rebuild_pools_preserving_rotation() # This saves the directory
+            return f"Control of owner '@{target_owner_name}' has been transferred to '@{new_manager_name}'."
+
+        m_reset_cooldown = RESET_COOLDOWN_RX.match(text)
+        if m_reset_cooldown:
+            owner_name = m_reset_cooldown.group(1)
+            owner_norm = _norm_owner_name(owner_name)
+
+            owner_group = _find_owner_group(owner_norm)
+            if not owner_group:
+                return f"Owner '@{owner_name}' not found."
+
+            catch_up_cooldowns = state.setdefault("catch_up_cooldowns", {})
+            catch_up_assignments = state.setdefault("catch_up_assignments", {})
+
+            if owner_norm not in catch_up_cooldowns:
+                return f"Owner '@{owner_name}' is not currently on an automatic cooldown."
+
+            # Remove from cooldown and reset assignment count
+            del catch_up_cooldowns[owner_norm]
+            if owner_norm in catch_up_assignments:
+                catch_up_assignments[owner_norm] = 0
+            
+            await save_state()
+            log.info(f"Super admin manually reset the automatic cooldown for owner '{owner_norm}'.")
+            return f"✅ The 60-minute automatic cooldown for owner '@{owner_name}' has been reset. They are now eligible to receive customers again."
+
 
     # Regular Admin Commands (with permission checks)
     m = TAKE_CUSTOMER_RX.match(text)
@@ -2768,7 +2826,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if chat_id == CONFIRMATION_GROUP_ID:
             if '+1' in text:
-                match = re.search(r'@([^\s]+)', text)
+                match = re.search(r'\+1\s+@([^\s]+)', text)
                 if match:
                     app_id_confirmed_raw = f"@{match.group(1)}"
                     found_and_counted = False
@@ -2809,6 +2867,40 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         elif chat_id == CLEARING_GROUP_ID:
+            # --- NEW: Strict format validation ---
+            required_labels = ['Name:', 'Age:', 'work:', 'from:', 'State :', 'App :']
+            text_lower = text.lower()
+            rejection_template = """<b>Please use the correct format:</b>
+<pre>
+Name: [Your Name]
+Age: [Your Age]
+work: [Your Work]
+from: [Your Country]
+State : [Your State]
+App : [App Name]  ID: @[AppID]
+</pre>"""
+
+            # 1. Check for all required labels
+            if not all(label.lower() in text_lower for label in required_labels):
+                rejection_reason = "Your message is missing one or more required fields (Name, Age, work, from, State, App)."
+                await msg.reply_html(
+                    f"{mention_user_html(uid)}, your submission was rejected.\n<b>Reason:</b> {rejection_reason}\n\n{rejection_template}"
+                )
+                log.warning(f"Rejected post from user {uid} due to missing fields.")
+                return
+
+            # 2. Check for the App ID format specifically and extract it
+            app_id_match = re.search(r"App\s*:.*ID\s*:\s*@([a-zA-Z0-9_]{4,})", text, re.IGNORECASE | re.DOTALL)
+            if not app_id_match:
+                rejection_reason = "The 'App' line must follow the format 'App : [App Name] ID: @[AppID]'."
+                await msg.reply_html(
+                    f"{mention_user_html(uid)}, your submission was rejected.\n<b>Reason:</b> {rejection_reason}\n\n{rejection_template}"
+                )
+                log.warning(f"Rejected post from user {uid} due to incorrect App ID format.")
+                return
+
+            # --- Validation passed, continue with existing logic ---
+
             # Find any pending items mentioned in the message
             pending_usernames = {item['value'] for item in _issued_bucket("username").get(str(uid), [])}
             pending_whatsapps = {item['value'] for item in _issued_bucket("whatsapp").get(str(uid), [])}
@@ -2860,61 +2952,57 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
             # --- From this point, the post is considered valid ---
-
-            # Find a new App ID in the message
-            app_id_match = APP_ID_RX.search(text)
             
             # Logic to link a new App ID to a source (explicitly or implicitly)
-            if app_id_match:
-                app_id = f"@{app_id_match.group(2)}"
-                source_item_to_clear, source_kind = None, None
+            app_id = f"@{app_id_match.group(1)}" # Group 1 is the app id from the new regex
+            source_item_to_clear, source_kind = None, None
 
-                # Priority 1: Link to an item explicitly mentioned in this message
-                if values_found_in_message:
-                    value = next(iter(values_found_in_message))
-                    kind = "whatsapp" if _looks_like_phone(value) else "username"
-                    for item in _issued_bucket(kind).get(str(uid), []):
-                        if item.get("value") == value:
-                            source_item_to_clear, source_kind = item, kind
-                            break
-                # Priority 2 (Fallback): Link to the most recently issued item for this user
-                else:
-                    last_item, last_ts = None, datetime.min.replace(tzinfo=TIMEZONE)
-                    for kind in ("username", "whatsapp"):
-                        user_items = _issued_bucket(kind).get(str(uid), [])
-                        if user_items:
-                            latest_in_kind = user_items[-1]
-                            item_ts = datetime.fromisoformat(latest_in_kind["ts"])
-                            if item_ts > last_ts:
-                                last_ts = item_ts
-                                last_item = latest_in_kind
-                                last_item['kind'] = kind # Store kind for later
-                    if last_item:
-                        source_item_to_clear, source_kind = last_item, last_item['kind']
+            # Priority 1: Link to an item explicitly mentioned in this message
+            if values_found_in_message:
+                value = next(iter(values_found_in_message))
+                kind = "whatsapp" if _looks_like_phone(value) else "username"
+                for item in _issued_bucket(kind).get(str(uid), []):
+                    if item.get("value") == value:
+                        source_item_to_clear, source_kind = item, kind
+                        break
+            # Priority 2 (Fallback): Link to the most recently issued item for this user
+            else:
+                last_item, last_ts = None, datetime.min.replace(tzinfo=TIMEZONE)
+                for kind in ("username", "whatsapp"):
+                    user_items = _issued_bucket(kind).get(str(uid), [])
+                    if user_items:
+                        latest_in_kind = user_items[-1]
+                        item_ts = datetime.fromisoformat(latest_in_kind["ts"])
+                        if item_ts > last_ts:
+                            last_ts = item_ts
+                            last_item = latest_in_kind
+                            last_item['kind'] = kind # Store kind for later
+                if last_item:
+                    source_item_to_clear, source_kind = last_item, last_item['kind']
 
 
-                # If we found a source item, log the new App ID and clear the source
-                if source_item_to_clear and source_kind:
-                    context_data = {
-                        "source_owner": source_item_to_clear.get("owner"),
-                        "source_kind": source_kind
-                    }
-                    value_to_clear = source_item_to_clear.get("value")
-                    await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
-                    await _log_event("app_id", "issued", update, app_id, owner=context_data.get("source_owner", ""))
-                    log.info(f"Recorded App ID '{app_id}' for user {uid}, linked to {source_kind} '{value_to_clear}'")
-                    if await _clear_one_issued(uid, source_kind, value_to_clear):
-                        await _log_event(source_kind, "cleared", update, value_to_clear)
-                        log.info(f"Auto-cleared pending {source_kind} for user {uid}: {value_to_clear}")
-                
-                else:
-                    # Treat unlinked App IDs as valid entries, storing them for later confirmation
-                    context_data = {"source_owner": "unknown", "source_kind": "app_id"}
-                    await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
-                    await _log_event("app_id", "issued", update, app_id)
-                    log.info(
-                        f"Recorded App ID '{app_id}' for user {uid} without a source item"
-                    )
+            # If we found a source item, log the new App ID and clear the source
+            if source_item_to_clear and source_kind:
+                context_data = {
+                    "source_owner": source_item_to_clear.get("owner"),
+                    "source_kind": source_kind
+                }
+                value_to_clear = source_item_to_clear.get("value")
+                await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
+                await _log_event("app_id", "issued", update, app_id, owner=context_data.get("source_owner", ""))
+                log.info(f"Recorded App ID '{app_id}' for user {uid}, linked to {source_kind} '{value_to_clear}'")
+                if await _clear_one_issued(uid, source_kind, value_to_clear):
+                    await _log_event(source_kind, "cleared", update, value_to_clear)
+                    log.info(f"Auto-cleared pending {source_kind} for user {uid}: {value_to_clear}")
+            
+            else:
+                # Treat unlinked App IDs as valid entries, storing them for later confirmation
+                context_data = {"source_owner": "unknown", "source_kind": "app_id"}
+                await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
+                await _log_event("app_id", "issued", update, app_id)
+                log.info(
+                    f"Recorded App ID '{app_id}' for user {uid} without a source item"
+                )
             return # End of processing for this group
 
         elif chat_id == REQUEST_GROUP_ID:
