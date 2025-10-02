@@ -2888,7 +2888,7 @@ async def post_shutdown(application: Application):
     await close_db_pool()
 
 
-async def main():
+def main() -> None:
     """Start the bot."""
     app = (
         Application.builder()
@@ -2908,9 +2908,9 @@ async def main():
     app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.ALL, on_message))
 
     log.info("Bot is starting...")
-    await app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
 
