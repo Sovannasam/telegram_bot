@@ -1,18 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Revised Telegram Bot Script.
-
-This version includes critical fixes for performance, logical errors, and stability.
-- Concurrency: Fine-grained locks have been added to prevent race conditions.
-- Efficiency: Optimized database queries for report generation.
-- Logic: Corrected ambiguous logic for clearing pending user items and fixed duplicate message bug.
-- Stability: Added comprehensive error handling for message sending and filters.
-- Readability: Refactored the main message handler into smaller functions.
-- NEW: Added handler for owners to clear pending items by replying to the bot.
-"""
-
 import os
 import json
 import asyncio
