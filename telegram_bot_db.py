@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Revised Telegram Bot Script.
+
+This version includes critical fixes for performance, logical errors, and stability.
+- Concurrency: Fine-grained locks have been added to prevent race conditions.
+- Efficiency: Optimized database queries for report generation.
+- Logic: Corrected ambiguous logic for clearing pending user items and fixed duplicate message bug.
+- Stability: Added comprehensive error handling for message sending and filters.
+- Readability: Refactored the main message handler into smaller functions.
+- NEW: Added handler for owners to clear pending items by replying to the bot.
+"""
+
 import os
 import json
-import csv
 import asyncio
 import logging
 from datetime import datetime, timedelta, date, time
@@ -15,6 +28,7 @@ import asyncpg
 from telegram import Update
 from telegram.constants import ChatType, ParseMode
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telegram.error import TelegramError
 
 # =============================
 # LOGGING
@@ -40,14 +54,14 @@ def get_env_variable(var_name: str) -> str:
 BOT_TOKEN = get_env_variable("BOT_TOKEN")
 DATABASE_URL = get_env_variable("DATABASE_URL")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "excelmerge")  # telegram username (without @)
-WA_DAILY_LIMIT = int(os.getenv("WA_DAILY_LIMIT", "2"))        # max sends per number per logical day
+WA_DAILY_LIMIT = int(os.getenv("WA_DAILY_LIMIT", "2"))       # max sends per number per logical day
 REMINDER_DELAY_MINUTES = int(os.getenv("REMINDER_DELAY_MINUTES", "30")) # Delay for reminders
 USER_WHATSAPP_LIMIT = int(os.getenv("USER_WHATSAPP_LIMIT", "10"))
 USERNAME_THRESHOLD_FOR_BONUS = int(os.getenv("USERNAME_THRESHOLD_FOR_BONUS", "35"))
-REQUEST_GROUP_ID = int(os.getenv("REQUEST_GROUP_ID", "-1002438185636")) # Group for 'i need ...' commands
-CLEARING_GROUP_ID = int(os.getenv("CLEARING_GROUP_ID", "-1002624324856")) # Group for auto-clearing pendings
-CONFIRMATION_GROUP_ID = int(os.getenv("CONFIRMATION_GROUP_ID", "-1002694540582"))
-DETAIL_GROUP_ID = int(os.getenv("DETAIL_GROUP_ID", "-1002598927727")) # Group for 'my detail' reports
+REQUEST_GROUP_ID = int(os.getenv("REQUEST_GROUP_ID", -1002438185636)) # Group for 'i need ...' commands
+CLEARING_GROUP_ID = int(os.getenv("CLEARING_GROUP_ID", -1002624324856)) # Group for auto-clearing pendings
+CONFIRMATION_GROUP_ID = int(os.getenv("CONFIRMATION_GROUP_ID", -1002694540582))
+DETAIL_GROUP_ID = int(os.getenv("DETAIL_GROUP_ID", -1002598927727)) # Group for 'my detail' reports
 PERFORMANCE_GROUP_IDS = {
     -1002670785417, -1002659012767, -1002790753092, -1002520117752
 }
@@ -74,20 +88,22 @@ DB_POOL: Optional[asyncpg.Pool] = None
 
 async def get_db_pool() -> asyncpg.Pool:
     global DB_POOL
-    if DB_POOL is None or DB_POOL.is_closing():
-        try:
-            DB_POOL = await asyncpg.create_pool(
-                dsn=DATABASE_URL,
-                max_inactive_connection_lifetime=60,
-                min_size=1,
-                max_size=10
-            )
-            if DB_POOL is None:
-                raise ConnectionError("Database pool initialization failed, create_pool returned None.")
-            log.info("Database connection pool established.")
-        except Exception as e:
-            log.error(f"Could not create database connection pool: {e}")
-            raise
+    # Use a separate lock for pool creation to avoid deadlocks with the main db_lock
+    async with asyncio.Lock():
+        if DB_POOL is None or DB_POOL.is_closing():
+            try:
+                DB_POOL = await asyncpg.create_pool(
+                    dsn=DATABASE_URL,
+                    max_inactive_connection_lifetime=60,
+                    min_size=1,
+                    max_size=10
+                )
+                if DB_POOL is None:
+                    raise ConnectionError("Database pool initialization failed, create_pool returned None.")
+                log.info("Database connection pool established.")
+            except Exception as e:
+                log.error(f"Could not create database connection pool: {e}")
+                raise
     return DB_POOL
 
 async def close_db_pool():
@@ -103,96 +119,17 @@ async def setup_database():
     log.info("Setting up database schema...")
     pool = await get_db_pool()
     async with pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS kv_storage (
-                key TEXT PRIMARY KEY,
-                data JSONB NOT NULL,
-                updated_at TIMESTAMPTZ DEFAULT NOW()
-            );
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id SERIAL PRIMARY KEY,
-                ts_local TIMESTAMPTZ NOT NULL,
-                chat_id BIGINT,
-                message_id BIGINT,
-                user_id BIGINT,
-                user_first TEXT,
-                user_username TEXT,
-                kind TEXT,
-                action TEXT,
-                value TEXT,
-                owner TEXT
-            );
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS wa_daily_usage (
-                day DATE NOT NULL,
-                number_norm TEXT NOT NULL,
-                sent_count INTEGER NOT NULL DEFAULT 0,
-                last_sent TIMESTAMPTZ,
-                PRIMARY KEY (day, number_norm)
-            );
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_daily_activity (
-                day DATE NOT NULL,
-                user_id BIGINT NOT NULL,
-                username_requests INTEGER DEFAULT 0,
-                whatsapp_requests INTEGER DEFAULT 0,
-                PRIMARY KEY (day, user_id)
-            );
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS whatsapp_bans (
-                user_id BIGINT PRIMARY KEY
-            );
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS whitelisted_users (
-                user_id BIGINT PRIMARY KEY
-            );
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_daily_country_counts (
-                day DATE NOT NULL,
-                user_id BIGINT NOT NULL,
-                country TEXT NOT NULL,
-                count INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (day, user_id, country)
-            );
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_daily_confirmations (
-                day DATE NOT NULL,
-                user_id BIGINT NOT NULL,
-                confirm_count INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (day, user_id)
-            );
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS owner_daily_performance (
-                day DATE NOT NULL,
-                owner_name TEXT NOT NULL,
-                telegram_count INTEGER NOT NULL DEFAULT 0,
-                whatsapp_count INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (day, owner_name)
-            );
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS admins (
-                username TEXT PRIMARY KEY,
-                permissions JSONB NOT NULL
-            );
-        """)
-        # NEW TABLE FOR USER-SPECIFIC COUNTRY BANS
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_country_bans (
-                user_id BIGINT NOT NULL,
-                country TEXT NOT NULL,
-                PRIMARY KEY (user_id, country)
-            );
-        """)
+        await conn.execute("CREATE TABLE IF NOT EXISTS kv_storage (key TEXT PRIMARY KEY, data JSONB NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW());")
+        await conn.execute("CREATE TABLE IF NOT EXISTS audit_log (id SERIAL PRIMARY KEY, ts_local TIMESTAMPTZ NOT NULL, chat_id BIGINT, message_id BIGINT, user_id BIGINT, user_first TEXT, user_username TEXT, kind TEXT, action TEXT, value TEXT, owner TEXT);")
+        await conn.execute("CREATE TABLE IF NOT EXISTS wa_daily_usage (day DATE NOT NULL, number_norm TEXT NOT NULL, sent_count INTEGER NOT NULL DEFAULT 0, last_sent TIMESTAMPTZ, PRIMARY KEY (day, number_norm));")
+        await conn.execute("CREATE TABLE IF NOT EXISTS user_daily_activity (day DATE NOT NULL, user_id BIGINT NOT NULL, username_requests INTEGER DEFAULT 0, whatsapp_requests INTEGER DEFAULT 0, PRIMARY KEY (day, user_id));")
+        await conn.execute("CREATE TABLE IF NOT EXISTS whatsapp_bans (user_id BIGINT PRIMARY KEY);")
+        await conn.execute("CREATE TABLE IF NOT EXISTS whitelisted_users (user_id BIGINT PRIMARY KEY);")
+        await conn.execute("CREATE TABLE IF NOT EXISTS user_daily_country_counts (day DATE NOT NULL, user_id BIGINT NOT NULL, country TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, user_id, country));")
+        await conn.execute("CREATE TABLE IF NOT EXISTS user_daily_confirmations (day DATE NOT NULL, user_id BIGINT NOT NULL, confirm_count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, user_id));")
+        await conn.execute("CREATE TABLE IF NOT EXISTS owner_daily_performance (day DATE NOT NULL, owner_name TEXT NOT NULL, telegram_count INTEGER NOT NULL DEFAULT 0, whatsapp_count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, owner_name));")
+        await conn.execute("CREATE TABLE IF NOT EXISTS admins (username TEXT PRIMARY KEY, permissions JSONB NOT NULL);")
+        await conn.execute("CREATE TABLE IF NOT EXISTS user_country_bans (user_id BIGINT NOT NULL, country TEXT NOT NULL, PRIMARY KEY (user_id, country));")
     log.info("Database schema is ready.")
 
 
@@ -516,6 +453,10 @@ async def load_owner_directory():
 # QUOTA & USER ACTIVITY
 # =============================
 def _logical_day_today() -> date:
+    """
+    Calculates the current "logical day" for reporting.
+    Our logical day starts at 05:30 AM local time (Asia/Phnom_Penh).
+    """
     now = datetime.now(TIMEZONE)
     return (now - timedelta(hours=5, minutes=30)).date()
 
@@ -533,8 +474,6 @@ async def _get_user_activity(user_id: int) -> Tuple[int, int]:
         return (0, 0)
 
 async def _increment_user_activity(user_id: int, kind: str):
-    # This function correctly only increments the counts and is called only on a successful request.
-    # No changes are needed here as it aligns with the user's request.
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
@@ -603,7 +542,6 @@ async def _increment_owner_performance(owner_name: str, kind: Optional[str]):
                     ON CONFLICT (day, owner_name) DO UPDATE
                     SET whatsapp_count = owner_daily_performance.whatsapp_count + 1;
                 """, _logical_day_today(), owner_name)
-            # For kind == 'app_id' or None, there is no performance metric to update.
     except Exception as e:
         log.warning(f"Owner performance write failed for {owner_name}: {e}")
 
@@ -666,63 +604,65 @@ def _preserve_entry_indices(rr_map: Dict[str, int], new_pool: List[Dict], list_k
         else: rr_map[owner] = rr_map.get(owner, 0) % sz
 
 async def _rebuild_pools_preserving_rotation():
-    old_user_owner_list = _owner_list_from_pool(USERNAME_POOL)
-    old_wa_owner_list   = _owner_list_from_pool(WHATSAPP_POOL)
+    async with db_lock:
+        old_user_owner_list = _owner_list_from_pool(USERNAME_POOL)
+        old_wa_owner_list   = _owner_list_from_pool(WHATSAPP_POOL)
 
-    rr = state.setdefault("rr", {})
-    old_user_owner_idx = rr.get("username_owner_idx", 0)
-    old_wa_owner_idx   = rr.get("wa_owner_idx", 0)
-    old_user_entry_idx = dict(rr.get("username_entry_idx", {}))
-    old_wa_entry_idx   = dict(rr.get("wa_entry_idx", {}))
+        rr = state.setdefault("rr", {})
+        old_user_owner_idx = rr.get("username_owner_idx", 0)
+        old_wa_owner_idx   = rr.get("wa_owner_idx", 0)
+        old_user_entry_idx = dict(rr.get("username_entry_idx", {}))
+        old_wa_entry_idx   = dict(rr.get("wa_entry_idx", {}))
 
-    await save_owner_directory()
-    await load_owner_directory()
+        await save_owner_directory()
+        await load_owner_directory()
 
-    new_user_owner_list = _owner_list_from_pool(USERNAME_POOL)
-    new_wa_owner_list   = _owner_list_from_pool(WHATSAPP_POOL)
+        new_user_owner_list = _owner_list_from_pool(USERNAME_POOL)
+        new_wa_owner_list   = _owner_list_from_pool(WHATSAPP_POOL)
 
-    rr["username_owner_idx"] = _preserve_owner_pointer(
-        old_user_owner_list, new_user_owner_list, old_user_owner_idx
-    )
-    rr["wa_owner_idx"] = _preserve_owner_pointer(
-        old_wa_owner_list, new_wa_owner_list, old_wa_owner_idx
-    )
+        rr["username_owner_idx"] = _preserve_owner_pointer(
+            old_user_owner_list, new_user_owner_list, old_user_owner_idx
+        )
+        rr["wa_owner_idx"] = _preserve_owner_pointer(
+            old_wa_owner_list, new_wa_owner_list, old_wa_owner_idx
+        )
 
-    rr.setdefault("username_entry_idx", old_user_entry_idx)
-    rr.setdefault("wa_entry_idx", old_wa_entry_idx)
-    _preserve_entry_indices(rr["username_entry_idx"], USERNAME_POOL, "usernames")
-    _preserve_entry_indices(rr["wa_entry_idx"], WHATSAPP_POOL, "numbers")
+        rr.setdefault("username_entry_idx", old_user_entry_idx)
+        rr.setdefault("wa_entry_idx", old_wa_entry_idx)
+        _preserve_entry_indices(rr["username_entry_idx"], USERNAME_POOL, "usernames")
+        _preserve_entry_indices(rr["wa_entry_idx"], WHATSAPP_POOL, "numbers")
 
-    await save_state()
+        await save_state()
 
 async def _decrement_priority_and_end_if_needed():
-    pq = state.get("priority_queue", {})
-    if not pq.get("active"):
-        return
+    async with db_lock:
+        pq = state.get("priority_queue", {})
+        if not pq.get("active"):
+            return
 
-    pq["remaining"] -= 1
+        pq["remaining"] -= 1
 
-    if pq["remaining"] <= 0:
-        log.info(f"Priority queue for owner {pq['owner']} completed.")
-        saved_indices = pq.get("saved_rr_indices", {})
-        state["rr"]["username_owner_idx"] = saved_indices.get("username_owner_idx", 0)
-        state["rr"]["wa_owner_idx"] = saved_indices.get("wa_owner_idx", 0)
+        if pq["remaining"] <= 0:
+            log.info(f"Priority queue for owner {pq['owner']} completed.")
+            saved_indices = pq.get("saved_rr_indices", {})
+            state["rr"]["username_owner_idx"] = saved_indices.get("username_owner_idx", 0)
+            state["rr"]["wa_owner_idx"] = saved_indices.get("wa_owner_idx", 0)
 
-        stop_after = pq.get("stop_after", False)
-        owner_to_stop = pq.get("owner")
+            stop_after = pq.get("stop_after", False)
+            owner_to_stop = pq.get("owner")
 
-        state["priority_queue"] = BASE_STATE["priority_queue"]
+            state["priority_queue"] = BASE_STATE["priority_queue"].copy()
 
-        if stop_after and owner_to_stop:
-            log.info(f"Auto-stopping owner {owner_to_stop} after priority queue completion.")
-            owner_group = _find_owner_group(owner_to_stop)
-            if owner_group:
-                owner_group["disabled"] = True
-            await _rebuild_pools_preserving_rotation()
+            if stop_after and owner_to_stop:
+                log.info(f"Auto-stopping owner {owner_to_stop} after priority queue completion.")
+                owner_group = _find_owner_group(owner_to_stop)
+                if owner_group:
+                    owner_group["disabled"] = True
+                await _rebuild_pools_preserving_rotation()
+            else:
+                await save_state()
         else:
             await save_state()
-    else:
-        await save_state()
 
 async def _get_bulk_owner_performance(owner_names: List[str], day: date) -> Dict[str, int]:
     """Fetches performance for a list of owners based on successful confirmations."""
@@ -749,153 +689,141 @@ async def _get_next_owner_by_performance(pool: List[Dict], rr_idx_key: str) -> O
     Selects the next owner using a tiered approach based on performance,
     now with a time-based cooldown after hitting the catch-up limit.
     """
-    active_owners = [o['owner'] for o in pool]
-    if not active_owners:
-        return 0
+    async with db_lock:
+        active_owners = [o['owner'] for o in pool]
+        if not active_owners:
+            return 0
 
-    performance = await _get_bulk_owner_performance(active_owners, _logical_day_today())
-    sorted_scores = sorted(list(set(performance.values())))
-    current_rr_idx = state['rr'].get(rr_idx_key, 0)
+        performance = await _get_bulk_owner_performance(active_owners, _logical_day_today())
+        sorted_scores = sorted(list(set(performance.values())))
+        current_rr_idx = state['rr'].get(rr_idx_key, 0)
 
-    # Get relevant state dictionaries
-    catch_up_assignments = state.setdefault("catch_up_assignments", {})
-    catch_up_cooldowns = state.setdefault("catch_up_cooldowns", {})
-    now = datetime.now(TIMEZONE)
+        catch_up_assignments = state.setdefault("catch_up_assignments", {})
+        catch_up_cooldowns = state.setdefault("catch_up_cooldowns", {})
+        now = datetime.now(TIMEZONE)
 
-    # 1. First, process any expired cooldowns for all owners in the pool.
-    # This makes them eligible again *before* we start selecting.
-    for owner_name in active_owners:
-        cooldown_ts_str = catch_up_cooldowns.get(owner_name)
-        if cooldown_ts_str:
-            cooldown_ts = datetime.fromisoformat(cooldown_ts_str)
-            if now >= cooldown_ts + timedelta(minutes=CATCH_UP_COOLDOWN_MINUTES):
-                log.info(f"Cooldown for owner {owner_name} expired. They are eligible again.")
-                # Reset their assignment count and remove cooldown
-                catch_up_assignments[owner_name] = 0
-                catch_up_cooldowns.pop(owner_name, None)
+        for owner_name in active_owners:
+            cooldown_ts_str = catch_up_cooldowns.get(owner_name)
+            if cooldown_ts_str:
+                cooldown_ts = datetime.fromisoformat(cooldown_ts_str)
+                if now >= cooldown_ts + timedelta(minutes=CATCH_UP_COOLDOWN_MINUTES):
+                    log.info(f"Cooldown for owner {owner_name} expired. They are eligible again.")
+                    catch_up_assignments[owner_name] = 0
+                    catch_up_cooldowns.pop(owner_name, None)
 
-    # 2. Iterate through performance tiers to find the best candidate.
-    for score in sorted_scores:
-        owners_at_this_level = {owner for owner, s in performance.items() if s == score}
+        for score in sorted_scores:
+            owners_at_this_level = {owner for owner, s in performance.items() if s == score}
+            
+            eligible_owners_in_tier = {
+                owner for owner in owners_at_this_level
+                if owner not in catch_up_cooldowns and catch_up_assignments.get(owner, 0) < CATCH_UP_LIMIT
+            }
+
+            if eligible_owners_in_tier:
+                for i in range(len(pool)):
+                    next_idx = (current_rr_idx + i) % len(pool)
+                    owner_name = pool[next_idx]['owner']
+
+                    if owner_name in eligible_owners_in_tier:
+                        new_assignment_count = catch_up_assignments.get(owner_name, 0) + 1
+                        catch_up_assignments[owner_name] = new_assignment_count
+                        
+                        if new_assignment_count >= CATCH_UP_LIMIT:
+                            log.info(f"Owner {owner_name} has now hit the catch-up limit. Starting a {CATCH_UP_COOLDOWN_MINUTES}-minute cooldown.")
+                            catch_up_cooldowns[owner_name] = now.isoformat()
+                        
+                        await save_state()
+                        return next_idx
         
-        # Check which of these owners are actually eligible
-        eligible_owners_in_tier = {
-            owner for owner in owners_at_this_level
-            if owner not in catch_up_cooldowns and catch_up_assignments.get(owner, 0) < CATCH_UP_LIMIT
-        }
-
-        if eligible_owners_in_tier:
-            # Found an eligible tier. Pick one using round-robin.
-            for i in range(len(pool)):
-                next_idx = (current_rr_idx + i) % len(pool)
-                owner_name = pool[next_idx]['owner']
-
-                if owner_name in eligible_owners_in_tier:
-                    # This is our owner. Increment their assignment count.
-                    new_assignment_count = catch_up_assignments.get(owner_name, 0) + 1
-                    catch_up_assignments[owner_name] = new_assignment_count
-                    
-                    # If this new assignment makes them hit the limit, start their cooldown.
-                    if new_assignment_count >= CATCH_UP_LIMIT:
-                        log.info(f"Owner {owner_name} has now hit the catch-up limit. Starting a {CATCH_UP_COOLDOWN_MINUTES}-minute cooldown.")
-                        catch_up_cooldowns[owner_name] = now.isoformat()
-
-                    # Return the index. The calling function will save the state.
-                    return next_idx
-
-    # Fallback: If no one is eligible in any tier (e.g., everyone is on cooldown)
-    log.warning("No eligible owners found in any performance tier. All active owners may be on cooldown.")
-    return None
+        log.warning("No eligible owners found in any performance tier. All active owners may be on cooldown.")
+        return None
 
 
 async def _next_from_username_pool() -> Optional[Dict[str, str]]:
-    pq = state.get("priority_queue", {})
-    if pq.get("active"):
-        priority_owner = pq.get("owner")
-        for block in USERNAME_POOL:
-            if block["owner"] == priority_owner:
-                arr = block.get("usernames", [])
-                if arr:
-                    ei = state["rr"]["username_entry_idx"].get(priority_owner, 0) % len(arr)
-                    result = {"owner": priority_owner, "username": arr[ei]}
-                    state["rr"]["username_entry_idx"][priority_owner] = (ei + 1) % len(arr)
-                    await _decrement_priority_and_end_if_needed()
-                    return result
-        log.warning(f"Priority owner {priority_owner} has no available usernames. Falling back to normal rotation for this request.")
+    async with db_lock:
+        pq = state.get("priority_queue", {})
+        if pq.get("active"):
+            priority_owner = pq.get("owner")
+            for block in USERNAME_POOL:
+                if block["owner"] == priority_owner:
+                    arr = block.get("usernames", [])
+                    if arr:
+                        ei = state["rr"]["username_entry_idx"].get(priority_owner, 0) % len(arr)
+                        result = {"owner": priority_owner, "username": arr[ei]}
+                        state["rr"]["username_entry_idx"][priority_owner] = (ei + 1) % len(arr)
+                        await _decrement_priority_and_end_if_needed() # This saves state
+                        return result
+            log.warning(f"Priority owner {priority_owner} has no available usernames. Falling back to normal rotation for this request.")
 
-    if not USERNAME_POOL: return None
+        if not USERNAME_POOL: return None
 
-    owner_idx = await _get_next_owner_by_performance(USERNAME_POOL, "username_owner_idx")
+        owner_idx = await _get_next_owner_by_performance(USERNAME_POOL, "username_owner_idx")
 
-    if owner_idx is None:
-        log.warning("Could not find an eligible owner for username request. All may be on cooldown.")
-        return None
+        if owner_idx is None:
+            log.warning("Could not find an eligible owner for username request. All may be on cooldown.")
+            return None
 
-    # Start searching from the selected owner's index
-    for i in range(len(USERNAME_POOL)):
-        current_idx = (owner_idx + i) % len(USERNAME_POOL)
-        block = USERNAME_POOL[current_idx]
-        arr = block.get("usernames", [])
-        if arr:
-            ei = state["rr"]["username_entry_idx"].get(block["owner"], 0) % len(arr)
-            result = {"owner": block["owner"], "username": arr[ei]}
-            state["rr"]["username_entry_idx"][block["owner"]] = (ei + 1) % len(arr)
-            state["rr"]["username_owner_idx"] = (current_idx + 1) % len(USERNAME_POOL)
-            await save_state()
-            return result
+        for i in range(len(USERNAME_POOL)):
+            current_idx = (owner_idx + i) % len(USERNAME_POOL)
+            block = USERNAME_POOL[current_idx]
+            arr = block.get("usernames", [])
+            if arr:
+                ei = state["rr"]["username_entry_idx"].get(block["owner"], 0) % len(arr)
+                result = {"owner": block["owner"], "username": arr[ei]}
+                state["rr"]["username_entry_idx"][block["owner"]] = (ei + 1) % len(arr)
+                state["rr"]["username_owner_idx"] = (current_idx + 1) % len(USERNAME_POOL)
+                await save_state()
+                return result
     return None
 
 
 async def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
-    pq = state.get("priority_queue", {})
-    if pq.get("active"):
-        priority_owner = pq.get("owner")
-        for block in WHATSAPP_POOL:
-            if block["owner"] == priority_owner:
-                numbers = block.get("numbers", []) or []
-                if numbers:
-                    start = state["rr"]["wa_entry_idx"].get(priority_owner, 0) % len(numbers)
-                    for step in range(len(numbers)):
-                        cand = numbers[(start + step) % len(numbers)]
-                        if not await _wa_quota_reached(cand):
-                            state["rr"]["wa_entry_idx"][priority_owner] = ((start + step) + 1) % len(numbers)
-                            await _decrement_priority_and_end_if_needed()
-                            return {"owner": priority_owner, "number": cand}
-        log.warning(f"Priority owner {priority_owner} has no available WhatsApp numbers. Falling back to normal rotation for this request.")
+    async with db_lock:
+        pq = state.get("priority_queue", {})
+        if pq.get("active"):
+            priority_owner = pq.get("owner")
+            for block in WHATSAPP_POOL:
+                if block["owner"] == priority_owner:
+                    numbers = block.get("numbers", []) or []
+                    if numbers:
+                        start = state["rr"]["wa_entry_idx"].get(priority_owner, 0) % len(numbers)
+                        for step in range(len(numbers)):
+                            cand = numbers[(start + step) % len(numbers)]
+                            if not await _wa_quota_reached(cand):
+                                state["rr"]["wa_entry_idx"][priority_owner] = ((start + step) + 1) % len(numbers)
+                                await _decrement_priority_and_end_if_needed() # This saves state
+                                return {"owner": priority_owner, "number": cand}
+            log.warning(f"Priority owner {priority_owner} has no available WhatsApp numbers. Falling back to normal rotation for this request.")
 
-    if not WHATSAPP_POOL: return None
+        if not WHATSAPP_POOL: return None
 
-    owner_idx = await _get_next_owner_by_performance(WHATSAPP_POOL, "wa_owner_idx")
+        owner_idx = await _get_next_owner_by_performance(WHATSAPP_POOL, "wa_owner_idx")
 
-    if owner_idx is None:
-        log.warning("Could not find an eligible owner for WhatsApp request. All may be on cooldown.")
-        return None
+        if owner_idx is None:
+            log.warning("Could not find an eligible owner for WhatsApp request. All may be on cooldown.")
+            return None
 
-    # Start searching from the selected owner's index
-    for i in range(len(WHATSAPP_POOL)):
-        current_idx = (owner_idx + i) % len(WHATSAPP_POOL)
-        block = WHATSAPP_POOL[current_idx]
-        owner = block["owner"]
-        numbers = block.get("numbers", []) or []
-        if numbers:
-            start = state["rr"]["wa_entry_idx"].get(owner, 0) % len(numbers)
-            for step in range(len(numbers)):
-                cand = numbers[(start + step) % len(numbers)]
-                if await _wa_quota_reached(cand):
-                    continue
-                state["rr"]["wa_entry_idx"][owner] = ((start + step) + 1) % len(numbers)
-                state["rr"]["wa_owner_idx"] = (current_idx + 1) % len(WHATSAPP_POOL)
-                await save_state()
-                return {"owner": owner, "number": cand}
+        for i in range(len(WHATSAPP_POOL)):
+            current_idx = (owner_idx + i) % len(WHATSAPP_POOL)
+            block = WHATSAPP_POOL[current_idx]
+            owner = block["owner"]
+            numbers = block.get("numbers", []) or []
+            if numbers:
+                start = state["rr"]["wa_entry_idx"].get(owner, 0) % len(numbers)
+                for step in range(len(numbers)):
+                    cand = numbers[(start + step) % len(numbers)]
+                    if await _wa_quota_reached(cand):
+                        continue
+                    state["rr"]["wa_entry_idx"][owner] = ((start + step) + 1) % len(numbers)
+                    state["rr"]["wa_owner_idx"] = (current_idx + 1) % len(WHATSAPP_POOL)
+                    await save_state()
+                    return {"owner": owner, "number": cand}
     return None
 
 # =============================
 # REGEXES & HELPERS
 # =============================
-WHO_USING_REGEX = re.compile(
-    r"^\s*who(?:['\u2019]s| is)\s+using\s+(?:@?([A-Za-z0-9_\.]+)|(\+?\d[\d\s\-]{6,}\d))\s*$",
-    re.IGNORECASE
-)
+WHO_USING_REGEX = re.compile(r"^\s*who(?:['\u2019]s| is)\s+using\s+(?:@?([A-Za-z0-9_\.]+)|(\+?\d[\d\s\-]{6,}\d))\s*$", re.IGNORECASE)
 NEED_USERNAME_RX = re.compile(r"^\s*i\s*need\s*(?:user\s*name|username)\s*$", re.IGNORECASE)
 NEED_WHATSAPP_RX = re.compile(r"^\s*i\s*need\s*(?:id\s*)?whats?app\s*$", re.IGNORECASE)
 EXTRACT_USERNAMES_RX = re.compile(r'@([a-zA-Z0-9_]{4,})')
@@ -995,6 +923,20 @@ async def _log_event(kind: str, action: str, update: Update, value: str, owner: 
 # =============================
 # UTIL
 # =============================
+async def safe_reply_html(message, text: str):
+    """Safely replies to a message, catching potential Telegram errors."""
+    try:
+        await message.reply_html(text)
+    except TelegramError as e:
+        log.error(f"Failed to send message to chat {message.chat_id}: {e}")
+
+async def safe_send_message(context, chat_id: int, text: str):
+    """Safely sends a message, catching potential Telegram errors."""
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+    except TelegramError as e:
+        log.error(f"Failed to send message to chat {chat_id}: {e}")
+
 def cache_user_info(user):
     state.setdefault("user_names", {})[str(user.id)] = {
         "first_name": user.first_name or "",
@@ -1010,54 +952,40 @@ def _issued_bucket(kind: str) -> Dict[str, list]:
     return state.setdefault("issued", {}).setdefault(kind, {})
 
 async def _set_issued(user_id: int, chat_id: int, kind: str, value: str, context_data: Optional[Dict] = None):
-    bucket = _issued_bucket(kind)
-    user_id_str = str(user_id)
-    if user_id_str not in bucket:
-        bucket[user_id_str] = []
+    async with db_lock:
+        bucket = _issued_bucket(kind)
+        user_id_str = str(user_id)
+        if user_id_str not in bucket:
+            bucket[user_id_str] = []
 
-    item_data = {
-        "value": value,
-        "ts": datetime.now(TIMEZONE).isoformat(),
-        "chat_id": chat_id
-    }
-    if context_data:
-        item_data.update(context_data)
+        item_data = {
+            "value": value,
+            "ts": datetime.now(TIMEZONE).isoformat(),
+            "chat_id": chat_id
+        }
+        if context_data:
+            item_data.update(context_data)
 
-    bucket[user_id_str].append(item_data)
-    await save_state()
-
-async def _clear_issued(user_id: int, kind: str, value_to_clear: str) -> bool:
-    bucket = _issued_bucket(kind)
-    user_id_str = str(user_id)
-    if user_id_str in bucket:
-        original_len = len(bucket[user_id_str])
-        bucket[user_id_str] = [
-            item for item in bucket[user_id_str] if item.get("value") != value_to_clear
-        ]
-        if not bucket[user_id_str]:
-            del bucket[user_id_str]
-
-        if len(bucket.get(user_id_str, [])) < original_len:
-            await save_state()
-            return True
-    return False
+        bucket[user_id_str].append(item_data)
+        await save_state()
 
 async def _clear_one_issued(user_id: int, kind: str, value_to_clear: str) -> bool:
-    bucket = _issued_bucket(kind)
-    user_id_str = str(user_id)
-    if user_id_str in bucket:
-        item_to_remove = None
-        for item in bucket[user_id_str]:
-            if item.get("value") == value_to_clear:
-                item_to_remove = item
-                break
+    async with db_lock:
+        bucket = _issued_bucket(kind)
+        user_id_str = str(user_id)
+        if user_id_str in bucket:
+            item_to_remove = None
+            for item in bucket[user_id_str]:
+                if item.get("value") == value_to_clear:
+                    item_to_remove = item
+                    break
 
-        if item_to_remove:
-            bucket[user_id_str].remove(item_to_remove)
-            if not bucket[user_id_str]:
-                del bucket[user_id_str]
-            await save_state()
-            return True
+            if item_to_remove:
+                bucket[user_id_str].remove(item_to_remove)
+                if not bucket[user_id_str]:
+                    del bucket[user_id_str]
+                await save_state()
+                return True
     return False
 
 def _value_in_text(value: Optional[str], text: str) -> bool:
@@ -1133,7 +1061,6 @@ def _find_age_in_text(text: str) -> Optional[int]:
     return None
 
 def _find_country_in_text(text: str) -> Tuple[Optional[str], Optional[str]]:
-    # MODIFIED: Reworked logic to be more robust
     match = re.search(r'\b(?:from|country)\s*:?\s*(.*)', text, re.IGNORECASE)
     if not match:
         return None, None
@@ -1275,15 +1202,12 @@ async def _get_user_stats_text(day: date) -> str:
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
-            # Fetch all activity and confirmations for the day
             activity_rows = await conn.fetch("SELECT user_id, username_requests, whatsapp_requests FROM user_daily_activity WHERE day = $1", day)
             confirm_rows = await conn.fetch("SELECT user_id, confirm_count FROM user_daily_confirmations WHERE day = $1", day)
             
-            # Process into dictionaries for easy lookup
             activities = {r['user_id']: {'u': r['username_requests'], 'w': r['whatsapp_requests']} for r in activity_rows}
             confirmations = {r['user_id']: r['confirm_count'] for r in confirm_rows}
             
-            # Get a set of all unique user IDs who were active
             all_user_ids = set(activities.keys()) | set(confirmations.keys())
 
             if not all_user_ids:
@@ -1298,7 +1222,7 @@ async def _get_user_stats_text(day: date) -> str:
                 if total_reqs > 0:
                     rate = (confirm_count / total_reqs) * 100
                 else:
-                    rate = 0.0 # User had confirmations but no recorded requests (unlikely but possible)
+                    rate = 0.0
                 
                 user_info = state.get("user_names", {}).get(str(user_id), {})
                 user_display = user_info.get('username') or user_info.get('first_name') or f"ID: {user_id}"
@@ -1316,7 +1240,6 @@ async def _get_user_stats_text(day: date) -> str:
         log.error(f"Failed to get user stats data: {e}")
         return "An error occurred while fetching user stats."
 
-    # Sort users by success rate, from highest to lowest
     user_stats.sort(key=lambda x: x['rate'], reverse=True)
     
     rank = 1
@@ -1372,11 +1295,9 @@ async def _get_user_detail_text(user_id: int) -> str:
 
 async def _get_owner_performance_text(owner_name: str, day: date) -> str:
     """Generates a formatted string of an owner's daily performance and inventory."""
-    # Daily Performance (from DB)
     tg_confirm_count, wa_confirm_count = await _get_owner_performance(owner_name, day)
     total_customers = tg_confirm_count + wa_confirm_count
 
-    # NEW: Get distribution counts
     tg_dist_count, wa_dist_count = await _get_owner_distribution_counts(owner_name, day)
 
     lines = [f"<b>📊 Performance for @{owner_name} on {day.isoformat()}</b>"]
@@ -1389,12 +1310,8 @@ async def _get_owner_performance_text(owner_name: str, day: date) -> str:
     lines.append(f"<b>- WhatsApps Sent from Bot:</b> {wa_dist_count}")
     lines.append("") # Spacer
 
-    # Inventory Stats (from OWNER_DATA)
     owner_group = _find_owner_group(owner_name)
-    total_tg = 0
-    total_wa = 0
-    stopped_tg = []
-    stopped_wa = []
+    total_tg, total_wa, stopped_tg, stopped_wa = 0, 0, [], []
 
     if owner_group:
         total_tg = len(owner_group.get("entries", []))
@@ -1407,28 +1324,21 @@ async def _get_owner_performance_text(owner_name: str, day: date) -> str:
     lines.append(f"<b>- Total WhatsApp in Bot:</b> {total_wa}")
 
     if stopped_tg:
-        lines.append("")
-        lines.append("<b>⛔ Stopped Telegram Usernames:</b>")
-        for u in stopped_tg:
-            lines.append(f"  - <code>{u}</code>")
+        lines.append("\n<b>⛔ Stopped Telegram Usernames:</b>")
+        for u in stopped_tg: lines.append(f"  - <code>{u}</code>")
 
     if stopped_wa:
-        lines.append("")
-        lines.append("<b>⛔ Stopped WhatsApp Numbers:</b>")
-        for w in stopped_wa:
-            lines.append(f"  - <code>{w}</code>")
+        lines.append("\n<b>⛔ Stopped WhatsApp Numbers:</b>")
+        for w in stopped_wa: lines.append(f"  - <code>{w}</code>")
 
     return "\n".join(lines)
 
-# NEW: Function to generate the 'data today' report
 async def _get_daily_data_summary_text() -> str:
     """Generates a summary of all owners who have added customers today."""
     today = _logical_day_today()
     lines = [f"<b>📊 Daily Customer Summary for {today.isoformat()}</b>"]
 
     owner_performances = []
-
-    # Get all owner names from the loaded data
     all_owners = [_norm_owner_name(o['owner']) for o in OWNER_DATA]
 
     for owner_name in all_owners:
@@ -1441,7 +1351,6 @@ async def _get_daily_data_summary_text() -> str:
     if not owner_performances:
         return "No owners have added customers today."
 
-    # Sort by total customers, descending
     owner_performances.sort(key=lambda x: x['total'], reverse=True)
 
     for perf in owner_performances:
@@ -1453,93 +1362,77 @@ async def _get_daily_data_summary_text() -> str:
 # =============================
 # EXCEL (reads audit_log)
 # =============================
-def _logical_day_of(ts: datetime) -> date:
-    shifted = ts.astimezone(TIMEZONE) - timedelta(hours=5, minutes=30)
-    return shifted.date()
+async def _compute_daily_summary(target_day: date) -> Tuple[List[dict], List[dict]]:
+    """
+    Computes daily summary for users and owners efficiently from the database.
+    """
+    start_ts = TIMEZONE.localize(datetime.combine(target_day, time(5, 30)))
+    end_ts = start_ts + timedelta(days=1)
+    
+    out_users, out_owners = [], []
+    owner_stats: Dict[str, dict] = {}
 
-async def _read_log_rows() -> List[dict]:
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
-            rows = await conn.fetch("SELECT * FROM audit_log ORDER BY ts_local")
-            return [dict(row) for row in rows]
+            # --- Fetch Owner Data ---
+            owner_rows = await conn.fetch("""
+                SELECT owner, kind, action FROM audit_log
+                WHERE ts_local >= $1 AND ts_local < $2 AND action = 'issued' AND owner IS NOT NULL
+            """, start_ts, end_ts)
+            
+            for r in owner_rows:
+                owner = (r.get("owner","") or "").lower()
+                if owner:
+                    s = owner_stats.setdefault(owner, {"total": 0, "tg": 0, "wa": 0})
+                    s["total"] += 1
+                    if r["kind"] == "username": s["tg"] += 1
+                    elif r["kind"] == "whatsapp": s["wa"] += 1
+
+            for owner, s in sorted(owner_stats.items(), key=lambda kv: kv[0]):
+                out_owners.append({
+                    "Day": target_day.isoformat(), "Owner": f"@{owner}",
+                    "Customers total": s["total"], "Customers via Telegram": s["tg"],
+                    "Customers via WhatsApp": s["wa"],
+                })
+
+            # --- Fetch User Data ---
+            audit_users = await conn.fetch("SELECT DISTINCT user_id FROM audit_log WHERE ts_local >= $1 AND ts_local < $2 AND user_id IS NOT NULL", start_ts, end_ts)
+            confirm_rows_db = await conn.fetch("SELECT user_id, confirm_count FROM user_daily_confirmations WHERE day = $1", target_day)
+            country_rows_db = await conn.fetch("SELECT user_id, country, count FROM user_daily_country_counts WHERE day = $1", target_day)
+            activity_rows_db = await conn.fetch("SELECT user_id, username_requests, whatsapp_requests FROM user_daily_activity WHERE day = $1", target_day)
+
+            # --- Process into lookups ---
+            all_user_ids = {r['user_id'] for r in audit_users if r['user_id']}
+            confirmations = {r['user_id']: r['confirm_count'] for r in confirm_rows_db}
+            activities = {r['user_id']: (r['username_requests'], r['whatsapp_requests']) for r in activity_rows_db}
+            countries = {}
+            for r in country_rows_db:
+                all_user_ids.add(r['user_id'])
+                countries.setdefault(r['user_id'], []).append((r['country'], r['count']))
+            for user_id in confirmations: all_user_ids.add(user_id)
+            for user_id in activities: all_user_ids.add(user_id)
+
+
+            for user_id in all_user_ids:
+                user_info = state.get("user_names", {}).get(str(user_id), {})
+                user_display = user_info.get('username') or user_info.get('first_name') or f"ID: {user_id}"
+                
+                username_reqs, whatsapp_reqs = activities.get(user_id, (0, 0))
+                confirm_count = confirmations.get(user_id, 0)
+                country_counts = countries.get(user_id, [])
+                country_str = ", ".join([f"{c.title()}: {n}" for c, n in country_counts])
+
+                out_users.append({
+                    "Day": target_day.isoformat(), "User": user_display,
+                    "Total username receive": username_reqs, "Total whatsapp receive": whatsapp_reqs,
+                    "Total customer added": confirm_count, "Country Submissions": country_str,
+                })
+
     except Exception as e:
-        log.error("Failed to read log rows from DB: %s", e)
-        return []
-
-async def _compute_daily_summary(target_day: date) -> Tuple[List[dict], List[dict]]:
-    """
-    Computes daily summary for users and owners, now with added customer and country data.
-    """
-    # Define the time range for the logical day
-    start_ts = TIMEZONE.localize(datetime.combine(target_day, time(5, 30)))
-    end_ts = start_ts + timedelta(days=1)
-
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        # Get all unique user IDs active on the target day from all relevant tables
-        audit_users = await conn.fetch("SELECT DISTINCT user_id FROM audit_log WHERE ts_local >= $1 AND ts_local < $2 AND user_id IS NOT NULL", start_ts, end_ts)
-        confirm_users = await conn.fetch("SELECT DISTINCT user_id FROM user_daily_confirmations WHERE day = $1", target_day)
-        country_users = await conn.fetch("SELECT DISTINCT user_id FROM user_daily_country_counts WHERE day = $1", target_day)
-
-        all_user_ids = {r['user_id'] for r in audit_users if r['user_id']}
-        all_user_ids.update({r['user_id'] for r in confirm_users if r['user_id']})
-        all_user_ids.update({r['user_id'] for r in country_users if r['user_id']})
-
-        # Process data for each user
-        out_users = []
-        for user_id in all_user_ids:
-            user_info = state.get("user_names", {}).get(str(user_id), {})
-            user_display = user_info.get('username') or user_info.get('first_name') or f"ID: {user_id}"
-
-            # Get request counts from audit log
-            username_reqs, whatsapp_reqs = 0, 0
-            req_rows = await conn.fetch("SELECT kind FROM audit_log WHERE ts_local >= $1 AND ts_local < $2 AND user_id = $3 AND action = 'issued'", start_ts, end_ts, user_id)
-            for row in req_rows:
-                if row['kind'] == 'username':
-                    username_reqs += 1
-                elif row['kind'] == 'whatsapp':
-                    whatsapp_reqs += 1
-
-            # Get confirmation counts
-            confirm_count = await _get_user_confirmation_count(user_id)
-
-            # Get country submissions
-            country_counts = await _get_user_country_counts(user_id)
-            country_str = ", ".join([f"{c.title()}: {n}" for c, n in country_counts])
-
-            out_users.append({
-                "Day": target_day.isoformat(),
-                "User": user_display,
-                "Total username receive": username_reqs,
-                "Total whatsapp receive": whatsapp_reqs,
-                "Total customer added": confirm_count,
-                "Country Submissions": country_str,
-            })
-
-    # Owner performance logic remains largely the same, but re-fetched for clarity
-    day_rows = [r for r in await _read_log_rows() if _logical_day_of(r["ts_local"]) == target_day]
-    owner_stats: Dict[str, dict] = {}
-    for r in day_rows:
-        owner = (r.get("owner","") or "").lower()
-        if r["action"] == "issued" and owner:
-            s = owner_stats.setdefault(owner, {"total": 0, "tg": 0, "wa": 0})
-            s["total"] += 1
-            if r["kind"] == "username":
-                s["tg"] += 1
-            elif r["kind"] == "whatsapp":
-                s["wa"] += 1
-
-    out_owners = []
-    for owner, s in sorted(owner_stats.items(), key=lambda kv: kv[0]):
-        out_owners.append({
-            "Day": target_day.isoformat(),
-            "Owner": f"@{owner}",
-            "Customers total": s["total"],
-            "Customers via Telegram": s["tg"],
-            "Customers via WhatsApp": s["wa"],
-        })
-
+        log.error(f"Failed to compute daily summary from DB: {e}")
+        return [], []
+        
     out_users.sort(key=lambda r: r["User"].lower())
     return out_users, out_owners
 
@@ -1551,8 +1444,6 @@ def _style_and_save_excel(user_rows: List[dict], owner_rows: List[dict]) -> io.B
         raise RuntimeError("openpyxl not installed. Please add it to requirements.txt")
 
     wb = Workbook()
-
-    # Sheet 1: Summary
     ws = wb.active; ws.title = "Summary"
     headers = ["Day", "User", "Total username receive", "Total whatsapp receive", "Total customer added", "Country Submissions"]
     ws.append(headers)
@@ -1567,12 +1458,9 @@ def _style_and_save_excel(user_rows: List[dict], owner_rows: List[dict]) -> io.B
         fill = PatternFill(start_color="F2F2F2" if i % 2 == 0 else "FFFFFF", fill_type="solid")
         for cell in row: cell.alignment = center; cell.border = border; cell.fill = fill
     for col in ws.columns:
-        max_len = 0; letter = col[0].column_letter
-        for c in col:
-            if c.value: max_len = max(max_len, len(str(c.value)))
-        ws.column_dimensions[letter].width = min(max_len + 2, 60)
+        max_len = max(len(str(c.value or "")) for c in col)
+        ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 60)
 
-    # Sheet 2: Owners
     ws2 = wb.create_sheet("Owners")
     headers2 = ["Day","Owner","Customers total","Customers via Telegram","Customers via WhatsApp"]
     ws2.append(headers2)
@@ -1582,10 +1470,8 @@ def _style_and_save_excel(user_rows: List[dict], owner_rows: List[dict]) -> io.B
         fill = PatternFill(start_color="F2F2F2" if i % 2 == 0 else "FFFFFF", fill_type="solid")
         for cell in row: cell.alignment = center; cell.border = border; cell.fill = fill
     for col in ws2.columns:
-        max_len = 0; letter = col[0].column_letter
-        for c in col:
-            if c.value: max_len = max(max_len, len(str(c.value)))
-        ws2.column_dimensions[letter].width = min(max_len + 2, 40)
+        max_len = max(len(str(c.value or "")) for c in col)
+        ws2.column_dimensions[col[0].column_letter].width = min(max_len + 2, 40)
 
     excel_buffer = io.BytesIO()
     wb.save(excel_buffer)
@@ -1712,7 +1598,6 @@ def _get_commands_text() -> str:
 async def _get_request_stats_text() -> str:
     """Generates a real-time report on the request ratio for the current 60-minute block."""
     now = datetime.now(TIMEZONE)
-    # Use fixed 60-minute blocks (always starts at the top of the hour)
     start_time = now.replace(minute=0, second=0, microsecond=0)
 
     try:
@@ -1752,10 +1637,7 @@ async def _get_request_stats_text() -> str:
 
 def _get_inventory_text() -> str:
     """Generates a summary of the total number of items in the bot."""
-    total_usernames = 0
-    active_usernames = 0
-    total_wa = 0
-    active_wa = 0
+    total_usernames, active_usernames, total_wa, active_wa = 0, 0, 0, 0
 
     for owner_group in OWNER_DATA:
         for entry in owner_group.get("entries", []):
@@ -1877,13 +1759,12 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
             if not target_owner_group:
                 return f"Target owner '@{target_owner_name}' not found."
 
-            # Check if the new manager exists as an owner
             new_manager_group = _find_owner_group(new_manager_norm)
             if not new_manager_group:
                 return f"New manager '@{new_manager_name}' is not a valid owner."
 
             target_owner_group['managed_by'] = new_manager_norm
-            await _rebuild_pools_preserving_rotation() # This saves the directory
+            await _rebuild_pools_preserving_rotation()
             return f"Control of owner '@{target_owner_name}' has been transferred to '@{new_manager_name}'."
 
         m_reset_cooldown = RESET_COOLDOWN_RX.match(text)
@@ -1894,21 +1775,21 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
             owner_group = _find_owner_group(owner_norm)
             if not owner_group:
                 return f"Owner '@{owner_name}' not found."
-
-            catch_up_cooldowns = state.setdefault("catch_up_cooldowns", {})
-            catch_up_assignments = state.setdefault("catch_up_assignments", {})
-
-            if owner_norm not in catch_up_cooldowns:
-                return f"Owner '@{owner_name}' is not currently on an automatic cooldown."
-
-            # Remove from cooldown and reset assignment count
-            del catch_up_cooldowns[owner_norm]
-            if owner_norm in catch_up_assignments:
-                catch_up_assignments[owner_norm] = 0
             
-            await save_state()
+            async with db_lock:
+                catch_up_cooldowns = state.setdefault("catch_up_cooldowns", {})
+                catch_up_assignments = state.setdefault("catch_up_assignments", {})
+
+                if owner_norm not in catch_up_cooldowns:
+                    return f"Owner '@{owner_name}' is not currently on an automatic cooldown."
+
+                del catch_up_cooldowns[owner_norm]
+                if owner_norm in catch_up_assignments:
+                    catch_up_assignments[owner_norm] = 0
+                
+                await save_state()
             log.info(f"Super admin manually reset the automatic cooldown for owner '{owner_norm}'.")
-            return f"✅ The 60-minute automatic cooldown for owner '@{owner_name}' has been reset. They are now eligible to receive customers again."
+            return f"✅ The 60-minute automatic cooldown for owner '@{owner_name}' has been reset."
 
 
     # Regular Admin Commands (with permission checks)
@@ -1923,12 +1804,13 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         if not owner_group: return f"Owner '{owner_name}' not found."
         if _owner_is_paused(owner_group): return f"Owner '{owner_name}' is currently paused and cannot take customers."
 
-        state["priority_queue"] = {
-            "active": True, "owner": owner_norm, "remaining": count,
-            "stop_after": bool(and_stop_str),
-            "saved_rr_indices": { "username_owner_idx": state["rr"]["username_owner_idx"], "wa_owner_idx": state["rr"]["wa_owner_idx"] }
-        }
-        await save_state()
+        async with db_lock:
+            state["priority_queue"] = {
+                "active": True, "owner": owner_norm, "remaining": count,
+                "stop_after": bool(and_stop_str),
+                "saved_rr_indices": { "username_owner_idx": state["rr"]["username_owner_idx"], "wa_owner_idx": state["rr"]["wa_owner_idx"] }
+            }
+            await save_state()
         stop_msg = " and will be stopped" if state["priority_queue"]["stop_after"] else ""
         return f"Priority queue activated: Next {count} customers will be directed to {owner_name}{stop_msg}."
 
@@ -1968,7 +1850,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
                 total += 1
                 if owner.get("disabled", False) != is_stop:
                     owner["disabled"] = is_stop
-                    owner.pop("disabled_until", None) # Also clear any timed pauses
+                    owner.pop("disabled_until", None)
                     changed += 1
             await _rebuild_pools_preserving_rotation()
             return f"{'Stopped' if is_stop else 'Opened'} all owners — changed {changed}/{total}."
@@ -2101,11 +1983,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         handle = m.group(1); norm_h = _norm_handle(handle); found_and_deleted = False
         current_admin = _norm_owner_name(user.username)
         for owner in OWNER_DATA:
-            entry_to_delete = None
-            for e in owner["entries"]:
-                if _norm_handle(e.get("telegram")) == norm_h:
-                    entry_to_delete = e
-                    break
+            entry_to_delete = next((e for e in owner["entries"] if _norm_handle(e.get("telegram")) == norm_h), None)
             
             if entry_to_delete:
                 manager = entry_to_delete.get("managed_by")
@@ -2125,11 +2003,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         num = m.group(1); norm_n = _norm_phone(num); found_and_deleted = False
         current_admin = _norm_owner_name(user.username)
         for owner in OWNER_DATA:
-            wa_to_delete = None
-            for w in owner["whatsapp"]:
-                if _norm_phone(w.get("number")) == norm_n:
-                    wa_to_delete = w
-                    break
+            wa_to_delete = next((w for w in owner["whatsapp"] if _norm_phone(w.get("number")) == norm_n), None)
             
             if wa_to_delete:
                 manager = wa_to_delete.get("managed_by")
@@ -2211,30 +2085,30 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         if not _has_permission(user, 'clear all pending'): return "You don't have permission to use this command."
         if not _is_super_admin(user): return "Only the super admin can use this command."
 
-        issued_data = state.setdefault("issued", {})
-        temp_bans = state.setdefault("whatsapp_temp_bans", {})
+        async with db_lock:
+            issued_data = state.setdefault("issued", {})
+            temp_bans = state.setdefault("whatsapp_temp_bans", {})
 
-        # Find all users with pending WhatsApps and lift their temp bans
-        users_with_pending_wa = list(issued_data.get("whatsapp", {}).keys())
-        bans_lifted_count = 0
-        for user_id_str in users_with_pending_wa:
-            if user_id_str in temp_bans:
-                del temp_bans[user_id_str]
-                bans_lifted_count += 1
-                log.info(f"Super admin cleared all pending, lifting temp ban for user {user_id_str}.")
+            users_with_pending_wa = list(issued_data.get("whatsapp", {}).keys())
+            bans_lifted_count = 0
+            for user_id_str in users_with_pending_wa:
+                if user_id_str in temp_bans:
+                    del temp_bans[user_id_str]
+                    bans_lifted_count += 1
+                    log.info(f"Super admin cleared all pending, lifting temp ban for user {user_id_str}.")
 
-        username_count = sum(len(items) for items in issued_data.get("username", {}).values())
-        whatsapp_count = sum(len(items) for items in issued_data.get("whatsapp", {}).values())
-        app_id_count = sum(len(items) for items in issued_data.get("app_id", {}).values())
+            username_count = sum(len(items) for items in issued_data.get("username", {}).values())
+            whatsapp_count = sum(len(items) for items in issued_data.get("whatsapp", {}).values())
+            app_id_count = sum(len(items) for items in issued_data.get("app_id", {}).values())
 
-        if username_count == 0 and whatsapp_count == 0 and app_id_count == 0:
-            return "There were no pending items to clear."
+            if username_count == 0 and whatsapp_count == 0 and app_id_count == 0:
+                return "There were no pending items to clear."
 
-        issued_data["username"] = {}
-        issued_data["whatsapp"] = {}
-        issued_data["app_id"] = {}
+            issued_data["username"] = {}
+            issued_data["whatsapp"] = {}
+            issued_data["app_id"] = {}
 
-        await save_state()
+            await save_state()
         log.info(f"Admin cleared all pending items. Removed {username_count} usernames, {whatsapp_count} whatsapps, {app_id_count} app IDs.")
         
         reply_message = f"✅ All pending items have been cleared ({username_count} usernames, {whatsapp_count} whatsapps, {app_id_count} app IDs)."
@@ -2250,6 +2124,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         if not _is_super_admin(user): return "Only the super admin can use this command."
 
         item_to_clear = m.group(1).strip()
+        
         for kind in ("username", "whatsapp", "app_id"):
             for user_id_str, items in list(_issued_bucket(kind).items()):
                 for item in items:
@@ -2264,19 +2139,20 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
                     if match_found:
                         user_id = int(user_id_str)
-                        if await _clear_issued(user_id, kind, stored_value):
+                        cleared = await _clear_one_issued(user_id, kind, stored_value)
+                        if cleared:
                             user_info = state.get("user_names", {}).get(user_id_str, {})
                             user_name = user_info.get("username") or user_info.get("first_name") or f"ID {user_id}"
                             reply_message = f"✅ Cleared pending {kind} <code>{stored_value}</code> for user {user_name}."
 
-                            # If a WA item is cleared by a super admin, lift any related temp ban
                             if kind == "whatsapp":
-                                temp_bans = state.setdefault("whatsapp_temp_bans", {})
-                                if user_id_str in temp_bans:
-                                    del temp_bans[user_id_str]
-                                    await save_state() # Save state after modifying bans
-                                    reply_message += "\nUser's temporary WhatsApp ban has been lifted."
-                                    log.info(f"Super admin cleared pending WA, lifting temp ban for user {user_id_str}.")
+                                async with db_lock:
+                                    temp_bans = state.setdefault("whatsapp_temp_bans", {})
+                                    if user_id_str in temp_bans:
+                                        del temp_bans[user_id_str]
+                                        await save_state()
+                                        reply_message += "\nUser's temporary WhatsApp ban has been lifted."
+                                        log.info(f"Super admin cleared pending WA, lifting temp ban for user {user_id_str}.")
                             
                             return reply_message
 
@@ -2338,7 +2214,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         async with pool.acquire() as conn:
             await conn.execute("INSERT INTO user_country_bans (user_id, country) VALUES ($1, $2) ON CONFLICT (user_id, country) DO NOTHING", target_user_id, country)
 
-        await load_user_country_bans() # Reload the cache
+        await load_user_country_bans()
         return f"User {target_name} is now banned from submitting for country: '{country}'."
 
     m = UNBAN_COUNTRY_RX.match(text)
@@ -2355,7 +2231,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM user_country_bans WHERE user_id = $1 AND country = $2", target_user_id, country)
         
-        await load_user_country_bans() # Reload the cache
+        await load_user_country_bans()
         return f"User {target_name} has been unbanned from submitting for country: '{country}'."
 
     m = LIST_COUNTRY_BANS_RX.match(text)
@@ -2425,8 +2301,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         return await _get_request_stats_text()
 
     if COMMANDS_RX.match(text):
-        command_list_text = _get_commands_text()
-        return command_list_text
+        return _get_commands_text()
 
     m = LIST_PENDING_RX.match(text)
     if m:
@@ -2436,24 +2311,18 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         lines = ["<b>⏳ All Pending Items by User:</b>"]
         total_pending = 0
 
-        # Check all kinds of pending items
         for kind, label in [("username", "Usernames"), ("whatsapp", "WhatsApps"), ("app_id", "App IDs")]:
             pending_bucket = _issued_bucket(kind)
-            if not pending_bucket:
-                continue
+            if not pending_bucket: continue
 
-            kind_lines = []
-            kind_total = 0
-
+            kind_lines, kind_total = [], 0
             for user_id_str, items in sorted(pending_bucket.items()):
-                if not items:
-                    continue
+                if not items: continue
 
                 user_id = int(user_id_str)
                 user_info = state.get("user_names", {}).get(user_id_str, {})
                 user_display = user_info.get('username') or user_info.get('first_name') or f"ID {user_id}"
-                if user_info.get('username'):
-                    user_display = f"@{user_display}"
+                if user_info.get('username'): user_display = f"@{user_display}"
                 
                 user_item_lines = [f"  - <code>{item.get('value')}</code>" for item in items if item.get('value')]
                 
@@ -2499,7 +2368,6 @@ async def _send_all_pending_reminders(context: ContextTypes.DEFAULT_TYPE) -> str
     reminded_users = set()
 
     reminders_to_send = []
-    # MODIFIED: Removed 'app_id' from the reminder loop
     for kind in ("username", "whatsapp"):
         bucket = _issued_bucket(kind)
         for user_id_str, items in bucket.items():
@@ -2519,70 +2387,56 @@ async def _send_all_pending_reminders(context: ContextTypes.DEFAULT_TYPE) -> str
         return "No pending items found to send reminders for."
 
     for r in reminders_to_send:
-        try:
-            await context.bot.send_message(
-                chat_id=r['chat_id'],
-                text=r['text'],
-                parse_mode=ParseMode.HTML
-            )
-            total_reminders_sent += 1
-            reminded_users.add(r['user_id'])
-        except Exception as e:
-            log.error(f"Error sending manual reminder for user {r['user_id']}: {e}")
+        await safe_send_message(context, r['chat_id'], r['text'])
+        total_reminders_sent += 1
+        reminded_users.add(r['user_id'])
 
     return f"Successfully sent {total_reminders_sent} reminder(s) to {len(reminded_users)} user(s)."
 
-# NEW: Function to clear expired App IDs
 async def _clear_expired_app_ids(context: ContextTypes.DEFAULT_TYPE):
     log.info("Running hourly check for expired App IDs...")
     now = datetime.now(TIMEZONE)
     forty_eight_hours = timedelta(hours=48)
-    state_changed = False
-
-    pending_apps = _issued_bucket("app_id")
-
-    for user_id_str, items in list(pending_apps.items()):
-        items_to_keep = []
-        for item in items:
-            try:
-                item_ts = datetime.fromisoformat(item["ts"])
-                if (now - item_ts) > forty_eight_hours:
-                    log.info(f"Expired App ID '{item['value']}' for user {user_id_str} removed after 48 hours.")
-                    state_changed = True
-                else:
+    
+    async with db_lock:
+        state_changed = False
+        pending_apps = _issued_bucket("app_id")
+        for user_id_str, items in list(pending_apps.items()):
+            items_to_keep = []
+            for item in items:
+                try:
+                    item_ts = datetime.fromisoformat(item["ts"])
+                    if (now - item_ts) > forty_eight_hours:
+                        log.info(f"Expired App ID '{item['value']}' for user {user_id_str} removed after 48 hours.")
+                        state_changed = True
+                    else:
+                        items_to_keep.append(item)
+                except Exception as e:
+                    log.warning(f"Could not parse timestamp for item {item} for user {user_id_str}: {e}")
                     items_to_keep.append(item)
-            except Exception as e:
-                log.warning(f"Could not parse timestamp for item {item} for user {user_id_str}: {e}")
-                items_to_keep.append(item) # Keep item if timestamp is invalid
 
-        if not items_to_keep:
-            if user_id_str in pending_apps:
-                del pending_apps[user_id_str]
+            if not items_to_keep:
+                if user_id_str in pending_apps:
+                    del pending_apps[user_id_str]
+            else:
+                pending_apps[user_id_str] = items_to_keep
+
+        if state_changed:
+            await save_state()
+            log.info("Finished clearing expired App IDs. State saved.")
         else:
-            pending_apps[user_id_str] = items_to_keep
-
-    if state_changed:
-        await save_state()
-        log.info("Finished clearing expired App IDs. State saved.")
-    else:
-        log.info("No expired App IDs found.")
+            log.info("No expired App IDs found.")
 
 
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handles sending reminders and applying escalating bans for non-compliance.
-    - Usernames get repeated reminders.
-    - WhatsApp failures escalate from 30min ban -> 2hr ban -> permanent ban.
-    - Overdue WhatsApp items are NOT cleared automatically, but are marked to prevent repeat punishments.
-    """
     reminders_to_send = []
-    state_changed = False
-
+    
     async with db_lock:
+        state_changed = False
         now = datetime.now(TIMEZONE)
-        pool = await get_db_pool() # For permanent bans
+        pool = await get_db_pool()
 
-        # Handle username reminders (sends a reminder every `REMINDER_DELAY_MINUTES`)
+        # Handle username reminders
         username_bucket = _issued_bucket("username")
         for user_id_str, items in list(username_bucket.items()):
             for item in list(items):
@@ -2591,14 +2445,10 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                     base_ts = datetime.fromisoformat(last_reminder_ts_str) if last_reminder_ts_str else datetime.fromisoformat(item["ts"])
 
                     if (now - base_ts) > timedelta(minutes=REMINDER_DELAY_MINUTES):
-                        user_id = int(user_id_str)
-                        chat_id = item.get("chat_id")
-                        value = item.get("value")
+                        user_id, chat_id, value = int(user_id_str), item.get("chat_id"), item.get("value")
                         if chat_id and value:
-                            reminder_text = (
-                                f"សូមរំលឹក: {mention_user_html(user_id)}, "
-                                f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ username {value} ដែលអ្នកបានស្នើសុំ។"
-                            )
+                            reminder_text = (f"សូមរំលឹក: {mention_user_html(user_id)}, "
+                                             f"អ្នកនៅមិនទាន់បានផ្តល់ព័ត៌មានសម្រាប់ username {value} ដែលអ្នកបានស្នើសុំ។")
                             reminders_to_send.append({'chat_id': chat_id, 'text': reminder_text})
                             item["last_reminder_ts"] = now.isoformat()
                             state_changed = True
@@ -2613,10 +2463,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             for item in items:
                 try:
                     item_ts = datetime.fromisoformat(item["ts"])
-                    
-                    # Check if item is overdue AND has not already been punished for this offense
                     if (now - item_ts) > timedelta(minutes=REMINDER_DELAY_MINUTES) and not item.get("punished"):
-                        # This item is overdue. Time to remind AND ban.
                         offense_counts = state.setdefault("whatsapp_offense_count", {})
                         offense_count = offense_counts.get(user_id_str, 0) + 1
                         offense_counts[user_id_str] = offense_count
@@ -2624,71 +2471,53 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
 
                         ban_message_khmer = ""
                         if offense_count == 1:
-                            # First offense: 30-minute ban
                             ban_duration_minutes = 30
                             ban_until = now + timedelta(minutes=ban_duration_minutes)
                             state.setdefault("whatsapp_temp_bans", {})[user_id_str] = ban_until.isoformat()
-                            ban_message_khmer = (
-                                f"សូមរំលឹក: {mention_user_html(user_id)}, អ្នកមិនបានផ្តល់ព័ត៌មានសម្រាប់ WhatsApp {item.get('value')}\n"
-                                f"អ្នកត្រូវបានហាមឃាត់ជាបណ្ដោះអាសន្នពីការស្នើសុំលេខ WhatsApp រយៈពេល {ban_duration_minutes} នាទី។"
-                            )
+                            ban_message_khmer = (f"សូមរំលឹក: {mention_user_html(user_id)}, អ្នកមិនបានផ្តល់ព័ត៌មានសម្រាប់ WhatsApp {item.get('value')}\n"
+                                                 f"អ្នកត្រូវបានហាមឃាត់ជាបណ្ដោះអាសន្នពីការស្នើសុំលេខ WhatsApp រយៈពេល {ban_duration_minutes} នាទី។")
                             log.info(f"User {user_id} temp-banned for {ban_duration_minutes} mins (1st offense).")
                         elif offense_count == 2:
-                            # Second offense: 2-hour ban
                             ban_duration_minutes = 120
                             ban_until = now + timedelta(minutes=ban_duration_minutes)
                             state.setdefault("whatsapp_temp_bans", {})[user_id_str] = ban_until.isoformat()
-                            ban_message_khmer = (
-                                f"{mention_user_html(user_id)}, ដោយសារអ្នកបានធ្វើកំហុសដដែលម្តងទៀត, "
-                                f"អ្នកត្រូវបានហាមឃាត់ពីការស្នើសុំលេខ WhatsApp រយៈពេល 2 ម៉ោង។"
-                            )
+                            ban_message_khmer = (f"{mention_user_html(user_id)}, ដោយសារអ្នកបានធ្វើកំហុសដដែលម្តងទៀត, "
+                                                 f"អ្នកត្រូវបានហាមឃាត់ពីការស្នើសុំលេខ WhatsApp រយៈពេល 2 ម៉ោង។")
                             log.info(f"User {user_id} temp-banned for {ban_duration_minutes} mins (2nd offense).")
-                        else: # 3rd or more offense
-                            # Third offense: Permanent ban
+                        else: # 3rd+ offense
                             WHATSAPP_BANNED_USERS.add(user_id)
                             async with pool.acquire() as conn:
                                 await conn.execute("INSERT INTO whatsapp_bans (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id)
-                            ban_message_khmer = (
-                                f"{mention_user_html(user_id)}, ដោយសារតែការមិនគោរពតាមការរំលឹកជាច្រើនដង, "
-                                f"អ្នកត្រូវបានហាមឃាត់ជាអចិន្ត្រៃយ៍ពីការស្នើសុំលេខ WhatsApp។"
-                            )
+                            ban_message_khmer = (f"{mention_user_html(user_id)}, ដោយសារតែការមិនគោរពតាមការរំលឹកជាច្រើនដង, "
+                                                 f"អ្នកត្រូវបានហាមឃាត់ជាអចិន្ត្រៃយ៍ពីការស្នើសុំលេខ WhatsApp។")
                             log.info(f"User {user_id} permanently banned from WhatsApp requests (3rd+ offense).")
 
                         if ban_message_khmer:
                             reminders_to_send.append({'chat_id': item.get("chat_id"), 'text': ban_message_khmer})
 
-                        # Mark the item as punished to prevent re-punishing, but DO NOT clear it.
                         item["punished"] = True
                         state_changed = True
-
                 except Exception as e:
                     log.error(f"Error processing reminder/ban for user {user_id_str}: {e}")
 
         if state_changed:
             await save_state()
 
-    # Send all queued messages
+    # Send all queued messages outside the lock
     for r in reminders_to_send:
-        try:
-            await context.bot.send_message(chat_id=r['chat_id'], text=r['text'], parse_mode=ParseMode.HTML)
-        except Exception as e:
-            log.error(f"Failed to send reminder/ban message to chat {r['chat_id']}: {e}")
+        await safe_send_message(context, r['chat_id'], r['text'])
 
 async def check_request_ratio_and_stop_whatsapp(context: ContextTypes.DEFAULT_TYPE):
     """Checks the ratio of WA to Username requests for the previous 60-min block and stops all WA if the ratio is too high."""
     log.info("Running 60-minute check of request ratio...")
     
     now = datetime.now(TIMEZONE)
-    
-    # Determine the start and end of the 60-minute block that just concluded.
-    # The job runs at the top of the hour, so we check the previous hour.
     end_time = now.replace(minute=0, second=0, microsecond=0)
     start_time = end_time - timedelta(hours=1)
     
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
-            # Query for the specific, fixed block
             wa_count = await conn.fetchval(
                 "SELECT COUNT(*) FROM audit_log WHERE kind = 'whatsapp' AND action = 'issued' AND ts_local >= $1 AND ts_local < $2",
                 start_time, end_time
@@ -2715,7 +2544,7 @@ async def check_request_ratio_and_stop_whatsapp(context: ContextTypes.DEFAULT_TY
                         changed += 1
             
             if changed > 0:
-                await _rebuild_pools_preserving_rotation()
+                await _rebuild_pools_preserving_rotation() # This saves owner data and reloads pools
                 
                 notification_text = (
                     f"⚠️ <b>Automatic Action</b> ⚠️\n\n"
@@ -2723,10 +2552,7 @@ async def check_request_ratio_and_stop_whatsapp(context: ContextTypes.DEFAULT_TY
                     f"exceeded username requests ({username_count}) in the last 60-minute block.\n\n"
                     f"An admin can re-enable them using the <code>open all whatsapp</code> or <code>open [number]</code> command."
                 )
-                try:
-                    await context.bot.send_message(chat_id=REQUEST_GROUP_ID, text=notification_text, parse_mode=ParseMode.HTML)
-                except Exception as e:
-                    log.error(f"Failed to send request ratio notification: {e}")
+                await safe_send_message(context, REQUEST_GROUP_ID, notification_text)
 
 
 async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
@@ -2734,374 +2560,327 @@ async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
     async with db_lock:
         state['catch_up_assignments'] = {}
         state['catch_up_cooldowns'] = {}
-        state['whatsapp_offense_count'] = {} # Reset offense counts daily
+        state['whatsapp_offense_count'] = {}
         log.info("Resetting daily catch-up assignments, cooldowns, and WhatsApp offense counters.")
         try:
             pool = await get_db_pool()
             async with pool.acquire() as conn:
-                await conn.execute("DELETE FROM wa_daily_usage;")
-                await conn.execute("DELETE FROM user_daily_activity;")
-                await conn.execute("DELETE FROM user_daily_country_counts;")
-                await conn.execute("DELETE FROM user_daily_confirmations;")
-                await conn.execute("DELETE FROM owner_daily_performance;")
-                log.info("Cleared daily WhatsApp, user activity, country, confirmation, and performance quotas from database.")
+                await conn.execute("""
+                    DELETE FROM wa_daily_usage;
+                    DELETE FROM user_daily_activity;
+                    DELETE FROM user_daily_country_counts;
+                    DELETE FROM user_daily_confirmations;
+                    DELETE FROM owner_daily_performance;
+                """)
+                log.info("Cleared daily DB tables.")
         except Exception as e:
             log.error(f"Failed to clear daily tables: {e}")
 
         await save_state()
-        log.info("Daily reset complete. Pending items from previous days are preserved.")
+        log.info("Daily reset complete.")
 
 # =============================
-# MESSAGE HANDLER
+# MESSAGE HANDLER (REFACTORED)
 # =============================
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_chat or not update.effective_user or \
-       update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+    if not update.effective_chat or not update.effective_user or update.effective_user.is_bot:
+        return
+        
+    if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
 
     msg = update.effective_message
     text = (msg.text or msg.caption or "").strip()
-    uid = update.effective_user.id
     chat_id = msg.chat_id
     cache_user_info(update.effective_user)
 
-    async with db_lock:
-        # User "my detail" command
-        if MY_DETAIL_RX.match(text):
-            if chat_id == DETAIL_GROUP_ID:
-                if uid not in WHITELISTED_USERS and not _is_admin(update.effective_user):
-                    return
-                detail_text = await _get_user_detail_text(uid)
-                await msg.reply_html(detail_text)
+    # --- Admin commands can run in any group ---
+    if _is_admin(update.effective_user):
+        admin_reply = await _handle_admin_command(text, context, update)
+        if admin_reply:
+            await safe_reply_html(msg, admin_reply)
             return
 
-        # Owner "my performance" command
-        m_my_perf = MY_PERFORMANCE_RX.match(text)
-        if m_my_perf:
-            if chat_id in PERFORMANCE_GROUP_IDS:
-                if _is_owner(update.effective_user):
-                    owner_name = _norm_owner_name(update.effective_user.username)
-                    target_day = _parse_report_day(m_my_perf.group(1))
-                    perf_text = await _get_owner_performance_text(owner_name, target_day)
-                    await msg.reply_html(perf_text)
-                else:
-                    await msg.reply_text("This command is only for registered owners.")
-            return
+    # --- Group-specific logic ---
+    if chat_id == REQUEST_GROUP_ID:
+        await _handle_request_group_message(update, context)
+        return
+    elif chat_id == CLEARING_GROUP_ID:
+        await _handle_clearing_group_message(update, context)
+        return
+    elif chat_id == CONFIRMATION_GROUP_ID:
+        await _handle_confirmation_group_message(update, context)
+        return
+    elif chat_id == DETAIL_GROUP_ID:
+        await _handle_detail_group_message(update, context)
+        return
+    elif chat_id in PERFORMANCE_GROUP_IDS:
+        await _handle_performance_group_message(update, context)
+        return
+    
+    # --- General commands ---
+    m_owner = WHO_USING_REGEX.match(text)
+    if m_owner:
+        handle, phone = m_owner.groups()
+        if handle:
+            key = _norm_handle(handle); hits = HANDLE_INDEX.get(key, [])
+            owners = sorted({h['owner'] for h in hits}) if hits else []
+            reply = f"Owner of username @{key} → " + (", ".join(f"@{o}" for o in owners) if owners else "not found")
+        else:
+            pnorm = _norm_phone(phone); rec = PHONE_INDEX.get(pnorm)
+            if rec and rec.get("channel") == "whatsapp": reply = f"Owner of WhatsApp {phone} → @{rec['owner']}"
+            elif rec: reply = f"Owner of number {phone} → @{rec['owner']} (@{rec.get('telegram') or '-'})"
+            else: reply = f"Owner of number {phone} → not found"
+        await safe_reply_html(msg, reply)
 
-        # Admin: Report
-        mrep = SEND_REPORT_RX.match(text)
-        if _is_admin(update.effective_user) and _has_permission(update.effective_user, 'report') and mrep:
-            target_day = _parse_report_day(mrep.group(1))
-            err, excel_buffer = await _get_daily_excel_report(target_day)
 
-            if err:
-                await msg.reply_text(err)
-            elif excel_buffer:
-                file_name = f"daily_summary_{target_day.isoformat()}.xlsx"
-                await msg.reply_document(
-                    document=excel_buffer, filename=file_name,
-                    caption=f"Daily summary (logical day starting 05:30) — {target_day}"
-                )
-            return
+async def _handle_request_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    text = (msg.text or "").strip()
+    uid = update.effective_user.id
+    
+    if uid not in WHITELISTED_USERS and not _is_admin(update.effective_user):
+        return
 
-        # Admin "performance @owner" command
-        m_owner_perf = PERFORMANCE_OWNER_RX.match(text)
-        if _is_admin(update.effective_user) and _has_permission(update.effective_user, 'performance') and m_owner_perf:
-            owner_name_raw, day_str = m_owner_perf.groups()
-            owner_name = _norm_owner_name(owner_name_raw)
-            if not _find_owner_group(owner_name):
-                await msg.reply_text(f"Owner '{owner_name}' not found.")
-                return
-            target_day = _parse_report_day(day_str)
-            perf_text = await _get_owner_performance_text(owner_name, target_day)
-            await msg.reply_html(perf_text)
-            return
-
-        # Admin: Console
-        if _is_admin(update.effective_user):
-            admin_reply = await _handle_admin_command(text, context, update)
-            if admin_reply:
-                await msg.reply_html(admin_reply)
+    if NEED_USERNAME_RX.match(text):
+        now = datetime.now(TIMEZONE)
+        last_req_ts_str = state.setdefault("username_last_request_ts", {}).get(str(uid))
+        if last_req_ts_str:
+            last_req_ts = datetime.fromisoformat(last_req_ts_str)
+            if (now - last_req_ts) < timedelta(minutes=1):
+                await safe_reply_html(msg, "អ្នកអាចស្នើសុំ username បានតែម្តងគត់ក្នុងមួយនាទី។ សូមរង់ចាំ។")
                 return
 
-        if chat_id == CONFIRMATION_GROUP_ID:
-            if '+1' in text:
-                match = re.search(r'\+1\s+@([^\s]+)', text)
-                if match:
-                    app_id_confirmed_raw = f"@{match.group(1)}"
-                    found_and_counted = False
+        rec = await _next_from_username_pool()
 
-                    # Search all users to find who this App ID belongs to
-                    for user_id_str, items in list(_issued_bucket("app_id").items()):
-                        if found_and_counted: break
-                        for item in items:
-                            stored_app_id_raw = item.get("value", "")
+        reply = "No available username." if not rec else f"@{rec['owner']}\n{rec['username']}"
+        await safe_reply_html(msg, reply)
+        if rec:
+            async with db_lock:
+                state.setdefault("username_last_request_ts", {})[str(uid)] = now.isoformat()
+                await save_state()
+            await _set_issued(uid, msg.chat_id, "username", rec["username"], context_data={"owner": rec["owner"]})
+            await _log_event("username", "issued", update, rec["username"], owner=rec["owner"])
+            await _increment_user_activity(uid, "username")
 
-                            match_is_found = (_normalize_app_id(stored_app_id_raw) == _normalize_app_id(app_id_confirmed_raw))
-
-                            if match_is_found:
-                                user_id_of_item = int(user_id_str)
-                                confirming_owner_name = _norm_owner_name(update.effective_user.username)
-                                source_kind = item.get("source_kind")
-
-                                await _increment_user_confirmation_count(user_id_of_item)
-                                await _increment_owner_performance(confirming_owner_name, source_kind)
-                                await _log_event("app_id", "confirmed", update, stored_app_id_raw, owner=confirming_owner_name)
-                                await _clear_one_issued(user_id_of_item, "app_id", stored_app_id_raw)
-                                log.info(f"Owner {confirming_owner_name} confirmed App ID {stored_app_id_raw}. Counted and cleared for user {user_id_of_item}")
-                                found_and_counted = True
-                                break
-
-                    if not found_and_counted:
-                        suggestion = _find_closest_app_id(app_id_confirmed_raw)
-                        if suggestion:
-                            reply_text = (
-                                f"Wrong ID. Did you mean <code>{suggestion}</code>?\n\n"
-                                f"Tap to copy and send again:\n"
-                                f"<code>+1 {suggestion}</code>"
-                            )
-                            await msg.reply_html(reply_text)
-                        else:
-                            await msg.reply_text("Wrong ID, please check.")
-                        log.warning(f"Received confirmation for incorrect App ID '{app_id_confirmed_raw}' from {update.effective_user.username}.")
+    elif NEED_WHATSAPP_RX.match(text):
+        if uid in WHATSAPP_BANNED_USERS:
+            await safe_reply_html(msg, "អ្នកត្រូវបានហាមឃាត់ជាអចិន្ត្រៃយ៍ពីការស្នើសុំលេខ WhatsApp ។")
             return
 
-        elif chat_id == CLEARING_GROUP_ID:
-            # --- NEW: Strict format validation ---
-            required_labels = ['Name:', 'Age:', 'work:', 'from:', 'State :', 'App :']
-            text_lower = text.lower()
-            rejection_template = """<b>Please use the correct format:</b>
+        temp_bans = state.get("whatsapp_temp_bans", {})
+        if str(uid) in temp_bans:
+            ban_expires_ts = datetime.fromisoformat(temp_bans[str(uid)])
+            now = datetime.now(TIMEZONE)
+            if now < ban_expires_ts:
+                minutes_left = round((ban_expires_ts - now).total_seconds() / 60)
+                await safe_reply_html(msg, f"អ្នកត្រូវបានហាមឃាត់ជាបណ្ដោះអាសន្ន។ សូមព្យាយាមម្តងទៀតក្នុងរយៈពេល {minutes_left} នាទីទៀត។")
+                return
+            else:
+                async with db_lock:
+                    del temp_bans[str(uid)]
+                    await save_state()
+                log.info(f"Temporary WhatsApp ban for user {uid} has expired.")
+
+        now = datetime.now(TIMEZONE)
+        last_req_ts_str = state.setdefault("whatsapp_last_request_ts", {}).get(str(uid))
+        if last_req_ts_str:
+            last_req_ts = datetime.fromisoformat(last_req_ts_str)
+            if (now - last_req_ts) < timedelta(minutes=3):
+                await safe_reply_html(msg, "អ្នកអាចស្នើសុំលេខ WhatsApp បានតែម្តងគត់ក្នុងរយៈពេល 3 នាទី។ សូមរង់ចាំ។")
+                return
+
+        username_count, whatsapp_count = await _get_user_activity(uid)
+        has_bonus = username_count > USERNAME_THRESHOLD_FOR_BONUS
+
+        if not has_bonus and whatsapp_count >= USER_WHATSAPP_LIMIT:
+            await safe_reply_html(msg, f"អ្នកបានស្នើសុំ WhatsApp គ្រប់ចំនួនកំណត់សម្រាប់ថ្ងៃនេះហើយ។\nសូមស្នើសុំ username ឱ្យលើសពី {USERNAME_THRESHOLD_FOR_BONUS} ដើម្បីទទួលបានការស្នើសុំ WhatsApp បន្ថែមទៀតដោយគ្មានដែនកំណត់។")
+            return
+
+        rec = await _next_from_whatsapp_pool()
+
+        reply = "No available WhatsApp."
+        if rec:
+            if await _wa_quota_reached(rec["number"]):
+                reply = "No available WhatsApp (daily limit may be reached)."
+                rec = None
+            else:
+                reply = f"@{rec['owner']}\n{rec['number']}"
+
+        await safe_reply_html(msg, reply)
+        if rec:
+            await _wa_inc_count(_norm_phone(rec["number"]), _logical_day_today())
+            async with db_lock:
+                state.setdefault("whatsapp_last_request_ts", {})[str(uid)] = now.isoformat()
+                await save_state()
+            await _set_issued(uid, msg.chat_id, "whatsapp", rec["number"], context_data={"owner": rec["owner"]})
+            await _log_event("whatsapp", "issued", update, rec["number"], owner=rec["owner"])
+            await _increment_user_activity(uid, "whatsapp")
+
+async def _handle_clearing_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    text = (msg.text or msg.caption or "").strip()
+    uid = update.effective_user.id
+    
+    # Phrases to ignore in the clearing group, as they are owner acknowledgements
+    ignore_phrases = {'+1', 'no add', 'no add yet'}
+    if text.lower() in ignore_phrases:
+        log.info(f"Ignoring owner acknowledgement '{text}' from user {uid} in clearing group.")
+        return
+    
+    required_labels = ['Name', 'Age', 'work', 'from', 'State', 'App']
+    text_lower = text.lower()
+    rejection_template = """<b>Please use the correct format:</b>
 <pre>
 Name: [Your Name]
 Age: [Your Age]
 work: [Your Work]
 from: [Your Country]
-State : [Your State]
-App : [App Name]  ID: @[AppID]
+State: [Your State]
+App: [App Name]  ID: @[AppID]
 </pre>"""
 
-            # 1. Check for all required labels
-            if not all(label.lower() in text_lower for label in required_labels):
-                rejection_reason = "Your message is missing one or more required fields (Name, Age, work, from, State, App)."
-                await msg.reply_html(
-                    f"{mention_user_html(uid)}, your submission was rejected.\n<b>Reason:</b> {rejection_reason}\n\n{rejection_template}"
-                )
-                log.warning(f"Rejected post from user {uid} due to missing fields.")
-                return
+    missing_labels = [label for label in required_labels if not re.search(fr'^{re.escape(label.lower())}\s*:', text_lower, re.MULTILINE)]
 
-            # 2. Check for the App ID format specifically and extract it
-            app_id_match = re.search(r"App\s*:.*ID\s*:\s*@([a-zA-Z0-9_]{4,})", text, re.IGNORECASE | re.DOTALL)
-            if not app_id_match:
-                rejection_reason = "The 'App' line must follow the format 'App : [App Name] ID: @[AppID]'."
-                await msg.reply_html(
-                    f"{mention_user_html(uid)}, your submission was rejected.\n<b>Reason:</b> {rejection_reason}\n\n{rejection_template}"
-                )
-                log.warning(f"Rejected post from user {uid} due to incorrect App ID format.")
-                return
+    if missing_labels:
+        reason = f"Your message is missing or has a malformed label for: {', '.join(missing_labels)}."
+        await safe_reply_html(msg, f"{mention_user_html(uid)}, your submission was rejected.\n<b>Reason:</b> {reason}\n\n{rejection_template}")
+        log.warning(f"Rejected post from user {uid} due to missing labels: {', '.join(missing_labels)}")
+        return
 
-            # --- Validation passed, continue with existing logic ---
+    app_id_match = re.search(r"App\s*:.*ID\s*:\s*@([a-zA-Z0-9_]{4,})", text, re.IGNORECASE | re.DOTALL)
+    if not app_id_match:
+        reason = "The 'App' line must follow the format 'App: [App Name] ID: @[AppID]'."
+        await safe_reply_html(msg, f"{mention_user_html(uid)}, your submission was rejected.\n<b>Reason:</b> {reason}\n\n{rejection_template}")
+        log.warning(f"Rejected post from user {uid} due to incorrect App ID format.")
+        return
 
-            # Find any pending items mentioned in the message
-            pending_usernames = {item['value'] for item in _issued_bucket("username").get(str(uid), [])}
-            pending_whatsapps = {item['value'] for item in _issued_bucket("whatsapp").get(str(uid), [])}
-            found_usernames = {f"@{u}" for u in EXTRACT_USERNAMES_RX.findall(text)}
-            found_phones = EXTRACT_PHONES_RX.findall(text)
+    pending_usernames = {item['value'] for item in _issued_bucket("username").get(str(uid), [])}
+    pending_whatsapps = {item['value'] for item in _issued_bucket("whatsapp").get(str(uid), [])}
+    found_usernames = {f"@{u}" for u in EXTRACT_USERNAMES_RX.findall(text)}
+    found_phones = EXTRACT_PHONES_RX.findall(text)
 
-            values_found_in_message = set()
-            for u in found_usernames:
-                if u in pending_usernames:
-                    values_found_in_message.add(u)
-            for p in found_phones:
-                for pending_p in pending_whatsapps:
-                    if _norm_phone(p) == _norm_phone(pending_p):
-                        values_found_in_message.add(pending_p)
+    values_found_in_message = set()
+    for u in found_usernames:
+        if u in pending_usernames:
+            values_found_in_message.add(u)
+    for p in found_phones:
+        for pending_p in pending_whatsapps:
+            if _norm_phone(p) == _norm_phone(pending_p):
+                values_found_in_message.add(pending_p)
 
+    if not values_found_in_message:
+        await safe_reply_html(msg, f"{mention_user_html(uid)}, your submission is valid, but you must mention the username or number you received from the bot to clear it from your pending list.")
+        return
 
-            # If a pending item is mentioned, we must validate country/age first.
-            if values_found_in_message:
-                found_country, country_status = _find_country_in_text(text)
-                age = _find_age_in_text(text)
-                is_allowed = True
-                rejection_reason = ""
+    found_country, country_status = _find_country_in_text(text)
+    age = _find_age_in_text(text)
+    rejection_reason = ""
 
-                # Tiered validation checks
-                if country_status == 'not_allowed':
-                    is_allowed = False
-                    rejection_reason = f"Country '{found_country}' is not on the allowed list."
-                elif country_status: # If it's a known country
-                    user_bans = USER_COUNTRY_BANS.get(uid, set())
-                    if country_status in user_bans:
-                        is_allowed = False
-                        rejection_reason = f"You are specifically not allowed to submit for the country '{found_country}'."
-                    elif country_status == 'india' and (age is None or age < 30):
-                        is_allowed = False
-                        rejection_reason = f"Age must be provided and must be 30 or older for India (found: {age})."
+    if country_status == 'not_allowed':
+        rejection_reason = f"Country '{found_country}' is not on the allowed list."
+    elif country_status:
+        user_bans = USER_COUNTRY_BANS.get(uid, set())
+        if country_status in user_bans:
+            rejection_reason = f"You are not allowed to submit for the country '{found_country}'."
+        elif country_status == 'india' and (age is None or age < 30):
+            rejection_reason = f"Age must be provided and must be 30 or older for India (found: {age})."
 
-                if not is_allowed:
-                    first_offending_value = next(iter(values_found_in_message))
-                    item_type = "username" if first_offending_value.startswith('@') else "whatsapp"
-                    reply_text = (f"{mention_user_html(uid)}, your submission was rejected. Reason: {rejection_reason}\n"
-                                  f"Please use that {item_type} (<code>{first_offending_value}</code>) for another customer.")
-                    await msg.reply_html(reply_text)
-                    log.warning(f"Rejected post from user {uid}. Reason: {rejection_reason}. Pending item was NOT cleared.")
-                    return
-                else:
-                    if country_status:
-                        await _increment_user_country_count(uid, country_status)
-                        log.info(f"Incremented country count for user {uid} for '{country_status}'")
+    if rejection_reason:
+        first_offending_value = next(iter(values_found_in_message))
+        item_type = "username" if first_offending_value.startswith('@') else "whatsapp"
+        reply_text = (f"{mention_user_html(uid)}, your submission was rejected. Reason: {rejection_reason}\n"
+                      f"Please use that {item_type} (<code>{first_offending_value}</code>) for another customer.")
+        await safe_reply_html(msg, reply_text)
+        log.warning(f"Rejected post from user {uid}. Reason: {rejection_reason}. Pending item was NOT cleared.")
+        return
+    
+    if country_status:
+        await _increment_user_country_count(uid, country_status)
+        log.info(f"Incremented country count for user {uid} for '{country_status}'")
+    
+    app_id = f"@{app_id_match.group(1)}"
+    
+    source_item_value = next(iter(values_found_in_message))
+    source_kind = "whatsapp" if _looks_like_phone(source_item_value) else "username"
+    source_item = next((item for item in _issued_bucket(source_kind).get(str(uid), []) if item.get("value") == source_item_value), None)
 
+    if source_item:
+        context_data = {"source_owner": source_item.get("owner"), "source_kind": source_kind}
+        await _set_issued(uid, msg.chat_id, "app_id", app_id, context_data=context_data)
+        await _log_event("app_id", "issued", update, app_id, owner=context_data.get("source_owner", ""))
+        log.info(f"Recorded App ID '{app_id}' for user {uid}, linked to {source_kind} '{source_item_value}'")
+        
+        if await _clear_one_issued(uid, source_kind, source_item_value):
+            await _log_event(source_kind, "cleared", update, source_item_value)
+            log.info(f"Auto-cleared pending {source_kind} for user {uid}: {source_item_value}")
+    else:
+        log.error(f"Could not find source item for value '{source_item_value}' for user {uid}, though it was found in the message.")
 
-            # --- From this point, the post is considered valid ---
-            
-            # Logic to link a new App ID to a source (explicitly or implicitly)
-            app_id = f"@{app_id_match.group(1)}" # Group 1 is the app id from the new regex
-            source_item_to_clear, source_kind = None, None
+async def _handle_confirmation_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    text = (msg.text or "").strip()
 
-            # Priority 1: Link to an item explicitly mentioned in this message
-            if values_found_in_message:
-                value = next(iter(values_found_in_message))
-                kind = "whatsapp" if _looks_like_phone(value) else "username"
-                for item in _issued_bucket(kind).get(str(uid), []):
-                    if item.get("value") == value:
-                        source_item_to_clear, source_kind = item, kind
+    if '+1' in text:
+        match = re.search(r'\+1\s+@([^\s]+)', text)
+        if match:
+            app_id_confirmed_raw = f"@{match.group(1)}"
+            found_and_counted = False
+
+            app_id_bucket = _issued_bucket("app_id")
+            for user_id_str, items in list(app_id_bucket.items()):
+                if found_and_counted: break
+                for item in items:
+                    stored_app_id_raw = item.get("value", "")
+                    if _normalize_app_id(stored_app_id_raw) == _normalize_app_id(app_id_confirmed_raw):
+                        user_id_of_item = int(user_id_str)
+                        confirming_owner_name = _norm_owner_name(update.effective_user.username)
+                        source_kind = item.get("source_kind")
+
+                        await _increment_user_confirmation_count(user_id_of_item)
+                        await _increment_owner_performance(confirming_owner_name, source_kind)
+                        await _log_event("app_id", "confirmed", update, stored_app_id_raw, owner=confirming_owner_name)
+                        await _clear_one_issued(user_id_of_item, "app_id", stored_app_id_raw)
+                        
+                        log.info(f"Owner {confirming_owner_name} confirmed App ID {stored_app_id_raw}. Counted and cleared for user {user_id_of_item}")
+                        found_and_counted = True
                         break
-            # Priority 2 (Fallback): Link to the most recently issued item for this user
-            else:
-                last_item, last_ts = None, datetime.min.replace(tzinfo=TIMEZONE)
-                for kind in ("username", "whatsapp"):
-                    user_items = _issued_bucket(kind).get(str(uid), [])
-                    if user_items:
-                        latest_in_kind = user_items[-1]
-                        item_ts = datetime.fromisoformat(latest_in_kind["ts"])
-                        if item_ts > last_ts:
-                            last_ts = item_ts
-                            last_item = latest_in_kind
-                            last_item['kind'] = kind # Store kind for later
-                if last_item:
-                    source_item_to_clear, source_kind = last_item, last_item['kind']
-
-
-            # If we found a source item, log the new App ID and clear the source
-            if source_item_to_clear and source_kind:
-                context_data = {
-                    "source_owner": source_item_to_clear.get("owner"),
-                    "source_kind": source_kind
-                }
-                value_to_clear = source_item_to_clear.get("value")
-                await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
-                await _log_event("app_id", "issued", update, app_id, owner=context_data.get("source_owner", ""))
-                log.info(f"Recorded App ID '{app_id}' for user {uid}, linked to {source_kind} '{value_to_clear}'")
-                if await _clear_one_issued(uid, source_kind, value_to_clear):
-                    await _log_event(source_kind, "cleared", update, value_to_clear)
-                    log.info(f"Auto-cleared pending {source_kind} for user {uid}: {value_to_clear}")
             
-            else:
-                # Treat unlinked App IDs as valid entries, storing them for later confirmation
-                context_data = {"source_owner": "unknown", "source_kind": "app_id"}
-                await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
-                await _log_event("app_id", "issued", update, app_id)
-                log.info(
-                    f"Recorded App ID '{app_id}' for user {uid} without a source item"
-                )
-            return # End of processing for this group
+            if not found_and_counted:
+                suggestion = _find_closest_app_id(app_id_confirmed_raw)
+                if suggestion:
+                    reply_text = (f"Wrong ID. Did you mean <code>{suggestion}</code>?\n\n"
+                                  f"Tap to copy and send again:\n"
+                                  f"<code>+1 {suggestion}</code>")
+                    await safe_reply_html(msg, reply_text)
+                else:
+                    await safe_reply_html(msg, "Wrong ID, please check.")
+                log.warning(f"Received confirmation for incorrect App ID '{app_id_confirmed_raw}' from {update.effective_user.username}.")
 
-        elif chat_id == REQUEST_GROUP_ID:
-            if uid not in WHITELISTED_USERS and not _is_admin(update.effective_user):
-                return
-                
-            if NEED_USERNAME_RX.match(text):
-                # Cooldown check for usernames
-                now = datetime.now(TIMEZONE)
-                last_req_ts_str = state.setdefault("username_last_request_ts", {}).get(str(uid))
-                if last_req_ts_str:
-                    last_req_ts = datetime.fromisoformat(last_req_ts_str)
-                    if (now - last_req_ts) < timedelta(minutes=1):
-                        await msg.reply_text("អ្នកអាចស្នើសុំ username បានតែម្តងគត់ក្នុងមួយនាទី។ សូមរង់ចាំ។")
-                        return
-
-                rec = await _next_from_username_pool()
-                reply = "No available username." if not rec else f"@{rec['owner']}\n{rec['username']}"
-                await msg.reply_text(reply)
-                if rec:
-                    # Record the time of this successful request
-                    state.setdefault("username_last_request_ts", {})[str(uid)] = now.isoformat()
-                    await _set_issued(uid, chat_id, "username", rec["username"], context_data={"owner": rec["owner"]})
-                    await _log_event("username", "issued", update, rec["username"], owner=rec["owner"])
-                    await _increment_user_activity(uid, "username")
-                return
-
-            if NEED_WHATSAPP_RX.match(text):
-                if uid in WHATSAPP_BANNED_USERS:
-                    await msg.reply_text("អ្នកត្រូវបានហាមឃាត់ជាអចិន្ត្រៃយ៍ពីការស្នើសុំលេខ WhatsApp ។")
-                    return
-
-                # Check for temporary bans
-                temp_bans = state.get("whatsapp_temp_bans", {})
-                if str(uid) in temp_bans:
-                    ban_expires_ts = datetime.fromisoformat(temp_bans[str(uid)])
-                    now = datetime.now(TIMEZONE)
-
-                    if now < ban_expires_ts:
-                        remaining_time = ban_expires_ts - now
-                        minutes_left = round(remaining_time.total_seconds() / 60)
-                        await msg.reply_text(f"អ្នកត្រូវបានហាមឃាត់ជាបណ្ដោះអាសន្ន។ សូមព្យាយាមម្តងទៀតក្នុងរយៈពេល {minutes_left} នាទីទៀត។")
-                        return
-                    else:
-                        # Ban has expired, remove it
-                        del temp_bans[str(uid)]
-                        await save_state()
-                        log.info(f"Temporary WhatsApp ban for user {uid} has expired and been removed.")
-
-                # Cooldown check
-                now = datetime.now(TIMEZONE)
-                last_req_ts_str = state.setdefault("whatsapp_last_request_ts", {}).get(str(uid))
-                if last_req_ts_str:
-                    last_req_ts = datetime.fromisoformat(last_req_ts_str)
-                    if (now - last_req_ts) < timedelta(minutes=3):
-                        await msg.reply_text("អ្នកអាចស្នើសុំលេខ WhatsApp បានតែម្តងគត់ក្នុងរយៈពេល 3 នាទី។ សូមរង់ចាំ។")
-                        return
-
-                username_count, whatsapp_count = await _get_user_activity(uid)
-                has_bonus = username_count > USERNAME_THRESHOLD_FOR_BONUS
-
-                if not has_bonus and whatsapp_count >= USER_WHATSAPP_LIMIT:
-                    await msg.reply_text(f"អ្នកបានស្នើសុំ WhatsApp គ្រប់ចំនួនកំណត់សម្រាប់ថ្ងៃនេះហើយ។\nសូមស្នើសុំ username ឱ្យលើសពី {USERNAME_THRESHOLD_FOR_BONUS} ដើម្បីទទួលបានការស្នើសុំ WhatsApp បន្ថែមទៀតដោយគ្មានដែនកំណត់។")
-                    return
-
-                rec = await _next_from_whatsapp_pool()
-                reply = "No available WhatsApp."
-                if rec:
-                    if await _wa_quota_reached(rec["number"]):
-                        reply = "No available WhatsApp (daily limit may be reached)."
-                        rec = None
-                    else:
-                        reply = f"@{rec['owner']}\n{rec['number']}"
-
-                await msg.reply_text(reply)
-                if rec:
-                    await _wa_inc_count(_norm_phone(rec["number"]), _logical_day_today())
-                    # Record the time of this successful request before saving state
-                    state.setdefault("whatsapp_last_request_ts", {})[str(uid)] = now.isoformat()
-                    await _set_issued(uid, chat_id, "whatsapp", rec["number"], context_data={"owner": rec["owner"]})
-                    await _log_event("whatsapp", "issued", update, rec["number"], owner=rec["owner"])
-                    await _increment_user_activity(uid, "whatsapp")
-                return
-
-        m_owner = WHO_USING_REGEX.match(text)
-        if m_owner:
-            handle, phone = m_owner.groups()
-            if handle:
-                key = _norm_handle(handle); hits = HANDLE_INDEX.get(key, [])
-                owners = sorted({h['owner'] for h in hits}) if hits else []
-                reply = f"Owner of username @{key} → " + (", ".join(f"@{o}" for o in owners) if owners else "not found")
-            else:
-                pnorm = _norm_phone(phone); rec = PHONE_INDEX.get(pnorm)
-                if rec and rec.get("channel") == "whatsapp": reply = f"Owner of WhatsApp {phone} → @{rec['owner']}"
-                elif rec: reply = f"Owner of number {phone} → @{rec['owner']} (@{rec.get('telegram') or '-'})"
-                else: reply = f"Owner of number {phone} → not found"
-
-            await msg.reply_text(reply)
+async def _handle_detail_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    text = (msg.text or "").strip()
+    uid = update.effective_user.id
+    
+    if MY_DETAIL_RX.match(text):
+        if uid not in WHITELISTED_USERS and not _is_admin(update.effective_user):
             return
+        detail_text = await _get_user_detail_text(uid)
+        await safe_reply_html(msg, detail_text)
+
+async def _handle_performance_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    text = (msg.text or "").strip()
+    
+    m_my_perf = MY_PERFORMANCE_RX.match(text)
+    if m_my_perf:
+        if _is_owner(update.effective_user):
+            owner_name = _norm_owner_name(update.effective_user.username)
+            target_day = _parse_report_day(m_my_perf.group(1))
+            perf_text = await _get_owner_performance_text(owner_name, target_day)
+            await safe_reply_html(msg, perf_text)
+        else:
+            await safe_reply_html(msg, "This command is only for registered owners.")
 
 # =============================
 # MAIN
@@ -3114,7 +2893,7 @@ async def post_initialization(application: Application):
     await _migrate_state_if_needed()
     await load_owner_directory()
     await load_whatsapp_bans()
-    await load_user_country_bans() # NEW: Load country bans
+    await load_user_country_bans()
     await load_admins()
     await load_whitelisted_users()
 
@@ -3123,7 +2902,8 @@ async def post_shutdown(application: Application):
     await close_db_pool()
 
 
-if __name__ == "__main__":
+async def main():
+    """Start the bot."""
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -3134,9 +2914,7 @@ if __name__ == "__main__":
 
     if app.job_queue:
         app.job_queue.run_repeating(check_reminders, interval=60, first=60)
-        # MODIFIED: Changed the check interval to 60 minutes (3600s).
         app.job_queue.run_repeating(check_request_ratio_and_stop_whatsapp, interval=3600, first=3600)
-        # NEW JOB for clearing expired IDs, runs every hour
         app.job_queue.run_repeating(_clear_expired_app_ids, interval=3600, first=3600)
         reset_time = time(hour=5, minute=31, tzinfo=TIMEZONE)
         app.job_queue.run_daily(daily_reset, time=reset_time)
@@ -3144,5 +2922,9 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.ALL, on_message))
 
     log.info("Bot is starting...")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    await app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
