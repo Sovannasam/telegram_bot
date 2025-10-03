@@ -59,7 +59,7 @@ CATCH_UP_COOLDOWN_MINUTES = int(os.getenv("CATCH_UP_COOLDOWN_MINUTES", "60")) # 
 ALLOWED_COUNTRIES = {
     'morocco', 'panama', 'saudi arabia', 'united arab emirates', 'uae',
     'oman', 'jordan', 'italy', 'germany', 'indonesia', 'colombia',
-    'bulgaria', 'brazil', 'spain', 'belgium','south africa',
+    'bulgaria', 'brazil', 'spain', 'belgium', 'south africa',
     'philippines', 'indian', 'india', 'portugal', 'netherlands', 'poland', 'ghana', 'dominican republic',
     'qatar', 'france', 'switzerland', 'argentina', 'costa rica', 'pakistan', 'kuwait'
 }
