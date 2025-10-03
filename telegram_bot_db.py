@@ -59,7 +59,7 @@ CATCH_UP_COOLDOWN_MINUTES = int(os.getenv("CATCH_UP_COOLDOWN_MINUTES", "60")) # 
 ALLOWED_COUNTRIES = {
     'morocco', 'panama', 'saudi arabia', 'united arab emirates', 'uae',
     'oman', 'jordan', 'italy', 'germany', 'indonesia', 'colombia',
-    'bulgaria', 'brazil', 'spain', 'belgium', 'algeria', 'south africa',
+    'bulgaria', 'brazil', 'spain', 'belgium','south africa',
     'philippines', 'indian', 'india', 'portugal', 'netherlands', 'poland', 'ghana', 'dominican republic',
     'qatar', 'france', 'switzerland', 'argentina', 'costa rica', 'pakistan', 'kuwait'
 }
@@ -2403,7 +2403,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
                     kind_lines.append(f"\n<b>{user_display}:</b>")
                     kind_lines.extend(user_item_lines)
                     kind_total += len(user_item_lines)
-            
+                
             if kind_total > 0:
                 lines.append(f"\n\n<b>--- {label} ({kind_total}) ---</b>")
                 lines.extend(kind_lines)
