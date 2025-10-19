@@ -43,7 +43,7 @@ ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "excelmerge")  # telegram username 
 WA_DAILY_LIMIT = int(os.getenv("WA_DAILY_LIMIT", "2"))        # max sends per number per logical day
 REMINDER_DELAY_MINUTES = int(os.getenv("REMINDER_DELAY_MINUTES", "30")) # Delay for reminders
 USER_WHATSAPP_LIMIT = int(os.getenv("USER_WHATSAPP_LIMIT", "10"))
-USERNAME_THRESHOLD_FOR_BONUS = int(os.getenv("USERNAME_THRESHOLD_FOR_BONUS", "35"))
+USERNAME_THRESHOLD_FOR_BONUS = int(os.getenv("USERNAME_THRESHOLD_FOR_BONUS", "25"))
 REQUEST_GROUP_ID = int(os.getenv("REQUEST_GROUP_ID", "-1002438185636")) # Group for 'i need ...' commands
 CLEARING_GROUP_ID = int(os.getenv("CLEARING_GROUP_ID", "-1002624324856")) # Group for auto-clearing pendings
 CONFIRMATION_GROUP_ID = int(os.getenv("CONFIRMATION_GROUP_ID", "-1002694540582"))
@@ -51,7 +51,7 @@ DETAIL_GROUP_ID = int(os.getenv("DETAIL_GROUP_ID", "-1002598927727")) # Group fo
 PERFORMANCE_GROUP_IDS = {
     -1002670785417, -1002659012767, -1002790753092, -1002520117752
 }
-CATCH_UP_LIMIT = int(os.getenv("CATCH_UP_LIMIT", "5")) # Limit for least-busy owner priority
+CATCH_UP_LIMIT = int(os.getenv("CATCH_UP_LIMIT", "4")) # Limit for least-busy owner priority
 CATCH_UP_COOLDOWN_MINUTES = int(os.getenv("CATCH_UP_COOLDOWN_MINUTES", "60")) # Cooldown in minutes after hitting catch-up limit
 
 
