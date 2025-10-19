@@ -61,7 +61,8 @@ ALLOWED_COUNTRIES = {
     'oman', 'jordan', 'italy', 'germany', 'indonesia', 'colombia',
     'bulgaria', 'brazil', 'spain', 'belgium', 'south africa',
     'philippines', 'indian', 'india', 'portugal', 'netherlands', 'poland', 'ghana', 'dominican republic',
-    'qatar', 'france', 'switzerland', 'argentina', 'costa rica', 'pakistan', 'kuwait'
+    'qatar', 'france', 'switzerland', 'argentina', 'costa rica', 'pakistan', 'kuwait', 'yemen', 'bahrain', 'malaysia', 
+    'canada'
 }
 
 TIMEZONE = pytz.timezone("Asia/Phnom_Penh")
