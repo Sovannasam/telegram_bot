@@ -2490,7 +2490,7 @@ async def _clear_expired_app_ids(context: ContextTypes.DEFAULT_TYPE):
             try:
                 item_ts = datetime.fromisoformat(item["ts"])
                 if (now - item_ts) > forty_eight_hours:
-                    log.info(f"Expired App ID '{item['value']}' for user {user_id_str} removed after 48 hours.")
+                    log.info(f"Expired App ID '{item['value']}' for user {user_id_str} removed after 72 hours.")
                     state_changed = True
                 else:
                     items_to_keep.append(item)
