@@ -67,7 +67,7 @@ ALLOWED_COUNTRIES = {
     'oman', 'jordan', 'italy', 'germany', 'indonesia', 'colombia',
     'bulgaria', 'brazil', 'spain', 'belgium', 'south africa',
     'philippines', 'indian', 'india', 'portugal', 'netherlands', 'poland', 'ghana', 'dominican republic',
-    'qatar', 'france', 'switzerland', 'argentina', 'costa rica', 'pakistan', 'kuwait', 'yemen', 'bahrain', 'malaysia', 
+    'qatar', 'france', 'switzerland', 'argentina', 'costa rica', 'pakistan', 'kuwait', 'yemen', 'bahrain', 'malaysia',
     'canada','mauritania'
 }
 
@@ -800,7 +800,7 @@ async def _get_next_owner_by_performance(pool: List[Dict], rr_idx_key: str) -> i
     # 2. Iterate through performance tiers to find the best candidate.
     for score in sorted_scores:
         owners_at_this_level = {owner for owner, s in performance.items() if s == score}
-        
+
         # Check which of these owners are actually eligible
         eligible_owners_in_tier = {
             owner for owner in owners_at_this_level
@@ -817,7 +817,7 @@ async def _get_next_owner_by_performance(pool: List[Dict], rr_idx_key: str) -> i
                     # This is our owner. Increment their assignment count.
                     new_assignment_count = catch_up_assignments.get(owner_name, 0) + 1
                     catch_up_assignments[owner_name] = new_assignment_count
-                    
+
                     # If this new assignment makes them hit the limit, start their cooldown.
                     if new_assignment_count >= CATCH_UP_LIMIT:
                         log.info(f"Owner {owner_name} has now hit the catch-up limit. Starting a {CATCH_UP_COOLDOWN_MINUTES}-minute cooldown.")
@@ -1240,26 +1240,26 @@ async def _get_owner_distribution_counts(owner_name: str, day: date) -> Tuple[in
 async def _get_user_performance_text(day: date) -> str:
     """Generates a ranked list of users by their successful customer confirmations."""
     lines = [f"<b>🏆 User Performance for {day.isoformat()}</b>"]
-    
+
     user_performances = []
-    
+
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT user_id, confirm_count 
-                FROM user_daily_confirmations 
+                SELECT user_id, confirm_count
+                FROM user_daily_confirmations
                 WHERE day = $1 AND confirm_count > 0
                 ORDER BY confirm_count DESC;
                 """,
                 day
             )
-            
+
             for row in rows:
                 user_id = row['user_id']
                 count = row['confirm_count']
-                
+
                 user_info = state.get("user_names", {}).get(str(user_id), {})
                 user_display = user_info.get('username') or user_info.get('first_name') or f"ID: {user_id}"
                 if user_info.get('username'):
@@ -1278,25 +1278,25 @@ async def _get_user_performance_text(day: date) -> str:
     for perf in user_performances:
         lines.append(f"<b>{rank}.</b> {perf['name']}: {perf['count']} customers")
         rank += 1
-        
+
     return "\n".join(lines)
 
 async def _get_user_stats_text(day: date) -> str:
     """Generates a ranked list of users by their success rate."""
     lines = [f"<b>📊 User Success Rate for {day.isoformat()}</b>"]
     user_stats = []
-    
+
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
             # Fetch all activity and confirmations for the day
             activity_rows = await conn.fetch("SELECT user_id, username_requests, whatsapp_requests FROM user_daily_activity WHERE day = $1", day)
             confirm_rows = await conn.fetch("SELECT user_id, confirm_count FROM user_daily_confirmations WHERE day = $1", day)
-            
+
             # Process into dictionaries for easy lookup
             activities = {r['user_id']: {'u': r['username_requests'], 'w': r['whatsapp_requests']} for r in activity_rows}
             confirmations = {r['user_id']: r['confirm_count'] for r in confirm_rows}
-            
+
             # Get a set of all unique user IDs who were active
             all_user_ids = set(activities.keys()) | set(confirmations.keys())
 
@@ -1306,19 +1306,19 @@ async def _get_user_stats_text(day: date) -> str:
             for user_id in all_user_ids:
                 activity = activities.get(user_id, {'u': 0, 'w': 0})
                 confirm_count = confirmations.get(user_id, 0)
-                
+
                 total_reqs = activity['u'] + activity['w']
-                
+
                 if total_reqs > 0:
                     rate = (confirm_count / total_reqs) * 100
                 else:
                     rate = 0.0 # User had confirmations but no recorded requests (unlikely but possible)
-                
+
                 user_info = state.get("user_names", {}).get(str(user_id), {})
                 user_display = user_info.get('username') or user_info.get('first_name') or f"ID: {user_id}"
                 if user_info.get('username'):
                     user_display = f"@{user_display}"
-                    
+
                 user_stats.append({
                     'name': user_display,
                     'rate': rate,
@@ -1332,12 +1332,12 @@ async def _get_user_stats_text(day: date) -> str:
 
     # Sort users by success rate, from highest to lowest
     user_stats.sort(key=lambda x: x['rate'], reverse=True)
-    
+
     rank = 1
     for stats in user_stats:
         lines.append(f"<b>{rank}.</b> {stats['name']}: <b>{stats['rate']:.1f}%</b> ({stats['confirm']} / {stats['reqs']})")
         rank += 1
-        
+
     return "\n".join(lines)
 
 
@@ -1756,9 +1756,9 @@ async def _get_request_stats_text() -> str:
         status = "🔴 HIGH - WhatsApp numbers will be automatically stopped if this ratio persists."
     else:
         status = "🟢 NORMAL - Ratio is stable."
-        
+
     lines.append(f"<b>- Current Status:</b> {status}")
-    
+
     return "\n".join(lines)
 
 
@@ -1778,11 +1778,11 @@ def _get_inventory_text() -> str:
             total_wa += 1
             if not wa_entry.get("disabled"):
                 active_wa += 1
-    
+
     lines = ["<b>📋 Bot Inventory Summary</b>"]
     lines.append(f"<b>- Usernames:</b> {active_usernames} active / {total_usernames} total")
     lines.append(f"<b>- WhatsApp Numbers:</b> {active_wa} active / {total_wa} total")
-    
+
     return "\n".join(lines)
 
 
@@ -1799,7 +1799,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
                 await conn.execute("INSERT INTO admins (username, permissions) VALUES ($1, '[]') ON CONFLICT(username) DO NOTHING", name)
             await load_admins()
             return f"Admin '{name}' added with no permissions."
-        
+
         m_add_user = ADD_USER_RX.match(text)
         if m_add_user:
             name = m_add_user.group(1)
@@ -1811,7 +1811,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
                 await conn.execute("INSERT INTO whitelisted_users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id)
             await load_whitelisted_users()
             return f"User '{name}' has been whitelisted."
-        
+
         m_del_user = DELETE_USER_RX.match(text)
         if m_del_user:
             name = m_del_user.group(1)
@@ -1947,13 +1947,13 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
                         found_item = w
                         break
                 if found_item: break
-            
+
             if not found_item: return f"WhatsApp number {value} not found."
 
             manager = found_item.get("managed_by")
             if manager and manager != current_admin and not _is_super_admin(user):
                 return f"You cannot manage this number. It is managed by @{manager}."
-            
+
             found_item["disabled"] = is_stop
             if not _is_super_admin(user):
                 found_item["managed_by"] = current_admin
@@ -1968,7 +1968,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
                         found_item = e
                         break
                 if found_item: break
-                
+
             if not found_item: return f"Username {value} not found."
 
             manager = found_item.get("managed_by")
@@ -1999,12 +1999,12 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         if not _has_permission(user, 'add owner'): return "You don't have permission to use this command."
         name = _norm_owner_name(m.group(1))
         if _find_owner_group(name): return f"Owner '{name}' already exists."
-        
+
         current_admin = _norm_owner_name(user.username)
         new_owner_data = {"owner": name}
         if not _is_super_admin(user):
             new_owner_data["managed_by"] = current_admin
-            
+
         OWNER_DATA.append(_ensure_owner_shape(new_owner_data))
         await _rebuild_pools_preserving_rotation()
         return f"Owner '{name}' added."
@@ -2020,7 +2020,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         manager = owner_group_to_delete.get("managed_by")
         if manager and manager != current_admin and not _is_super_admin(user):
             return f"You cannot delete owner @{name}. It is managed by @{manager}."
-        
+
         OWNER_DATA[:] = [g for g in OWNER_DATA if _norm_owner_name(g.get("owner","")) != name]
         if len(OWNER_DATA) == before: return f"Owner '{name}' not found."
         await _rebuild_pools_preserving_rotation()
@@ -2033,7 +2033,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         if not owner: return f"Owner '{owner_name}' not found."
         norm_h = _norm_handle(handle)
         if any(_norm_handle(e.get("telegram")) == norm_h for e in owner["entries"]): return f"@{handle} already exists for owner {owner_name}."
-        
+
         current_admin = _norm_owner_name(user.username)
         new_entry = {"telegram": handle, "phone": "", "disabled": False}
         if not _is_super_admin(user):
@@ -2050,12 +2050,12 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         if not owner: return f"Owner '{owner_name}' not found."
         norm_n = _norm_phone(num)
         if any(_norm_phone(w.get("number")) == norm_n for w in owner["whatsapp"]): return f"Number {num} already exists for owner {owner_name}."
-        
+
         current_admin = _norm_owner_name(user.username)
         new_wa = {"number": num, "disabled": False}
         if not _is_super_admin(user):
             new_wa["managed_by"] = current_admin
-            
+
         owner["whatsapp"].append(new_wa)
         await _rebuild_pools_preserving_rotation()
         return f"Added WhatsApp {num} to {owner_name}."
@@ -2071,15 +2071,15 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
                 if _norm_handle(e.get("telegram")) == norm_h:
                     entry_to_delete = e
                     break
-            
+
             if entry_to_delete:
                 manager = entry_to_delete.get("managed_by")
                 if manager and manager != current_admin and not _is_super_admin(user):
                     return f"You cannot delete username @{handle}. It is managed by @{manager}."
-                
+
                 owner["entries"].remove(entry_to_delete)
                 found_and_deleted = True
-        
+
         if not found_and_deleted: return f"Username @{handle} not found."
         await _rebuild_pools_preserving_rotation()
         return f"Deleted username @{handle} from all owners."
@@ -2095,12 +2095,12 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
                 if _norm_phone(w.get("number")) == norm_n:
                     wa_to_delete = w
                     break
-            
+
             if wa_to_delete:
                 manager = wa_to_delete.get("managed_by")
                 if manager and manager != current_admin and not _is_super_admin(user):
                     return f"You cannot delete number {num}. It is managed by @{manager}."
-                
+
                 owner["whatsapp"].remove(wa_to_delete)
                 found_and_deleted = True
 
@@ -2201,7 +2201,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
         await save_state()
         log.info(f"Admin cleared all pending items. Removed {username_count} usernames, {whatsapp_count} whatsapps, {app_id_count} app IDs.")
-        
+
         reply_message = f"✅ All pending items have been cleared ({username_count} usernames, {whatsapp_count} whatsapps, {app_id_count} app IDs)."
         if bans_lifted_count > 0:
             reply_message += f"\nLifted {bans_lifted_count} temporary WhatsApp ban(s)."
@@ -2242,7 +2242,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
                                     await save_state() # Save state after modifying bans
                                     reply_message += "\nUser's temporary WhatsApp ban has been lifted."
                                     log.info(f"Super admin cleared pending WA, lifting temp ban for user {user_id_str}.")
-                            
+
                             return reply_message
 
         return f"❌ Could not find any user with the pending item <code>{item_to_clear}</code>."
@@ -2267,7 +2267,8 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         if not _has_permission(user, 'unban whatsapp'): return "You don't have permission to use this command."
         target_name = m.group(1)
         user_id_to_unban = _find_user_id_by_name(target_name)
-        if not target_user_id:
+        # Check if user_id_to_unban exists before proceeding
+        if not user_id_to_unban:
             return f"User '{target_name}' not found."
 
         pool = await get_db_pool()
@@ -2288,17 +2289,17 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
             user_display = user_info.get('username') or user_info.get('first_name') or f"ID: {user_id}"
             lines.append(f"- {user_display}")
         return "\n".join(lines)
-        
+
     m = BAN_COUNTRY_RX.match(text)
     if m:
         if not _has_permission(user, 'ban country'): return "You're not authorized to use this command."
         country_raw, target_name = m.groups()
         country = country_raw.strip().lower()
-        
+
         target_user_id = _find_user_id_by_name(target_name)
         if not target_user_id:
             return f"User '{target_name}' not found."
-            
+
         pool = await get_db_pool()
         async with pool.acquire() as conn:
             await conn.execute("INSERT INTO user_country_bans (user_id, country) VALUES ($1, $2) ON CONFLICT (user_id, country) DO NOTHING", target_user_id, country)
@@ -2311,7 +2312,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         if not _has_permission(user, 'unban country'): return "You're not authorized to use this command."
         country_raw, target_name = m.groups()
         country = country_raw.strip().lower()
-        
+
         target_user_id = _find_user_id_by_name(target_name)
         if not target_user_id:
             return f"User '{target_name}' not found."
@@ -2319,7 +2320,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         pool = await get_db_pool()
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM user_country_bans WHERE user_id = $1 AND country = $2", target_user_id, country)
-        
+
         await load_user_country_bans() # Reload the cache
         return f"User {target_name} has been MANUALLY unbanned from submitting for country: '{country}'."
 
@@ -2327,30 +2328,30 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
     if m:
         if not _has_permission(user, 'list country bans'): return "You're not authorized to use this command."
         target_name = m.group(1)
-        
+
         if target_name:
             target_user_id = _find_user_id_by_name(target_name)
             if not target_user_id:
                 return f"User '{target_name}' not found."
-            
+
             user_bans = USER_COUNTRY_BANS.get(target_user_id, set())
             if not user_bans:
                 return f"User {target_name} has no manual country bans."
-            
+
             lines = [f"<b>Manual country bans for {target_name}:</b>"]
             lines.extend(f"- {c.title()}" for c in sorted(list(user_bans)))
             return "\n".join(lines)
         else:
             if not USER_COUNTRY_BANS:
                 return "No users have manual (permanent) country-specific bans."
-            
+
             lines = ["<b>All User-Specific Manual Country Bans:</b>"]
             for user_id, banned_countries in sorted(USER_COUNTRY_BANS.items()):
                 user_info = state.get("user_names", {}).get(str(user_id), {})
                 user_display = user_info.get('username') or user_info.get('first_name') or f"ID: {user_id}"
                 if user_info.get('username'):
                     user_display = f"@{user_display}"
-                
+
                 countries_str = ", ".join(sorted([c.title() for c in banned_countries]))
                 lines.append(f"- <b>{user_display}</b>: {countries_str}")
             return "\n".join(lines)
@@ -2380,7 +2381,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         if not _has_permission(user, 'user stats'): return "You're not authorized to use this command."
         target_day = _parse_report_day(m.group(1))
         return await _get_user_stats_text(target_day)
-        
+
     if INVENTORY_RX.match(text):
         if not _has_permission(user, 'inventory'): return "You're not authorized to use this command."
         return _get_inventory_text()
@@ -2419,14 +2420,14 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
                 user_display = user_info.get('username') or user_info.get('first_name') or f"ID {user_id}"
                 if user_info.get('username'):
                     user_display = f"@{user_display}"
-                
+
                 user_item_lines = [f"  - <code>{item.get('value')}</code>" for item in items if item.get('value')]
-                
+
                 if user_item_lines:
                     kind_lines.append(f"\n<b>{user_display}:</b>")
                     kind_lines.extend(user_item_lines)
                     kind_total += len(user_item_lines)
-                
+
             if kind_total > 0:
                 lines.append(f"\n\n<b>--- {label} ({kind_total}) ---</b>")
                 lines.extend(kind_lines)
@@ -2578,7 +2579,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             for item in items:
                 try:
                     item_ts = datetime.fromisoformat(item["ts"])
-                    
+
                     # Check if item is overdue AND has not already been punished for this offense
                     if (now - item_ts) > timedelta(minutes=REMINDER_DELAY_MINUTES) and not item.get("punished"):
                         # This item is overdue. Time to remind AND ban.
@@ -2642,14 +2643,14 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
 async def check_request_ratio_and_stop_whatsapp(context: ContextTypes.DEFAULT_TYPE):
     """Checks the ratio of WA to Username requests for the previous 60-min block and stops all WA if the ratio is too high."""
     log.info("Running 60-minute check of request ratio...")
-    
+
     now = datetime.now(TIMEZONE)
-    
+
     # Determine the start and end of the 60-minute block that just concluded.
     # The job runs at the top of the hour, so we check the previous hour.
     end_time = now.replace(minute=0, second=0, microsecond=0)
     start_time = end_time - timedelta(hours=1)
-    
+
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
@@ -2670,7 +2671,7 @@ async def check_request_ratio_and_stop_whatsapp(context: ContextTypes.DEFAULT_TY
 
     if wa_count > username_count:
         log.warning(f"WhatsApp requests ({wa_count}) exceeded username requests ({username_count}) in the last block. Stopping all WhatsApp numbers.")
-        
+
         changed = 0
         async with db_lock:
             for owner in OWNER_DATA:
@@ -2678,10 +2679,10 @@ async def check_request_ratio_and_stop_whatsapp(context: ContextTypes.DEFAULT_TY
                     if not w_entry.get("disabled"):
                         w_entry["disabled"] = True
                         changed += 1
-            
+
             if changed > 0:
                 await _rebuild_pools_preserving_rotation()
-                
+
                 notification_text = (
                     f"⚠️ <b>Automatic Action</b> ⚠️\n\n"
                     f"All WhatsApp numbers have been temporarily disabled because WhatsApp requests ({wa_count}) "
@@ -2861,10 +2862,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if country_status == 'not_allowed':
                     is_allowed = False
                     rejection_reason = f"Country '{found_country}' is not on the allowed list."
-                
+
                 # MODIFICATION: Added new validation logic here
                 elif country_status: # If it's a known country, check bans and limits
-                    
+
                     # 1. Check for manual (permanent) bans
                     user_manual_bans = USER_COUNTRY_BANS.get(uid, set())
                     if country_status in user_manual_bans:
@@ -2897,29 +2898,28 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                     # ========================================================
                     # FORWARD MESSAGE UPON SUCCESSFUL VALIDATION (AS REQUESTED)
-                    # MODIFIED: Switching to copy_message for better media integrity.
-                    # Increased delay slightly.
+                    # REVERTED: Using forward_message as originally requested.
+                    # Removed asyncio.sleep delay.
                     # ========================================================
-                    log.info(f"Validation passed. Waiting 2.5 seconds and using copy_message for forwarding message {msg.message_id} to ensure media group completion.")
-                    await asyncio.sleep(2.5) # Increased delay to 2.5s for robustness
+                    log.info(f"Validation passed. Forwarding message {msg.message_id} using forward_message.")
+                    # Removed: await asyncio.sleep(2.5) # Delay removed as it didn't help and adds overhead
                     try:
-                        # Use copy_message instead of forward_message for cleaner, more reliable copying
-                        await context.bot.copy_message(
+                        # Reverted to forward_message
+                        await context.bot.forward_message(
                             chat_id=FORWARD_GROUP_ID, # The new target group ID
                             from_chat_id=chat_id,
                             message_id=msg.message_id
                         )
-                        log.info(f"Copied successfully cleared message {msg.message_id} to {FORWARD_GROUP_ID}.")
+                        log.info(f"Forwarded successfully cleared message {msg.message_id} to {FORWARD_GROUP_ID}.")
                     except Exception as e:
-                        log.error(f"Failed to copy cleared message {msg.message_id} to {FORWARD_GROUP_ID}: {e}")
+                        log.error(f"Failed to forward cleared message {msg.message_id} to {FORWARD_GROUP_ID}: {e}")
                     # ========================================================
-
 
             # --- From this point, the post is considered valid ---
 
             # Find a new App ID in the message
             app_id_match = APP_ID_RX.search(text)
-            
+
             # Logic to link a new App ID to a source (explicitly or implicitly)
             if app_id_match:
                 app_id = f"@{app_id_match.group(2)}"
@@ -2962,7 +2962,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if await _clear_one_issued(uid, source_kind, value_to_clear):
                         await _log_event(source_kind, "cleared", update, value_to_clear)
                         log.info(f"Auto-cleared pending {source_kind} for user {uid}: {value_to_clear}")
-                
+
                 else:
                     # Treat unlinked App IDs as valid entries, storing them for later confirmation
                     context_data = {"source_owner": "unknown", "source_kind": "app_id"}
@@ -2976,7 +2976,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif chat_id == REQUEST_GROUP_ID:
             if uid not in WHITELISTED_USERS and not _is_admin(update.effective_user):
                 return
-                
+
             if NEED_USERNAME_RX.match(text):
                 # Cooldown check for usernames
                 now = datetime.now(TIMEZONE)
@@ -3113,3 +3113,4 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
