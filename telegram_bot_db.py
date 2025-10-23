@@ -2897,19 +2897,21 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                     # ========================================================
                     # FORWARD MESSAGE UPON SUCCESSFUL VALIDATION (AS REQUESTED)
-                    # MODIFIED: Added 2 second delay to allow media groups to complete loading.
+                    # MODIFIED: Switching to copy_message for better media integrity.
+                    # Increased delay slightly.
                     # ========================================================
-                    log.info(f"Validation passed. Waiting 2 seconds before forwarding message {msg.message_id} to allow media group completion.")
-                    await asyncio.sleep(2)
+                    log.info(f"Validation passed. Waiting 2.5 seconds and using copy_message for forwarding message {msg.message_id} to ensure media group completion.")
+                    await asyncio.sleep(2.5) # Increased delay to 2.5s for robustness
                     try:
-                        await context.bot.forward_message(
+                        # Use copy_message instead of forward_message for cleaner, more reliable copying
+                        await context.bot.copy_message(
                             chat_id=FORWARD_GROUP_ID, # The new target group ID
                             from_chat_id=chat_id,
                             message_id=msg.message_id
                         )
-                        log.info(f"Forwarded successfully cleared message {msg.message_id} to {FORWARD_GROUP_ID}.")
+                        log.info(f"Copied successfully cleared message {msg.message_id} to {FORWARD_GROUP_ID}.")
                     except Exception as e:
-                        log.error(f"Failed to forward cleared message {msg.message_id} to {FORWARD_GROUP_ID}: {e}")
+                        log.error(f"Failed to copy cleared message {msg.message_id} to {FORWARD_GROUP_ID}: {e}")
                     # ========================================================
 
 
