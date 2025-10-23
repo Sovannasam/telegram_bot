@@ -48,11 +48,17 @@ REQUEST_GROUP_ID = int(os.getenv("REQUEST_GROUP_ID", "-1002438185636")) # Group 
 CLEARING_GROUP_ID = int(os.getenv("CLEARING_GROUP_ID", "-1002624324856")) # Group for auto-clearing pendings
 CONFIRMATION_GROUP_ID = int(os.getenv("CONFIRMATION_GROUP_ID", "-1002694540582"))
 DETAIL_GROUP_ID = int(os.getenv("DETAIL_GROUP_ID", "-1002598927727")) # Group for 'my detail' reports
+# --- TARGET GROUP FOR FORWARDED MESSAGES ---
+FORWARD_GROUP_ID = int(os.getenv("FORWARD_GROUP_ID", "-1003109226804")) # Target for cleared messages
+# ------------------------------------------
 PERFORMANCE_GROUP_IDS = {
     -1002670785417, -1002659012767, -1002790753092, -1002520117752
 }
 CATCH_UP_LIMIT = int(os.getenv("CATCH_UP_LIMIT", "4")) # Limit for least-busy owner priority
 CATCH_UP_COOLDOWN_MINUTES = int(os.getenv("CATCH_UP_COOLDOWN_MINUTES", "60")) # Cooldown in minutes after hitting catch-up limit
+
+# NEW: Daily limit for submissions per country
+COUNTRY_DAILY_LIMIT = int(os.getenv("COUNTRY_DAILY_LIMIT", "20"))
 
 
 # Whitelist of allowed countries (lowercase for case-insensitive matching)
@@ -186,7 +192,7 @@ async def setup_database():
                 permissions JSONB NOT NULL
             );
         """)
-        # NEW TABLE FOR USER-SPECIFIC COUNTRY BANS
+        # This table is for MANUAL, PERMANENT bans
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS user_country_bans (
                 user_id BIGINT NOT NULL,
@@ -294,7 +300,7 @@ async def load_user_country_bans():
                 if user_id not in USER_COUNTRY_BANS:
                     USER_COUNTRY_BANS[user_id] = set()
                 USER_COUNTRY_BANS[user_id].add(country)
-        log.info(f"Loaded {sum(len(c) for c in USER_COUNTRY_BANS.values())} user-country bans from database.")
+        log.info(f"Loaded {sum(len(c) for c in USER_COUNTRY_BANS.values())} user-country (manual) bans from database.")
     except Exception as e:
         log.error(f"Failed to load user-country bans from DB: %s", e)
 
@@ -569,6 +575,22 @@ async def _increment_user_country_count(user_id: int, country: str):
     except Exception as e:
         log.warning(f"User country count write failed for {user_id} and country {country}: {e}")
 
+# NEW: Helper function to get the current count for a single country
+async def _get_user_country_count(user_id: int, country: str) -> int:
+    """Fetches a user's submission count for a specific country on the current logical day."""
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            count = await conn.fetchval(
+                "SELECT count FROM user_daily_country_counts WHERE day=$1 AND user_id=$2 AND country=$3",
+                _logical_day_today(), user_id, country
+            )
+            return int(count) if count is not None else 0
+    except Exception as e:
+        log.warning(f"User country count read failed for {user_id} and country {country}: {e}")
+        return 0
+
+
 async def _increment_user_confirmation_count(user_id: int):
     """Increments the successful confirmation count for a user on the current logical day."""
     try:
@@ -631,7 +653,7 @@ async def _wa_inc_count(number_norm: str, day: date):
                 VALUES ($1, $2, 1, $3)
                 ON CONFLICT (day, number_norm)
                 DO UPDATE SET sent_count = wa_daily_usage.sent_count + 1,
-                              last_sent = EXCLUDED.last_sent
+                            last_sent = EXCLUDED.last_sent
             """, day, number_norm, datetime.now(TIMEZONE))
     except Exception as e:
         log.warning("Quota write failed: %s", e)
@@ -886,7 +908,7 @@ async def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
 # REGEXES & HELPERS
 # =============================
 WHO_USING_REGEX = re.compile(
-    r"^\s*who(?:['\u2019]s| is)\s+using\s+(?:@?([A-Za-z0-9_\.]+)|(\+?\d[\d\s\-]{6,}\d))\s*$",
+    r"^\s*who(?:['\u2019']s| is)\s+using\s+(?:@?([A-Za-z0-9_\.]+)|(\+?\d[\d\s\-]{6,}\d))\s*$",
     re.IGNORECASE
 )
 NEED_USERNAME_RX = re.compile(r"^\s*i\s*need\s*(?:user\s*name|username)\s*$", re.IGNORECASE)
@@ -1065,7 +1087,7 @@ def _value_in_text(value: Optional[str], text: str) -> bool:
     else:
         v_digits = re.sub(r'\D', '', v_norm)
         text_digits = re.sub(r'\D', '', text_norm)
-        return v_digits and v_digits in text_norm
+        return v_digits and v_digits in text_digits
 
 def _find_closest_app_id(typed_id: str) -> Optional[str]:
     """Finds the most similar pending App ID using Levenshtein distance."""
@@ -2282,7 +2304,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
             await conn.execute("INSERT INTO user_country_bans (user_id, country) VALUES ($1, $2) ON CONFLICT (user_id, country) DO NOTHING", target_user_id, country)
 
         await load_user_country_bans() # Reload the cache
-        return f"User {target_name} is now banned from submitting for country: '{country}'."
+        return f"User {target_name} is now MANUALLY banned from submitting for country: '{country}'."
 
     m = UNBAN_COUNTRY_RX.match(text)
     if m:
@@ -2299,7 +2321,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
             await conn.execute("DELETE FROM user_country_bans WHERE user_id = $1 AND country = $2", target_user_id, country)
         
         await load_user_country_bans() # Reload the cache
-        return f"User {target_name} has been unbanned from submitting for country: '{country}'."
+        return f"User {target_name} has been MANUALLY unbanned from submitting for country: '{country}'."
 
     m = LIST_COUNTRY_BANS_RX.match(text)
     if m:
@@ -2313,16 +2335,16 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
             
             user_bans = USER_COUNTRY_BANS.get(target_user_id, set())
             if not user_bans:
-                return f"User {target_name} has no country bans."
+                return f"User {target_name} has no manual country bans."
             
-            lines = [f"<b>Country bans for {target_name}:</b>"]
+            lines = [f"<b>Manual country bans for {target_name}:</b>"]
             lines.extend(f"- {c.title()}" for c in sorted(list(user_bans)))
             return "\n".join(lines)
         else:
             if not USER_COUNTRY_BANS:
-                return "No users have country-specific bans."
+                return "No users have manual (permanent) country-specific bans."
             
-            lines = ["<b>All User-Specific Country Bans:</b>"]
+            lines = ["<b>All User-Specific Manual Country Bans:</b>"]
             for user_id, banned_countries in sorted(USER_COUNTRY_BANS.items()):
                 user_info = state.get("user_names", {}).get(str(user_id), {})
                 user_display = user_info.get('username') or user_info.get('first_name') or f"ID: {user_id}"
@@ -2572,7 +2594,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                             ban_until = now + timedelta(minutes=ban_duration_minutes)
                             state.setdefault("whatsapp_temp_bans", {})[user_id_str] = ban_until.isoformat()
                             ban_message_khmer = (
-                                f"សូមរំលឹក: {mention_user_html(user_id)}, អ្នកមិនបានផ្តល់ព័ត៌មានសម្រាប់ WhatsApp {item.get('value')}\n"
+                                f"សូមរំលឹក: {mention_user_html(user_id)}, អ្នកមិនបានផ្តល់ព័តរ៌មានសម្រាប់ WhatsApp {item.get('value')}\n"
                                 f"អ្នកត្រូវបានហាមឃាត់ជាបណ្ដោះអាសន្នពីការស្នើសុំលេខ WhatsApp រយៈពេល {ban_duration_minutes} នាទី។"
                             )
                             log.info(f"User {user_id} temp-banned for {ban_duration_minutes} mins (1st offense).")
@@ -2687,6 +2709,8 @@ async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
                 await conn.execute("DELETE FROM user_daily_country_counts;")
                 await conn.execute("DELETE FROM user_daily_confirmations;")
                 await conn.execute("DELETE FROM owner_daily_performance;")
+                # MODIFICATION: DO NOT clear user_country_bans, as this is for manual/permanent bans.
+                # The automatic daily limit is enforced by clearing user_daily_country_counts.
                 log.info("Cleared daily WhatsApp, user activity, country, confirmation, and performance quotas from database.")
         except Exception as e:
             log.error(f"Failed to clear daily tables: {e}")
@@ -2837,14 +2861,26 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if country_status == 'not_allowed':
                     is_allowed = False
                     rejection_reason = f"Country '{found_country}' is not on the allowed list."
-                elif country_status: # If it's a known country
-                    user_bans = USER_COUNTRY_BANS.get(uid, set())
-                    if country_status in user_bans:
+                
+                # MODIFICATION: Added new validation logic here
+                elif country_status: # If it's a known country, check bans and limits
+                    
+                    # 1. Check for manual (permanent) bans
+                    user_manual_bans = USER_COUNTRY_BANS.get(uid, set())
+                    if country_status in user_manual_bans:
                         is_allowed = False
-                        rejection_reason = f"You are specifically not allowed to submit for the country '{found_country}'."
-                    elif country_status == 'india' and (age is None or age < 30):
-                        is_allowed = False
-                        rejection_reason = f"Age must be provided and must be 30 or older for India (found: {age})."
+                        rejection_reason = f"You are manually banned from submitting for the country '{found_country}'."
+                    else:
+                        # 2. Check for automatic (daily) limit
+                        current_country_count = await _get_user_country_count(uid, country_status)
+                        if current_country_count >= COUNTRY_DAILY_LIMIT:
+                            is_allowed = False
+                            rejection_reason = f"You have reached the daily limit ({COUNTRY_DAILY_LIMIT}) for '{found_country}'. Please try again tomorrow."
+                        else:
+                            # 3. Check for India age limit
+                            if country_status == 'india' and (age is None or age < 30):
+                                is_allowed = False
+                                rejection_reason = f"Age must be provided and must be 30 or older for India (found: {age})."
 
                 if not is_allowed:
                     first_offending_value = next(iter(values_found_in_message))
@@ -2858,6 +2894,20 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if country_status:
                         await _increment_user_country_count(uid, country_status)
                         log.info(f"Incremented country count for user {uid} for '{country_status}'")
+
+                    # ========================================================
+                    # FORWARD MESSAGE UPON SUCCESSFUL VALIDATION (AS REQUESTED)
+                    # ========================================================
+                    try:
+                        await context.bot.forward_message(
+                            chat_id=FORWARD_GROUP_ID, # The new target group ID
+                            from_chat_id=chat_id,
+                            message_id=msg.message_id
+                        )
+                        log.info(f"Forwarded successfully cleared message {msg.message_id} to {FORWARD_GROUP_ID}.")
+                    except Exception as e:
+                        log.error(f"Failed to forward cleared message {msg.message_id} to {FORWARD_GROUP_ID}: {e}")
+                    # ========================================================
 
 
             # --- From this point, the post is considered valid ---
