@@ -2109,7 +2109,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         return f"Deleted WhatsApp number {num} from all owners."
 
     if LIST_OWNERS_RX.match(text):
-        if not _has_permission(user, 'list owners'): return "You don't have permission to use this command."
+        if not _has_permission(user, 'list owners'): return "You're not authorized to use this command."
         if not OWNER_DATA: return "No owners configured."
         lines = ["<b>Owner Roster:</b>"]
         for o in OWNER_DATA:
@@ -2120,7 +2120,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         return "\n".join(lines)
 
     if LIST_DISABLED_RX.match(text):
-        if not _has_permission(user, 'list disabled'): return "You don't have permission to use this command."
+        if not _has_permission(user, 'list disabled'): return "You're not authorized to use this command."
         disabled = [o for o in OWNER_DATA if _owner_is_paused(o)]
         if not disabled: return "No owners are currently disabled/paused."
         lines = ["<b>Disabled/Paused Owners:</b>"]
@@ -2131,7 +2131,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     m = LIST_ENABLED_RX.match(text)
     if m:
-        if not _has_permission(user, 'list enabled'): return "You don't have permission to use this command."
+        if not _has_permission(user, 'list enabled'): return "You're not authorized to use this command."
         enabled = [o for o in OWNER_DATA if not _owner_is_paused(o)]
         if not enabled: return "No owners are currently enabled/active."
         lines = ["<b>Enabled/Active Owners:</b>"]
@@ -2144,7 +2144,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     m = LIST_OWNER_DETAIL_RX.match(text) or LIST_OWNER_ALIAS_RX.match(text)
     if m:
-        if not _has_permission(user, 'list owner'): return "You don't have permission to use this command."
+        if not _has_permission(user, 'list owner'): return "You're not authorized to use this command."
         name = m.group(1).strip()
         if name.lower() in ("owners", "disabled", "pending"): return None
         owner = _find_owner_group(name)
@@ -2267,7 +2267,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         if not _has_permission(user, 'unban whatsapp'): return "You don't have permission to use this command."
         target_name = m.group(1)
         user_id_to_unban = _find_user_id_by_name(target_name)
-        if not user_id_to_unban:
+        if not target_user_id:
             return f"User '{target_name}' not found."
 
         pool = await get_db_pool()
@@ -2278,7 +2278,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         return f"User {target_name} has been unbanned from requesting WhatsApp numbers."
 
     if LIST_BANNED_RX.match(text):
-        if not _has_permission(user, 'list banned'): return "You don't have permission to use this command."
+        if not _has_permission(user, 'list banned'): return "You're not authorized to use this command."
         if not WHATSAPP_BANNED_USERS:
             return "No users are currently banned from requesting WhatsApp numbers."
 
@@ -2291,7 +2291,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         
     m = BAN_COUNTRY_RX.match(text)
     if m:
-        if not _has_permission(user, 'ban country'): return "You don't have permission to use this command."
+        if not _has_permission(user, 'ban country'): return "You're not authorized to use this command."
         country_raw, target_name = m.groups()
         country = country_raw.strip().lower()
         
@@ -2308,7 +2308,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     m = UNBAN_COUNTRY_RX.match(text)
     if m:
-        if not _has_permission(user, 'unban country'): return "You don't have permission to use this command."
+        if not _has_permission(user, 'unban country'): return "You're not authorized to use this command."
         country_raw, target_name = m.groups()
         country = country_raw.strip().lower()
         
@@ -2325,7 +2325,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     m = LIST_COUNTRY_BANS_RX.match(text)
     if m:
-        if not _has_permission(user, 'list country bans'): return "You don't have permission to use this command."
+        if not _has_permission(user, 'list country bans'): return "You're not authorized to use this command."
         target_name = m.group(1)
         
         if target_name:
@@ -2358,7 +2358,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     m = OWNER_REPORT_RX.match(text)
     if m:
-        if not _has_permission(user, 'owner report'): return "You don't have permission to use this command."
+        if not _has_permission(user, 'owner report'): return "You're not authorized to use this command."
         target_day = _parse_report_day(m.group(1))
         _, owner_rows = await _compute_daily_summary(target_day)
         if not owner_rows:
@@ -2371,22 +2371,22 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     m = USER_PERFORMANCE_RX.match(text)
     if m:
-        if not _has_permission(user, 'user performance'): return "You don't have permission to use this command."
+        if not _has_permission(user, 'user performance'): return "You're not authorized to use this command."
         target_day = _parse_report_day(m.group(1))
         return await _get_user_performance_text(target_day)
 
     m = USER_STATS_RX.match(text)
     if m:
-        if not _has_permission(user, 'user stats'): return "You don't have permission to use this command."
+        if not _has_permission(user, 'user stats'): return "You're not authorized to use this command."
         target_day = _parse_report_day(m.group(1))
         return await _get_user_stats_text(target_day)
         
     if INVENTORY_RX.match(text):
-        if not _has_permission(user, 'inventory'): return "You don't have permission to use this command."
+        if not _has_permission(user, 'inventory'): return "You're not authorized to use this command."
         return _get_inventory_text()
 
     if REQUEST_STATS_RX.match(text):
-        if not _has_permission(user, 'request stats'): return "You don't have permission to use this command."
+        if not _has_permission(user, 'request stats'): return "You're not authorized to use this command."
         return await _get_request_stats_text()
 
     if COMMANDS_RX.match(text):
@@ -2396,7 +2396,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
     m = LIST_PENDING_RX.match(text)
     if m:
         if not _has_permission(user, 'list pending'):
-            return "You don't have permission to use this command."
+            return "You're not authorized to use this command."
 
         lines = ["<b>⏳ All Pending Items by User:</b>"]
         total_pending = 0
@@ -2441,12 +2441,12 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
     m = DATA_TODAY_RX.match(text)
     if m:
         if not _has_permission(user, 'data today'):
-            return "You don't have permission to use this command."
+            return "You're not authorized to use this command."
         return await _get_daily_data_summary_text()
 
     m = DETAIL_USER_RX.match(text)
     if m:
-        if not _has_permission(user, 'detail user'): return "You don't have permission to use this command."
+        if not _has_permission(user, 'detail user'): return "You're not authorized to use this command."
         target_name = m.group(1)
         target_user_id = _find_user_id_by_name(target_name)
         if not target_user_id:
@@ -2594,7 +2594,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                             ban_until = now + timedelta(minutes=ban_duration_minutes)
                             state.setdefault("whatsapp_temp_bans", {})[user_id_str] = ban_until.isoformat()
                             ban_message_khmer = (
-                                f"សូមរំលឹក: {mention_user_html(user_id)}, អ្នកមិនបានផ្តល់ព័តរ៌មានសម្រាប់ WhatsApp {item.get('value')}\n"
+                                f"សូមរំលឹក: {mention_user_html(user_id)}, អ្នកមិនបានផ្តល់ព័ត៌មានសម្រាប់ WhatsApp {item.get('value')}\n"
                                 f"អ្នកត្រូវបានហាមឃាត់ជាបណ្ដោះអាសន្នពីការស្នើសុំលេខ WhatsApp រយៈពេល {ban_duration_minutes} នាទី។"
                             )
                             log.info(f"User {user_id} temp-banned for {ban_duration_minutes} mins (1st offense).")
@@ -2897,7 +2897,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                     # ========================================================
                     # FORWARD MESSAGE UPON SUCCESSFUL VALIDATION (AS REQUESTED)
+                    # MODIFIED: Added 2 second delay to allow media groups to complete loading.
                     # ========================================================
+                    log.info(f"Validation passed. Waiting 2 seconds before forwarding message {msg.message_id} to allow media group completion.")
+                    await asyncio.sleep(2)
                     try:
                         await context.bot.forward_message(
                             chat_id=FORWARD_GROUP_ID, # The new target group ID
