@@ -653,7 +653,7 @@ async def _wa_inc_count(number_norm: str, day: date):
                 VALUES ($1, $2, 1, $3)
                 ON CONFLICT (day, number_norm)
                 DO UPDATE SET sent_count = wa_daily_usage.sent_count + 1,
-                            last_sent = EXCLUDED.last_sent
+                              last_sent = EXCLUDED.last_sent
             """, day, number_norm, datetime.now(TIMEZONE))
     except Exception as e:
         log.warning("Quota write failed: %s", e)
@@ -2850,22 +2850,22 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if _norm_phone(p) == _norm_phone(pending_p):
                         values_found_in_message.add(pending_p)
 
+            # --- Validation Step ---
+            # We only validate if a pending item is being used.
+            # If no pending item is mentioned, the message is not "rejected",
+            # it's just a message (e.g., an unlinked App ID or chatter).
+            is_allowed = True
+            rejection_reason = ""
+            country_status_to_increment = None # Store this for later
 
-            # If a pending item is mentioned, we must validate country/age first.
             if values_found_in_message:
                 found_country, country_status = _find_country_in_text(text)
                 age = _find_age_in_text(text)
-                is_allowed = True
-                rejection_reason = ""
 
-                # Tiered validation checks
                 if country_status == 'not_allowed':
                     is_allowed = False
                     rejection_reason = f"Country '{found_country}' is not on the allowed list."
-
-                # MODIFICATION: Added new validation logic here
                 elif country_status: # If it's a known country, check bans and limits
-
                     # 1. Check for manual (permanent) bans
                     user_manual_bans = USER_COUNTRY_BANS.get(uid, set())
                     if country_status in user_manual_bans:
@@ -2882,45 +2882,48 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             if country_status == 'india' and (age is None or age < 30):
                                 is_allowed = False
                                 rejection_reason = f"Age must be provided and must be 30 or older for India (found: {age})."
+                            else:
+                                # Validation passed for this country
+                                country_status_to_increment = country_status
 
-                if not is_allowed:
-                    first_offending_value = next(iter(values_found_in_message))
-                    item_type = "username" if first_offending_value.startswith('@') else "whatsapp"
-                    reply_text = (f"{mention_user_html(uid)}, your submission was rejected. Reason: {rejection_reason}\n"
-                                  f"Please use that {item_type} (<code>{first_offending_value}</code>) for another customer.")
-                    await msg.reply_html(reply_text)
-                    log.warning(f"Rejected post from user {uid}. Reason: {rejection_reason}. Pending item was NOT cleared.")
-                    return
-                else:
-                    if country_status:
-                        await _increment_user_country_count(uid, country_status)
-                        log.info(f"Incremented country count for user {uid} for '{country_status}'")
+            # --- Rejection Handling ---
+            # If validation failed, send reply and stop all processing.
+            if not is_allowed:
+                first_offending_value = next(iter(values_found_in_message))
+                item_type = "username" if first_offending_value.startswith('@') else "whatsapp"
+                reply_text = (f"{mention_user_html(uid)}, your submission was rejected. Reason: {rejection_reason}\n"
+                              f"Please use that {item_type} (<code>{first_offending_value}</code>) for another customer.")
+                await msg.reply_html(reply_text)
+                log.warning(f"Rejected post from user {uid}. Reason: {rejection_reason}. Pending item was NOT cleared. Message will NOT be forwarded.")
+                return # Stop. Do not forward.
 
-                    # ========================================================
-                    # FORWARD MESSAGE UPON SUCCESSFUL VALIDATION (AS REQUESTED)
-                    # REVERTED: Using forward_message as originally requested.
-                    # Removed asyncio.sleep delay.
-                    # ========================================================
-                    log.info(f"Validation passed. Forwarding message {msg.message_id} using forward_message.")
-                    # Removed: await asyncio.sleep(2.5) # Delay removed as it didn't help and adds overhead
-                    try:
-                        # Reverted to forward_message
-                        await context.bot.forward_message(
-                            chat_id=FORWARD_GROUP_ID, # The new target group ID
-                            from_chat_id=chat_id,
-                            message_id=msg.message_id
-                        )
-                        log.info(f"Forwarded successfully cleared message {msg.message_id} to {FORWARD_GROUP_ID}.")
-                    except Exception as e:
-                        log.error(f"Failed to forward cleared message {msg.message_id} to {FORWARD_GROUP_ID}: {e}")
-                    # ========================================================
+            # --- Forwarding Step ---
+            # If we are here, the message was NOT rejected. Forward it.
+            # This now includes:
+            # 1. Valid posts with pending items.
+            # 2. Posts with only an unlinked App ID.
+            # 3. Posts with neither (chatter).
+            try:
+                log.info(f"Message {msg.message_id} was not rejected. Forwarding to {FORWARD_GROUP_ID}.")
+                await context.bot.forward_message(
+                    chat_id=FORWARD_GROUP_ID,
+                    from_chat_id=chat_id,
+                    message_id=msg.message_id
+                )
+                log.info(f"Forwarded message {msg.message_id} to {FORWARD_GROUP_ID}.")
+            except Exception as e:
+                log.error(f"Failed to forward message {msg.message_id} to {FORWARD_GROUP_ID}: {e}")
+                # We continue anyway to process the clearing/app_id logic.
 
-            # --- From this point, the post is considered valid ---
+            # --- Post-Forwarding State Changes ---
 
-            # Find a new App ID in the message
+            # 1. Increment country count if validation passed
+            if country_status_to_increment:
+                await _increment_user_country_count(uid, country_status_to_increment)
+                log.info(f"Incremented country count for user {uid} for '{country_status_to_increment}'")
+
+            # 2. Process App ID and clear source items
             app_id_match = APP_ID_RX.search(text)
-
-            # Logic to link a new App ID to a source (explicitly or implicitly)
             if app_id_match:
                 app_id = f"@{app_id_match.group(2)}"
                 source_item_to_clear, source_kind = None, None
@@ -3113,4 +3116,3 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
