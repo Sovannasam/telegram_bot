@@ -58,7 +58,7 @@ CATCH_UP_LIMIT = int(os.getenv("CATCH_UP_LIMIT", "4")) # Limit for least-busy ow
 CATCH_UP_COOLDOWN_MINUTES = int(os.getenv("CATCH_UP_COOLDOWN_MINUTES", "60")) # Cooldown in minutes after hitting catch-up limit
 
 # NEW: Daily limit for submissions per country
-COUNTRY_DAILY_LIMIT = int(os.getenv("COUNTRY_DAILY_LIMIT", "20"))
+COUNTRY_DAILY_LIMIT = int(os.getenv("COUNTRY_DAILY_LIMIT", "10"))
 
 
 # Whitelist of allowed countries (lowercase for case-insensitive matching)
