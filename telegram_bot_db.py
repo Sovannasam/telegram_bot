@@ -2367,7 +2367,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
         lines = [f"<b>Owner Performance for {target_day.isoformat()}:</b>"]
         for row in owner_rows:
-            lines.append(f"- <b>{row['Owner']}</b>: {row['Customers total']} total ({row['Customers via Telegram']} usernames, {row['Customers via WhatsApp']} whatsapps)")
+            lines.append(f"- <b>{row['Owner']}</b>: {row['Customers total']} ({row['Customers via Telegram']} usernames, {row['Customers via WhatsApp']} whatsapps)")
         return "\n".join(lines)
 
     m = USER_PERFORMANCE_RX.match(text)
@@ -2513,7 +2513,7 @@ async def _clear_expired_app_ids(context: ContextTypes.DEFAULT_TYPE):
             try:
                 item_ts = datetime.fromisoformat(item["ts"])
                 if (now - item_ts) > forty_eight_hours:
-                    log.info(f"Expired App ID '{item['value']}' for user {user_id_str} removed after 72 hours.")
+                    log.info(f"Expired App ID '{item['value']}' for user {user_id_str} removed after 48 hours.")
                     state_changed = True
                 else:
                     items_to_keep.append(item)
@@ -2834,6 +2834,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         log.warning(f"Received confirmation for incorrect App ID '{app_id_confirmed_raw}' from {update.effective_user.username}.")
             return
 
+        # ================================================================
+        # START OF MODIFIED BLOCK FOR CLEARING_GROUP_ID
+        # ================================================================
         elif chat_id == CLEARING_GROUP_ID:
             # Find any pending items mentioned in the message
             pending_usernames = {item['value'] for item in _issued_bucket("username").get(str(uid), [])}
@@ -2851,76 +2854,92 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         values_found_in_message.add(pending_p)
 
 
-            # If a pending item is mentioned, we must validate country/age first.
-            if values_found_in_message:
-                found_country, country_status = _find_country_in_text(text)
-                age = _find_age_in_text(text)
-                is_allowed = True
-                rejection_reason = ""
-
-                # Tiered validation checks
-                if country_status == 'not_allowed':
-                    is_allowed = False
-                    rejection_reason = f"Country '{found_country}' is not on the allowed list."
-
-                # MODIFICATION: Added new validation logic here
-                elif country_status: # If it's a known country, check bans and limits
-
-                    # 1. Check for manual (permanent) bans
-                    user_manual_bans = USER_COUNTRY_BANS.get(uid, set())
-                    if country_status in user_manual_bans:
-                        is_allowed = False
-                        rejection_reason = f"You are manually banned from submitting for the country '{found_country}'."
-                    else:
-                        # 2. Check for automatic (daily) limit
-                        current_country_count = await _get_user_country_count(uid, country_status)
-                        if current_country_count >= COUNTRY_DAILY_LIMIT:
-                            is_allowed = False
-                            rejection_reason = f"You have reached the daily limit ({COUNTRY_DAILY_LIMIT}) for '{found_country}'. Please try again tomorrow."
-                        else:
-                            # 3. Check for India age limit
-                            if country_status == 'india' and (age is None or age < 30):
-                                is_allowed = False
-                                rejection_reason = f"Age must be provided and must be 30 or older for India (found: {age})."
-
-                if not is_allowed:
-                    first_offending_value = next(iter(values_found_in_message))
-                    item_type = "username" if first_offending_value.startswith('@') else "whatsapp"
-                    reply_text = (f"{mention_user_html(uid)}, your submission was rejected. Reason: {rejection_reason}\n"
-                                  f"Please use that {item_type} (<code>{first_offending_value}</code>) for another customer.")
-                    await msg.reply_html(reply_text)
-                    log.warning(f"Rejected post from user {uid}. Reason: {rejection_reason}. Pending item was NOT cleared.")
-                    return
-                else:
-                    if country_status:
-                        await _increment_user_country_count(uid, country_status)
-                        log.info(f"Incremented country count for user {uid} for '{country_status}'")
-
-                    # ========================================================
-                    # FORWARD MESSAGE UPON SUCCESSFUL VALIDATION (AS REQUESTED)
-                    # REVERTED: Using forward_message as originally requested.
-                    # Removed asyncio.sleep delay.
-                    # ========================================================
-                    log.info(f"Validation passed. Forwarding message {msg.message_id} using forward_message.")
-                    # Removed: await asyncio.sleep(2.5) # Delay removed as it didn't help and adds overhead
-                    try:
-                        # Reverted to forward_message
-                        await context.bot.forward_message(
-                            chat_id=FORWARD_GROUP_ID, # The new target group ID
-                            from_chat_id=chat_id,
-                            message_id=msg.message_id
-                        )
-                        log.info(f"Forwarded successfully cleared message {msg.message_id} to {FORWARD_GROUP_ID}.")
-                    except Exception as e:
-                        log.error(f"Failed to forward cleared message {msg.message_id} to {FORWARD_GROUP_ID}: {e}")
-                    # ========================================================
-
-            # --- From this point, the post is considered valid ---
-
+            # --- START CHANGE 1: Find app_id_match *before* validation ---
             # Find a new App ID in the message
             app_id_match = APP_ID_RX.search(text)
 
-            # Logic to link a new App ID to a source (explicitly or implicitly)
+            # An actionable message must have a pending item or a new app ID
+            if not values_found_in_message and not app_id_match:
+                return
+            # --- END CHANGE 1 ---
+
+            # --- START CHANGE 2: Un-indent validation block ---
+            # Now validation runs if *either* a pending item OR an app_id is found.
+            found_country, country_status = _find_country_in_text(text)
+            age = _find_age_in_text(text)
+            is_allowed = True
+            rejection_reason = ""
+
+            # Tiered validation checks
+            if country_status == 'not_allowed':
+                is_allowed = False
+                rejection_reason = f"Country '{found_country}' is not on the allowed list."
+
+            # MODIFICATION: Added new validation logic here
+            elif country_status: # If it's a known country, check bans and limits
+
+                # 1. Check for manual (permanent) bans
+                user_manual_bans = USER_COUNTRY_BANS.get(uid, set())
+                if country_status in user_manual_bans:
+                    is_allowed = False
+                    rejection_reason = f"You are manually banned from submitting for the country '{found_country}'."
+                else:
+                    # 2. Check for automatic (daily) limit
+                    current_country_count = await _get_user_country_count(uid, country_status)
+                    if current_country_count >= COUNTRY_DAILY_LIMIT:
+                        is_allowed = False
+                        rejection_reason = f"You have reached the daily limit ({COUNTRY_DAILY_LIMIT}) for '{found_country}'. Please try again tomorrow."
+                    else:
+                        # 3. Check for India age limit
+                        if country_status == 'india' and (age is None or age < 30):
+                            is_allowed = False
+                            rejection_reason = f"Age must be provided and must be 30 or older for India (found: {age})."
+
+            if not is_allowed:
+                # --- START CHANGE 3: Modified rejection message ---
+                # This now handles cases where no pending item was found, but an app_id was.
+                item_for_reply = "an item"
+                if values_found_in_message:
+                    first_offending_value = next(iter(values_found_in_message))
+                    item_type = "username" if first_offending_value.startswith('@') else "whatsapp"
+                    item_for_reply = f"that {item_type} (<code>{first_offending_value}</code>)"
+                elif app_id_match:
+                    app_id_val = f"@{app_id_match.group(2)}"
+                    item_for_reply = f"that App ID (<code>{app_id_val}</code>)"
+
+                reply_text = (f"{mention_user_html(uid)}, your submission was rejected. Reason: {rejection_reason}\n"
+                              f"Please use {item_for_reply} for another customer.")
+                # --- END CHANGE 3 ---
+                await msg.reply_html(reply_text)
+                log.warning(f"Rejected post from user {uid}. Reason: {rejection_reason}. No items cleared.")
+                return
+            else:
+                # --- 2. Validation Passed. Process the message. ---
+                if country_status:
+                    await _increment_user_country_count(uid, country_status)
+                    log.info(f"Incremented country count for user {uid} for '{country_status}'")
+
+                # --- START CHANGE 4: Move forwarding block ---
+                # This block is now un-indented and will run if validation passes
+                # for *any* actionable message.
+                # ========================================================
+                log.info(f"Validation passed. Forwarding message {msg.message_id} using forward_message.")
+                try:
+                    await context.bot.forward_message(
+                        chat_id=FORWARD_GROUP_ID, # The new target group ID
+                        from_chat_id=chat_id,
+                        message_id=msg.message_id
+                    )
+                    log.info(f"Forwarded successfully cleared message {msg.message_id} to {FORWARD_GROUP_ID}.")
+                except Exception as e:
+                    log.error(f"Failed to forward cleared message {msg.message_id} to {FORWARD_GROUP_ID}: {e}")
+                # ========================================================
+                # --- END CHANGE 4 ---
+            # --- END CHANGE 2 ---
+
+            # --- 4. Process App ID and clear source item ---
+            # This logic was already here, but now it runs *after* validation and forwarding.
+            # It is no longer inside an `else` block.
             if app_id_match:
                 app_id = f"@{app_id_match.group(2)}"
                 source_item_to_clear, source_kind = None, None
@@ -2972,6 +2991,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"Recorded App ID '{app_id}' for user {uid} without a source item"
                     )
             return # End of processing for this group
+        # ================================================================
+        # END OF MODIFIED BLOCK
+        # ================================================================
 
         elif chat_id == REQUEST_GROUP_ID:
             if uid not in WHITELISTED_USERS and not _is_admin(update.effective_user):
