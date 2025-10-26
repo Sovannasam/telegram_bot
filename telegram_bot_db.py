@@ -239,9 +239,9 @@ USER_COUNTRY_BANS: Dict[int, set[str]] = {}
 COMMAND_PERMISSIONS = {
     'add owner', 'delete owner', 'add username', 'delete username', 'add whatsapp', 'delete whatsapp',
     'stop open', 'take customer', 'ban whatsapp', 'unban whatsapp', 'report',
-    'owner report', 'performance', 'remind user', 'clear pending', 'clear all pending',
+    'owner report', 'performance', 'remind user', 'clear pending',
     'list owners', 'list disabled', 'list owner', 'detail user', 'list banned', 'list admins',
-    'list pending', 'data today', 'list enabled', 'add user', 'delete user',
+    'data today', 'list enabled', 'add user', 'delete user',
     'ban country', 'unban country', 'list country bans', 'user performance', 'user stats',
     'inventory', 'request stats'
 }
@@ -934,7 +934,6 @@ LIST_OWNER_ALIAS_RX   = re.compile(r"^\s*list\s+@?([A-Za-z0-9_]{3,})\s*$", re.IG
 REMIND_ALL_RX         = re.compile(r"^\s*remind\s+user\s*$", re.IGNORECASE)
 TAKE_CUSTOMER_RX      = re.compile(r"^\s*take\s+(\d+)\s+customer(?:s)?\s+to\s+owner\s+@?(.+?)(?:\s+(and\s+stop))?\s*$", re.IGNORECASE)
 CLEAR_PENDING_RX      = re.compile(r"^\s*clear\s+pending\s+(.+)\s*$", re.IGNORECASE)
-CLEAR_ALL_PENDING_RX  = re.compile(r"^\s*clear\s+all\s+pending\s*$", re.IGNORECASE)
 BAN_WHATSAPP_RX       = re.compile(r"^\s*ban\s+whatsapp\s+@?(\S+)\s*$", re.IGNORECASE)
 UNBAN_WHATSAPP_RX     = re.compile(r"^\s*unban\s+whatsapp\s+@?(\S+)\s*$", re.IGNORECASE)
 LIST_BANNED_RX        = re.compile(r"^\s*list\s+banned\s*$", re.IGNORECASE)
@@ -949,7 +948,6 @@ DELETE_ADMIN_RX       = re.compile(r"^\s*delete\s+admin\s+@?(\S+)\s*$", re.IGNOR
 ALLOW_ADMIN_CMD_RX    = re.compile(r"^\s*allow\s+@?(\S+)\s+to\s+use\s+command\s+(.+)\s*$", re.IGNORECASE)
 STOP_ALLOW_ADMIN_CMD_RX = re.compile(r"^\s*stop\s+allow\s+@?(\S+)\s+to\s+use\s+command\s+(.+)\s*$", re.IGNORECASE)
 LIST_ADMINS_RX        = re.compile(r"^\s*list\s+admins\s*$", re.IGNORECASE)
-LIST_PENDING_RX       = re.compile(r"^\s*list\s+pending\s*$", re.IGNORECASE)
 DATA_TODAY_RX         = re.compile(r"^\s*data\s+today\s*$", re.IGNORECASE)
 LIST_ENABLED_RX       = re.compile(r"^\s*list\s+enabled\s*$", re.IGNORECASE)
 ADD_USER_RX           = re.compile(r"^\s*add\s+user\s+@?(\S+)\s*$", re.IGNORECASE)
@@ -1699,8 +1697,6 @@ def _get_commands_text() -> str:
 <code>performance @owner [day]</code> - See owner's customer stats.
 <code>remind user</code>
 <code>clear pending @item_or_number</code>
-<code>clear all pending</code>
-<code>list pending</code> - List all pending App IDs.
 <code>data today</code> - Show today's customer summary by owner.
 
 <b>--- Admin: Viewing Information ---</b>
@@ -2146,7 +2142,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
     if m:
         if not _has_permission(user, 'list owner'): return "You're not authorized to use this command."
         name = m.group(1).strip()
-        if name.lower() in ("owners", "disabled", "pending"): return None
+        if name.lower() in ("owners", "disabled"): return None
         owner = _find_owner_group(name)
         if not owner: return f"Owner '{name}' not found."
 
@@ -2170,44 +2166,6 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
     if m:
         if not _has_permission(user, 'remind user'): return "You don't have permission to use this command."
         return await _send_all_pending_reminders(context)
-
-    m = CLEAR_ALL_PENDING_RX.match(text)
-    if m:
-        if not _has_permission(user, 'clear all pending'): return "You don't have permission to use this command."
-        if not _is_super_admin(user): return "Only the super admin can use this command."
-
-        issued_data = state.setdefault("issued", {})
-        temp_bans = state.setdefault("whatsapp_temp_bans", {})
-
-        # Find all users with pending WhatsApps and lift their temp bans
-        users_with_pending_wa = list(issued_data.get("whatsapp", {}).keys())
-        bans_lifted_count = 0
-        for user_id_str in users_with_pending_wa:
-            if user_id_str in temp_bans:
-                del temp_bans[user_id_str]
-                bans_lifted_count += 1
-                log.info(f"Super admin cleared all pending, lifting temp ban for user {user_id_str}.")
-
-        username_count = sum(len(items) for items in issued_data.get("username", {}).values())
-        whatsapp_count = sum(len(items) for items in issued_data.get("whatsapp", {}).values())
-        app_id_count = sum(len(items) for items in issued_data.get("app_id", {}).values())
-
-        if username_count == 0 and whatsapp_count == 0 and app_id_count == 0:
-            return "There were no pending items to clear."
-
-        issued_data["username"] = {}
-        issued_data["whatsapp"] = {}
-        issued_data["app_id"] = {}
-
-        await save_state()
-        log.info(f"Admin cleared all pending items. Removed {username_count} usernames, {whatsapp_count} whatsapps, {app_id_count} app IDs.")
-
-        reply_message = f"✅ All pending items have been cleared ({username_count} usernames, {whatsapp_count} whatsapps, {app_id_count} app IDs)."
-        if bans_lifted_count > 0:
-            reply_message += f"\nLifted {bans_lifted_count} temporary WhatsApp ban(s)."
-
-        return reply_message
-
 
     m = CLEAR_PENDING_RX.match(text)
     if m:
@@ -2393,51 +2351,6 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
     if COMMANDS_RX.match(text):
         command_list_text = _get_commands_text()
         return command_list_text
-
-    m = LIST_PENDING_RX.match(text)
-    if m:
-        if not _has_permission(user, 'list pending'):
-            return "You're not authorized to use this command."
-
-        lines = ["<b>⏳ All Pending Items by User:</b>"]
-        total_pending = 0
-
-        # Check all kinds of pending items
-        for kind, label in [("username", "Usernames"), ("whatsapp", "WhatsApps"), ("app_id", "App IDs")]:
-            pending_bucket = _issued_bucket(kind)
-            if not pending_bucket:
-                continue
-
-            kind_lines = []
-            kind_total = 0
-
-            for user_id_str, items in sorted(pending_bucket.items()):
-                if not items:
-                    continue
-
-                user_id = int(user_id_str)
-                user_info = state.get("user_names", {}).get(user_id_str, {})
-                user_display = user_info.get('username') or user_info.get('first_name') or f"ID {user_id}"
-                if user_info.get('username'):
-                    user_display = f"@{user_display}"
-
-                user_item_lines = [f"  - <code>{item.get('value')}</code>" for item in items if item.get('value')]
-
-                if user_item_lines:
-                    kind_lines.append(f"\n<b>{user_display}:</b>")
-                    kind_lines.extend(user_item_lines)
-                    kind_total += len(user_item_lines)
-
-            if kind_total > 0:
-                lines.append(f"\n\n<b>--- {label} ({kind_total}) ---</b>")
-                lines.extend(kind_lines)
-                total_pending += kind_total
-
-        if total_pending == 0:
-            return "No pending items found."
-
-        lines.insert(1, f"<b>Total Pending Items:</b> {total_pending}")
-        return "\n".join(lines)
 
     m = DATA_TODAY_RX.match(text)
     if m:
