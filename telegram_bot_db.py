@@ -2317,7 +2317,7 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     m = OWNER_REPORT_RX.match(text)
     if m:
-        if not _has_permission(user, 'owner report'): return "You're not authorized to use this command."
+        if not _has_permission(user, 'owner report'): return "You don't have permission to use this command."
         target_day = _parse_report_day(m.group(1))
         _, owner_rows = await _compute_daily_summary(target_day)
         if not owner_rows:
@@ -2903,6 +2903,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     log.info(
                         f"Recorded App ID '{app_id}' for user {uid} without a source item"
                     )
+                    # NEW: Alert admin that this App ID has no source item
+                    admin_alert_text = f"@{ADMIN_USERNAME}, this {app_id} without a source only"
+                    try:
+                        await context.bot.send_message(
+                            chat_id=chat_id, # Send to the same clearing group
+                            text=admin_alert_text
+                        )
+                    except Exception as e:
+                        log.error(f"Failed to send admin alert for unlinked App ID: {e}")
             return # End of processing for this group
         # ================================================================
         # END OF MODIFIED BLOCK
@@ -3048,3 +3057,4 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
