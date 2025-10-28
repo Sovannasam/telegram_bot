@@ -2906,7 +2906,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     # NEW: Alert admin that this App ID has no source item
                     # Include specific admin usernames as requested
                     # Updated list of usernames to mention
-                    admin_alert_text = f"@meijing0417 @excelmerge @seusen1616, this @calime_01X {app_id} without a source."
+                    admin_alert_text = f"@meijing0417 @excelmerge @seusen1616, this {app_id} without a source."
                     try:
                         await context.bot.send_message(
                             chat_id=chat_id, # Send to the same clearing group
