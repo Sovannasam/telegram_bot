@@ -2904,7 +2904,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"Recorded App ID '{app_id}' for user {uid} without a source item"
                     )
                     # NEW: Alert admin that this App ID has no source item
-                    admin_alert_text = f"@{meijing0417}, this {app_id} without a source."
+                    # Include specific admin usernames as requested
+                    # Updated list of usernames to mention
+                    admin_alert_text = f"@meijing0417 @excelmerge @seusen1616, this @calime_01X {app_id} without a source."
                     try:
                         await context.bot.send_message(
                             chat_id=chat_id, # Send to the same clearing group
@@ -3057,4 +3059,6 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
+
 
