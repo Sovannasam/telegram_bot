@@ -2895,26 +2895,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await _log_event(source_kind, "cleared", update, value_to_clear)
                         log.info(f"Auto-cleared pending {source_kind} for user {uid}: {value_to_clear}")
 
-                else:
-                    # Treat unlinked App IDs as valid entries, storing them for later confirmation
-                    context_data = {"source_owner": "unknown", "source_kind": "app_id"}
-                    await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
-                    await _log_event("app_id", "issued", update, app_id)
-                    log.info(
-                        f"Recorded App ID '{app_id}' for user {uid} without a source item"
-                    )
-                    # NEW: Alert admin that this App ID has no source item
-                    # Include specific admin usernames as requested
-                    # Updated list of usernames to mention
-                    admin_alert_text = f"@meijing0417 @excelmerge @seusen1616, this {app_id} without a source."
-                    try:
-                        await context.bot.send_message(
-                            chat_id=chat_id, # Send to the same clearing group
-                            text=admin_alert_text
-                        )
-                    except Exception as e:
-                        log.error(f"Failed to send admin alert for unlinked App ID: {e}")
-            return # End of processing for this group
+
         # ================================================================
         # END OF MODIFIED BLOCK
         # ================================================================
