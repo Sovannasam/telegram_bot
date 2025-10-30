@@ -54,7 +54,7 @@ FORWARD_GROUP_ID = int(os.getenv("FORWARD_GROUP_ID", "-1003109226804")) # Target
 PERFORMANCE_GROUP_IDS = {
     -1002670785417, -1002659012767, -1002790753092, -1002520117752
 }
-CATCH_UP_LIMIT = int(os.getenv("CATCH_UP_LIMIT", "4")) # Limit for least-busy owner priority
+CATCH_UP_LIMIT = int(os.getenv("CATCH_UP_LIMIT", "5")) # Limit for least-busy owner priority
 CATCH_UP_COOLDOWN_MINUTES = int(os.getenv("CATCH_UP_COOLDOWN_MINUTES", "100")) # Cooldown in minutes after hitting catch-up limit
 
 # NEW: Daily limit for submissions per country
