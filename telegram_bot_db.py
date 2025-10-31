@@ -2525,7 +2525,7 @@ async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
     log.info("Performing daily reset...")
     async with db_lock:
         state['whatsapp_offense_count'] = {} # Reset offense counts daily
-        log.info("Resetting daily catch-up assignments, cooldowns, and WhatsApp offense counters.")
+       log.info("Resetting daily WhatsApp offense counters.")
         try:
             pool = await get_db_pool()
             async with pool.acquire() as conn:
