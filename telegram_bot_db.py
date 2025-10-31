@@ -211,13 +211,7 @@ BASE_STATE = {
         "wa_owner_idx": 0, "wa_entry_idx": {},
     },
     "issued": {"username": {}, "whatsapp": {}, "app_id": {}},
-    "priority_queue": {
-        "active": False,
-        "owner": None,
-        "remaining": 0,
-        "stop_after": False,
-        "saved_rr_indices": {}
-    },
+    "priority_queue": {}, # NEW: Will store {owner_name: {"remaining": N, "stop_after": bool}}
     "whatsapp_temp_bans": {},
     "whatsapp_last_request_ts": {},
     "username_last_request_ts": {},
@@ -371,6 +365,21 @@ async def _migrate_state_if_needed():
                 bucket[user_id] = [item_or_list]
                 state_was_changed = True
                 log.info(f"Migrated user {user_id}'s '{kind}' data to new list format.")
+
+    # NEW: Migration for priority_queue
+    pq = state.get("priority_queue", {})
+    if "active" in pq or "owner" in pq:
+        log.info("Migrating old priority_queue structure...")
+        new_pq = {}
+        if pq.get("active") and pq.get("owner") and pq.get("remaining", 0) > 0:
+            owner = pq["owner"]
+            new_pq[owner] = {
+                "remaining": pq["remaining"],
+                "stop_after": pq.get("stop_after", False)
+            }
+        state["priority_queue"] = new_pq
+        state_was_changed = True
+        log.info("Migrated priority_queue to new multi-owner format.")
 
     if state_was_changed:
         log.info("State structure was migrated. Saving new format to database.")
@@ -711,50 +720,37 @@ async def _rebuild_pools_preserving_rotation():
 
     await save_state()
 
-async def _decrement_priority_and_end_if_needed():
-    pq = state.get("priority_queue", {})
-    if not pq.get("active"):
-        return
+async def _decrement_priority_and_end_if_needed(owner_name: str):
+    pq_map = state.setdefault("priority_queue", {})
+    owner_pq = pq_map.get(owner_name)
 
-    pq["remaining"] -= 1
+    if not owner_pq:
+        return # No priority queue for this owner
 
-    if pq["remaining"] <= 0:
-        log.info(f"Priority queue for owner {pq['owner']} completed.")
-        saved_indices = pq.get("saved_rr_indices", {})
-        state["rr"]["username_owner_idx"] = saved_indices.get("username_owner_idx", 0)
-        state["rr"]["wa_owner_idx"] = saved_indices.get("wa_owner_idx", 0)
+    owner_pq["remaining"] -= 1
 
-        stop_after = pq.get("stop_after", False)
-        owner_to_stop = pq.get("owner")
+    if owner_pq["remaining"] <= 0:
+        log.info(f"Priority queue for owner {owner_name} completed.")
+        stop_after = owner_pq.get("stop_after", False)
+        
+        # Remove this owner from the priority map
+        del pq_map[owner_name]
 
-        state["priority_queue"] = BASE_STATE["priority_queue"]
-
-        if stop_after and owner_to_stop:
-            log.info(f"Auto-stopping owner {owner_to_stop} after priority queue completion.")
-            owner_group = _find_owner_group(owner_to_stop)
+        if stop_after:
+            log.info(f"Auto-stopping owner {owner_name} after priority queue completion.")
+            owner_group = _find_owner_group(owner_name)
             if owner_group:
                 owner_group["disabled"] = True
+            # We must rebuild pools *after* modifying the owner data
             await _rebuild_pools_preserving_rotation()
         else:
+            # Just save the state change (pq_map was modified)
             await save_state()
     else:
+        # Save the state with decremented 'remaining'
         await save_state()
 
 async def _next_from_username_pool() -> Optional[Dict[str, str]]:
-    pq = state.get("priority_queue", {})
-    if pq.get("active"):
-        priority_owner = pq.get("owner")
-        for block in USERNAME_POOL:
-            if block["owner"] == priority_owner:
-                arr = block.get("usernames", [])
-                if arr:
-                    ei = state["rr"]["username_entry_idx"].get(priority_owner, 0) % len(arr)
-                    result = {"owner": priority_owner, "username": arr[ei]}
-                    state["rr"]["username_entry_idx"][priority_owner] = (ei + 1) % len(arr)
-                    await _decrement_priority_and_end_if_needed()
-                    return result
-        log.warning(f"Priority owner {priority_owner} has no available usernames. Falling back to normal rotation for this request.")
-
     if not USERNAME_POOL: return None
 
     owner_idx = state['rr'].get("username_owner_idx", 0)
@@ -764,34 +760,36 @@ async def _next_from_username_pool() -> Optional[Dict[str, str]]:
     for i in range(len(USERNAME_POOL)):
         current_idx = (owner_idx + i) % len(USERNAME_POOL)
         block = USERNAME_POOL[current_idx]
+        owner_name = block["owner"]
         arr = block.get("usernames", [])
+        
         if arr:
-            ei = state["rr"]["username_entry_idx"].get(block["owner"], 0) % len(arr)
-            result = {"owner": block["owner"], "username": arr[ei]}
-            state["rr"]["username_entry_idx"][block["owner"]] = (ei + 1) % len(arr)
-            state["rr"]["username_owner_idx"] = (current_idx + 1) % len(USERNAME_POOL)
-            await save_state()
+            # Found a valid owner with items
+            ei = state["rr"]["username_entry_idx"].get(owner_name, 0) % len(arr)
+            result = {"owner": owner_name, "username": arr[ei]}
+            state["rr"]["username_entry_idx"][owner_name] = (ei + 1) % len(arr)
+
+            # --- NEW LOGIC START ---
+            # Check if this owner is in the multi-owner priority map
+            is_priority_owner = owner_name in state.get("priority_queue", {})
+
+            if is_priority_owner:
+                # It's the priority owner's turn. Give them the item.
+                # DO NOT advance the owner_idx, so the next request also lands here.
+                log.info(f"Priority queue: Serving {owner_name} (turn matched).")
+                await _decrement_priority_and_end_if_needed(owner_name) # Pass owner_name
+            else:
+                # Normal rotation. Advance the owner_idx.
+                state["rr"]["username_owner_idx"] = (current_idx + 1) % len(USERNAME_POOL)
+                await save_state()
+            # --- NEW LOGIC END ---
+
             return result
-    return None
+            
+    return None # No owners with items found
 
 
 async def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
-    pq = state.get("priority_queue", {})
-    if pq.get("active"):
-        priority_owner = pq.get("owner")
-        for block in WHATSAPP_POOL:
-            if block["owner"] == priority_owner:
-                numbers = block.get("numbers", []) or []
-                if numbers:
-                    start = state["rr"]["wa_entry_idx"].get(priority_owner, 0) % len(numbers)
-                    for step in range(len(numbers)):
-                        cand = numbers[(start + step) % len(numbers)]
-                        if not await _wa_quota_reached(cand):
-                            state["rr"]["wa_entry_idx"][priority_owner] = ((start + step) + 1) % len(numbers)
-                            await _decrement_priority_and_end_if_needed()
-                            return {"owner": priority_owner, "number": cand}
-        log.warning(f"Priority owner {priority_owner} has no available WhatsApp numbers. Falling back to normal rotation for this request.")
-
     if not WHATSAPP_POOL: return None
 
     owner_idx = state['rr'].get("wa_owner_idx", 0)
@@ -803,17 +801,35 @@ async def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
         block = WHATSAPP_POOL[current_idx]
         owner = block["owner"]
         numbers = block.get("numbers", []) or []
+        
         if numbers:
             start = state["rr"]["wa_entry_idx"].get(owner, 0) % len(numbers)
             for step in range(len(numbers)):
                 cand = numbers[(start + step) % len(numbers)]
                 if await _wa_quota_reached(cand):
                     continue
+                
+                # Found a valid number.
                 state["rr"]["wa_entry_idx"][owner] = ((start + step) + 1) % len(numbers)
-                state["rr"]["wa_owner_idx"] = (current_idx + 1) % len(WHATSAPP_POOL)
-                await save_state()
+                
+                # --- NEW LOGIC START ---
+                # Check if this owner is in the multi-owner priority map
+                is_priority_owner = owner in state.get("priority_queue", {})
+
+                if is_priority_owner:
+                    # It's the priority owner's turn. Give them the item.
+                    # DO NOT advance the wa_owner_idx, so the next request also lands here.
+                    log.info(f"Priority queue: Serving {owner} (turn matched).")
+                    await _decrement_priority_and_end_if_needed(owner) # Pass owner
+                else:
+                    # Normal rotation. Advance the wa_owner_idx.
+                    state["rr"]["wa_owner_idx"] = (current_idx + 1) % len(WHATSAPP_POOL)
+                    await save_state()
+                # --- NEW LOGIC END ---
+
                 return {"owner": owner, "number": cand}
-    return None
+                
+    return None # No owners with items or all numbers at quota
 
 # =============================
 # REGEXES & HELPERS
@@ -841,7 +857,7 @@ LIST_DISABLED_RX      = re.compile(r"^\s*list\s+disabled\s*$", re.IGNORECASE)
 PHONE_LIKE_RX         = re.compile(r"^\+?\d[\d\s\-]{6,}\d$")
 LIST_OWNER_ALIAS_RX   = re.compile(r"^\s*list\s+@?([A-Za-z0-9_]{3,})\s*$", re.IGNORECASE)
 REMIND_ALL_RX         = re.compile(r"^\s*remind\s+user\s*$", re.IGNORECASE)
-TAKE_CUSTOMER_RX      = re.compile(r"^\s*take\s+(\d+)\s+customer(?:s)?\s+to\s+owner\s+@?(.+?)(?:\s+(and\s+stop))?\s*$", re.IGNORECASE)
+TAKE_CUSTOMER_RX      = re.compile(r"^\s*take\s+(\d+)\s+customer(?:s)?\s+to\s+owners?\s+(.+?)(?:\s+(and\s+stop))?\s*$", re.IGNORECASE)
 CLEAR_PENDING_RX      = re.compile(r"^\s*clear\s+pending\s+(.+)\s*$", re.IGNORECASE)
 BAN_WHATSAPP_RX       = re.compile(r"^\s*ban\s+whatsapp\s+@?(\S+)\s*$", re.IGNORECASE)
 UNBAN_WHATSAPP_RX     = re.compile(r"^\s*unban\s+whatsapp\s+@?(\S+)\s*$", re.IGNORECASE)
@@ -1626,22 +1642,49 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
     m = TAKE_CUSTOMER_RX.match(text)
     if m:
         if not _has_permission(user, 'take customer'): return "You don't have permission to use this command."
-        count_str, owner_name, and_stop_str = m.groups()
+        count_str, owners_str, and_stop_str = m.groups()
         count = int(count_str)
-        owner_norm = _norm_owner_name(owner_name)
+        stop_after = bool(and_stop_str)
 
-        owner_group = _find_owner_group(owner_norm)
-        if not owner_group: return f"Owner '{owner_name}' not found."
-        if _owner_is_paused(owner_group): return f"Owner '{owner_name}' is currently paused and cannot take customers."
+        # Split owners string by comma or space, and clean up
+        owner_names_raw = re.split(r'[\s,]+', owners_str)
+        owner_names = [_norm_owner_name(name) for name in owner_names_raw if name.strip()]
+        
+        if not owner_names:
+            return "No valid owner names provided."
 
-        state["priority_queue"] = {
-            "active": True, "owner": owner_norm, "remaining": count,
-            "stop_after": bool(and_stop_str),
-            "saved_rr_indices": { "username_owner_idx": state["rr"]["username_owner_idx"], "wa_owner_idx": state["rr"]["wa_owner_idx"] }
-        }
+        pq_map = state.setdefault("priority_queue", {})
+        added_owners = []
+        failed_owners = []
+
+        for owner_norm in owner_names:
+            if not owner_norm: continue
+            
+            owner_group = _find_owner_group(owner_norm)
+            if not owner_group:
+                failed_owners.append(f"@{owner_norm} (not found)")
+                continue
+            if _owner_is_paused(owner_group):
+                failed_owners.append(f"@{owner_norm} (paused)")
+                continue
+            
+            # Add or update this owner in the priority queue
+            pq_map[owner_norm] = {
+                "remaining": count,
+                "stop_after": stop_after
+            }
+            added_owners.append(f"@{owner_norm}")
+
         await save_state()
-        stop_msg = " and will be stopped" if state["priority_queue"]["stop_after"] else ""
-        return f"Priority queue activated: Next {count} customers will be directed to {owner_name}{stop_msg}."
+        
+        reply_lines = []
+        if added_owners:
+            stop_msg = " and will be stopped" if stop_after else ""
+            reply_lines.append(f"Priority queue activated: Next {count} customers will be directed to {', '.join(added_owners)} (when their turn comes){stop_msg}.")
+        if failed_owners:
+            reply_lines.append(f"Failed to add: {', '.join(failed_owners)}.")
+        
+        return "\n".join(reply_lines)
 
     m = STOP_OPEN_RX.match(text)
     if m:
