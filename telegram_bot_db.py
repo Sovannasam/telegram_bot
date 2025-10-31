@@ -234,9 +234,7 @@ USER_COUNTRY_BANS: Dict[int, set[str]] = {}
 # =============================
 COMMAND_PERMISSIONS = {
     'add owner', 'delete owner', 'add username', 'delete username', 'add whatsapp', 'delete whatsapp',
-    'stop open', 'take customer', 'ban whatsapp', 'unban whatsapp', 'report',
-    'owner report', 'performance', 'remind user', 'clear pending',
-    'list owners', 'list disabled', 'list owner', 'detail user', 'list banned', 'list admins',
+    'stop open', 'take customer', 'ban whatsapp', 'unban whatsapp','performance', 'remind user', 'clear pending', 'list disabled', 'detail user', 'list banned', 'list admins',
     'data today', 'list enabled', 'add user', 'delete user',
     'ban country', 'unban country', 'list country bans', 'user performance', 'user stats',
     'inventory', 'request stats'
@@ -838,10 +836,8 @@ ADD_WHATSAPP_RX       = re.compile(r"^\s*add\s+whats?app\s+(\+?\d[\d\s\-]{6,}\d)
 DEL_OWNER_RX          = re.compile(r"^\s*delete\s+owner\s+@?(.+?)\s*$", re.IGNORECASE)
 DEL_USERNAME_RX       = re.compile(r"^\s*delete\s+username\s+@([A-Za-z0-9_]{3,})\s*$", re.IGNORECASE)
 DEL_WHATSAPP_RX       = re.compile(r"^\s*delete\s+whats?app\s+(\+?\d[\d\s\-]{6,}\d)\s*$", re.IGNORECASE)
-LIST_OWNERS_RX        = re.compile(r"^\s*list\s+owners\s*$", re.IGNORECASE)
 LIST_OWNER_DETAIL_RX  = re.compile(r"^\s*list\s+owner\s+@?([A-Za-z0-9_]{3,})\s*$", re.IGNORECASE)
 LIST_DISABLED_RX      = re.compile(r"^\s*list\s+disabled\s*$", re.IGNORECASE)
-SEND_REPORT_RX        = re.compile(r"^\s*(?:send\s+report|report)(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 PHONE_LIKE_RX         = re.compile(r"^\+?\d[\d\s\-]{6,}\d$")
 LIST_OWNER_ALIAS_RX   = re.compile(r"^\s*list\s+@?([A-Za-z0-9_]{3,})\s*$", re.IGNORECASE)
 REMIND_ALL_RX         = re.compile(r"^\s*remind\s+user\s*$", re.IGNORECASE)
@@ -850,7 +846,6 @@ CLEAR_PENDING_RX      = re.compile(r"^\s*clear\s+pending\s+(.+)\s*$", re.IGNOREC
 BAN_WHATSAPP_RX       = re.compile(r"^\s*ban\s+whatsapp\s+@?(\S+)\s*$", re.IGNORECASE)
 UNBAN_WHATSAPP_RX     = re.compile(r"^\s*unban\s+whatsapp\s+@?(\S+)\s*$", re.IGNORECASE)
 LIST_BANNED_RX        = re.compile(r"^\s*list\s+banned\s*$", re.IGNORECASE)
-OWNER_REPORT_RX       = re.compile(r"^\s*owner\s+report(?:\s+(yesterday|today|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 COMMANDS_RX           = re.compile(r"^\s*commands\s*$", re.IGNORECASE)
 MY_DETAIL_RX          = re.compile(r"^\s*my\s+detail\s*$", re.IGNORECASE)
 DETAIL_USER_RX        = re.compile(r"^\s*detail\s+@?(\S+)\s*$", re.IGNORECASE)
@@ -1374,161 +1369,6 @@ async def _get_daily_data_summary_text() -> str:
 
     return "\n".join(lines)
 
-
-# =============================
-# EXCEL (reads audit_log)
-# =============================
-def _logical_day_of(ts: datetime) -> date:
-    shifted = ts.astimezone(TIMEZONE) - timedelta(hours=5, minutes=30)
-    return shifted.date()
-
-async def _read_log_rows() -> List[dict]:
-    try:
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch("SELECT * FROM audit_log ORDER BY ts_local")
-            return [dict(row) for row in rows]
-    except Exception as e:
-        log.error("Failed to read log rows from DB: %s", e)
-        return []
-
-async def _compute_daily_summary(target_day: date) -> Tuple[List[dict], List[dict]]:
-    """
-    Computes daily summary for users and owners, now with added customer and country data.
-    """
-    # Define the time range for the logical day
-    start_ts = TIMEZONE.localize(datetime.combine(target_day, time(5, 30)))
-    end_ts = start_ts + timedelta(days=1)
-
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        # Get all unique user IDs active on the target day from all relevant tables
-        audit_users = await conn.fetch("SELECT DISTINCT user_id FROM audit_log WHERE ts_local >= $1 AND ts_local < $2 AND user_id IS NOT NULL", start_ts, end_ts)
-        confirm_users = await conn.fetch("SELECT DISTINCT user_id FROM user_daily_confirmations WHERE day = $1", target_day)
-        country_users = await conn.fetch("SELECT DISTINCT user_id FROM user_daily_country_counts WHERE day = $1", target_day)
-
-        all_user_ids = {r['user_id'] for r in audit_users if r['user_id']}
-        all_user_ids.update({r['user_id'] for r in confirm_users if r['user_id']})
-        all_user_ids.update({r['user_id'] for r in country_users if r['user_id']})
-
-        # Process data for each user
-        out_users = []
-        for user_id in all_user_ids:
-            user_info = state.get("user_names", {}).get(str(user_id), {})
-            user_display = user_info.get('username') or user_info.get('first_name') or f"ID: {user_id}"
-
-            # Get request counts from audit log
-            username_reqs, whatsapp_reqs = 0, 0
-            req_rows = await conn.fetch("SELECT kind FROM audit_log WHERE ts_local >= $1 AND ts_local < $2 AND user_id = $3 AND action = 'issued'", start_ts, end_ts, user_id)
-            for row in req_rows:
-                if row['kind'] == 'username':
-                    username_reqs += 1
-                elif row['kind'] == 'whatsapp':
-                    whatsapp_reqs += 1
-
-            # Get confirmation counts
-            confirm_count = await _get_user_confirmation_count(user_id)
-
-            # Get country submissions
-            country_counts = await _get_user_country_counts(user_id)
-            country_str = ", ".join([f"{c.title()}: {n}" for c, n in country_counts])
-
-            out_users.append({
-                "Day": target_day.isoformat(),
-                "User": user_display,
-                "Total username receive": username_reqs,
-                "Total whatsapp receive": whatsapp_reqs,
-                "Total customer added": confirm_count,
-                "Country Submissions": country_str,
-            })
-
-    # Owner performance logic remains largely the same, but re-fetched for clarity
-    day_rows = [r for r in await _read_log_rows() if _logical_day_of(r["ts_local"]) == target_day]
-    owner_stats: Dict[str, dict] = {}
-    for r in day_rows:
-        owner = (r.get("owner","") or "").lower()
-        if r["action"] == "issued" and owner:
-            s = owner_stats.setdefault(owner, {"total": 0, "tg": 0, "wa": 0})
-            s["total"] += 1
-            if r["kind"] == "username":
-                s["tg"] += 1
-            elif r["kind"] == "whatsapp":
-                s["wa"] += 1
-
-    out_owners = []
-    for owner, s in sorted(owner_stats.items(), key=lambda kv: kv[0]):
-        out_owners.append({
-            "Day": target_day.isoformat(),
-            "Owner": f"@{owner}",
-            "Customers total": s["total"],
-            "Customers via Telegram": s["tg"],
-            "Customers via WhatsApp": s["wa"],
-        })
-
-    out_users.sort(key=lambda r: r["User"].lower())
-    return out_users, out_owners
-
-def _style_and_save_excel(user_rows: List[dict], owner_rows: List[dict]) -> io.BytesIO:
-    try:
-        from openpyxl import Workbook
-        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-    except ImportError:
-        raise RuntimeError("openpyxl not installed. Please add it to requirements.txt")
-
-    wb = Workbook()
-
-    # Sheet 1: Summary
-    ws = wb.active; ws.title = "Summary"
-    headers = ["Day", "User", "Total username receive", "Total whatsapp receive", "Total customer added", "Country Submissions"]
-    ws.append(headers)
-    for r in user_rows: ws.append([r.get(h, "") for h in headers])
-
-    header_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
-    header_font = Font(color="FFFFFF", bold=True, size=11)
-    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    thin = Side(style="thin"); border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    for cell in ws[1]: cell.fill = header_fill; cell.font = header_font; cell.alignment = center; cell.border = border
-    for i, row in enumerate(ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=ws.max_column), start=2):
-        fill = PatternFill(start_color="F2F2F2" if i % 2 == 0 else "FFFFFF", fill_type="solid")
-        for cell in row: cell.alignment = center; cell.border = border; cell.fill = fill
-    for col in ws.columns:
-        max_len = 0; letter = col[0].column_letter
-        for c in col:
-            if c.value: max_len = max(max_len, len(str(c.value)))
-        ws.column_dimensions[letter].width = min(max_len + 2, 60)
-
-    # Sheet 2: Owners
-    ws2 = wb.create_sheet("Owners")
-    headers2 = ["Day","Owner","Customers total","Customers via Telegram","Customers via WhatsApp"]
-    ws2.append(headers2)
-    for r in owner_rows: ws2.append([r.get(h, "") for h in headers2])
-    for cell in ws2[1]: cell.fill = header_fill; cell.font = header_font; cell.alignment = center; cell.border = border
-    for i, row in enumerate(ws2.iter_rows(min_row=2, max_row=ws2.max_row, max_col=ws2.max_column), start=2):
-        fill = PatternFill(start_color="F2F2F2" if i % 2 == 0 else "FFFFFF", fill_type="solid")
-        for cell in row: cell.alignment = center; cell.border = border; cell.fill = fill
-    for col in ws2.columns:
-        max_len = 0; letter = col[0].column_letter
-        for c in col:
-            if c.value: max_len = max(max_len, len(str(c.value)))
-        ws2.column_dimensions[letter].width = min(max_len + 2, 40)
-
-    excel_buffer = io.BytesIO()
-    wb.save(excel_buffer)
-    excel_buffer.seek(0)
-    return excel_buffer
-
-async def _get_daily_excel_report(target_day: date) -> Tuple[Optional[str], Optional[io.BytesIO]]:
-    user_rows, owner_rows = await _compute_daily_summary(target_day)
-    if not user_rows and not owner_rows:
-        return ("No data for that day.", None)
-    try:
-        excel_buffer = _style_and_save_excel(user_rows, owner_rows)
-        return (None, excel_buffer)
-    except Exception as e:
-        log.error("Failed to generate Excel report in memory: %s", e)
-        return (f"Failed to generate report: {e}", None)
-
-
 def _parse_report_day(arg: Optional[str]) -> date:
     now = datetime.now(TIMEZONE)
     if not arg or arg.lower() == "today": return (now - timedelta(hours=5, minutes=30)).date()
@@ -1602,8 +1442,6 @@ def _get_commands_text() -> str:
 <code>list country bans [@user]</code>
 
 <b>--- Admin: Reports & Manual Actions ---</b>
-<code>report [today|yesterday|YYYY-MM-DD]</code>
-<code>owner report [today|yesterday|YYYY-MM-DD]</code>
 <code>user performance [day]</code> - See ranked list of users by customers added.
 <code>user stats [day]</code> - See user success rates.
 <code>request stats</code> - See current request ratio for auto-shutdown.
@@ -1613,7 +1451,6 @@ def _get_commands_text() -> str:
 <code>data today</code> - Show today's customer summary by owner.
 
 <b>--- Admin: Viewing Information ---</b>
-<code>list owners</code>
 <code>list disabled</code>
 <code>list enabled</code> - List all active owners.
 <code>list @owner</code>
@@ -2017,17 +1854,6 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         await _rebuild_pools_preserving_rotation()
         return f"Deleted WhatsApp number {num} from all owners."
 
-    if LIST_OWNERS_RX.match(text):
-        if not _has_permission(user, 'list owners'): return "You're not authorized to use this command."
-        if not OWNER_DATA: return "No owners configured."
-        lines = ["<b>Owner Roster:</b>"]
-        for o in OWNER_DATA:
-            status = "PAUSED" if _owner_is_paused(o) else "active"
-            u_count = len([e for e in o.get("entries", []) if not e.get("disabled")])
-            w_count = len([w for w in o.get("whatsapp", []) if not w.get("disabled")])
-            lines.append(f"- <code>{o['owner']}</code> ({status}): {u_count} usernames, {w_count} whatsapps")
-        return "\n".join(lines)
-
     if LIST_DISABLED_RX.match(text):
         if not _has_permission(user, 'list disabled'): return "You're not authorized to use this command."
         disabled = [o for o in OWNER_DATA if _owner_is_paused(o)]
@@ -2226,20 +2052,6 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
                 countries_str = ", ".join(sorted([c.title() for c in banned_countries]))
                 lines.append(f"- <b>{user_display}</b>: {countries_str}")
             return "\n".join(lines)
-
-
-    m = OWNER_REPORT_RX.match(text)
-    if m:
-        if not _has_permission(user, 'owner report'): return "You don't have permission to use this command."
-        target_day = _parse_report_day(m.group(1))
-        _, owner_rows = await _compute_daily_summary(target_day)
-        if not owner_rows:
-            return f"No owner activity found for {target_day.isoformat()}."
-
-        lines = [f"<b>Owner Performance for {target_day.isoformat()}:</b>"]
-        for row in owner_rows:
-            lines.append(f"- <b>{row['Owner']}</b>: {row['Customers total']} ({row['Customers via Telegram']} usernames, {row['Customers via WhatsApp']} whatsapps)")
-        return "\n".join(lines)
 
     m = USER_PERFORMANCE_RX.match(text)
     if m:
@@ -2578,22 +2390,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await msg.reply_html(perf_text)
                 else:
                     await msg.reply_text("This command is only for registered owners.")
-            return
-
-        # Admin: Report
-        mrep = SEND_REPORT_RX.match(text)
-        if _is_admin(update.effective_user) and _has_permission(update.effective_user, 'report') and mrep:
-            target_day = _parse_report_day(mrep.group(1))
-            err, excel_buffer = await _get_daily_excel_report(target_day)
-
-            if err:
-                await msg.reply_text(err)
-            elif excel_buffer:
-                file_name = f"daily_summary_{target_day.isoformat()}.xlsx"
-                await msg.reply_document(
-                    document=excel_buffer, filename=file_name,
-                    caption=f"Daily summary (logical day starting 05:30) — {target_day}"
-                )
             return
 
         # Admin "performance @owner" command
@@ -2959,6 +2755,3 @@ if __name__ == "__main__":
 
     log.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
-
-
