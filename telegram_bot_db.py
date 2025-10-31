@@ -891,7 +891,7 @@ def _parse_stop_open_target(raw: str) -> Tuple[str, str]:
     if s.startswith("@"):
         return ("username", s)
     if _looks_like_phone(s):
-        return ("phone", s)`
+        return ("phone", s)
     return ("owner", s)
 
 # =============================
