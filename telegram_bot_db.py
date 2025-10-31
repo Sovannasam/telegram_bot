@@ -2522,11 +2522,11 @@ async def check_request_ratio_and_stop_whatsapp(context: ContextTypes.DEFAULT_TY
 
 
 async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
-    log.info("Performing daily reset...")
-    async with db_lock:
-        state['whatsapp_offense_count'] = {} # Reset offense counts daily
-        log.info("Resetting daily WhatsApp offense counters.")
-        try:
+    log.info("Performing daily reset...")
+    async with db_lock:
+        state['whatsapp_offense_count'] = {} # Reset offense counts daily
+        log.info("Resetting daily WhatsApp offense counters.")
+        try:
             pool = await get_db_pool()
             async with pool.acquire() as conn:
                 await conn.execute("DELETE FROM wa_daily_usage;")
