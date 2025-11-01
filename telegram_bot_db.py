@@ -231,7 +231,7 @@ COMMAND_PERMISSIONS = {
     'stop open', 'take customer', 'ban whatsapp', 'unban whatsapp','performance', 'remind user', 'clear pending', 'list disabled', 'detail user', 'list banned', 'list admins',
     'data today', 'list enabled', 'add user', 'delete user',
     'ban country', 'unban country', 'list country bans', 'user performance', 'user stats',
-    'inventory', 'request stats'
+    'inventory', 'request stats', 'list priority' # ADDED: list priority
 }
 
 async def load_admins():
@@ -366,9 +366,9 @@ async def _migrate_state_if_needed():
                 state_was_changed = True
                 log.info(f"Migrated user {user_id}'s '{kind}' data to new list format.")
 
-    # NEW: Migration for priority_queue
+    # NEW: Migration for priority_queue (from old single-owner structure)
     pq = state.get("priority_queue", {})
-    if "active" in pq or "owner" in pq:
+    if isinstance(pq, dict) and ("active" in pq or "owner" in pq):
         log.info("Migrating old priority_queue structure...")
         new_pq = {}
         if pq.get("active") and pq.get("owner") and pq.get("remaining", 0) > 0:
@@ -879,6 +879,7 @@ DELETE_USER_RX        = re.compile(r"^\s*delete\s+user\s+@?(\S+)\s*$", re.IGNORE
 BAN_COUNTRY_RX        = re.compile(r"^\s*ban\s+country\s+([a-zA-Z\s]+)\s+for\s+@?(\S+)\s*$", re.IGNORECASE)
 UNBAN_COUNTRY_RX      = re.compile(r"^\s*unban\s+country\s+([a-zA-Z\s]+)\s+for\s+@?(\S+)\s*$", re.IGNORECASE)
 LIST_COUNTRY_BANS_RX  = re.compile(r"^\s*list\s+country\s+bans(?:\s+@?(\S+))?\s*$", re.IGNORECASE)
+LIST_PRIORITY_RX      = re.compile(r"^\s*list\s+priority\s*$", re.IGNORECASE)
 USER_PERFORMANCE_RX   = re.compile(r"^\s*user\s+performance(?:\s+(today|yesterday|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 USER_STATS_RX         = re.compile(r"^\s*user\s+stats(?:\s+(today|yesterday|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 INVENTORY_RX          = re.compile(r"^\s*inventory\s*$", re.IGNORECASE)
@@ -1450,6 +1451,7 @@ def _get_commands_text() -> str:
 <b>--- Admin: Priority & User Management ---</b>
 <code>take 5 customer to owner @owner</code>
 <code>take 5 customer to owner @owner and stop</code>
+<code>list priority</code>
 <code>ban whatsapp @user</code>
 <code>unban whatsapp @user</code>
 <code>list banned</code>
@@ -1917,6 +1919,24 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
             u_count = len([e for e in o.get("entries", []) if not e.get("disabled")])
             w_count = len([w for w in o.get("whatsapp", []) if not w.get("disabled")])
             lines.append(f"- <code>{o['owner']}</code>: {u_count} usernames, {w_count} whatsapps")
+        return "\n".join(lines)
+        
+    if LIST_PRIORITY_RX.match(text):
+        if not _has_permission(user, 'list priority'): 
+            return "You're not authorized to use this command."
+            
+        pq_map = state.get("priority_queue", {})
+
+        if not pq_map:
+            return "The priority queue is currently empty. No owners are waiting for customers."
+
+        lines = ["<b>👑 Active Priority Owners:</b>"]
+        for owner, data in pq_map.items():
+            remaining = data.get("remaining", 0)
+            stop = " (STOP AFTER)" if data.get("stop_after") else ""
+            lines.append(f"- <b>@{owner}</b>: {remaining} customers remaining{stop}")
+            
+        lines.append("\nOwners are served in the order of the normal round-robin rotation.")
         return "\n".join(lines)
 
 
