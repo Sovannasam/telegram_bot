@@ -233,7 +233,7 @@ COMMAND_PERMISSIONS = {
     'stop open', 'take customer', 'ban whatsapp', 'unban whatsapp','performance', 'remind user', 'clear pending', 'list disabled', 'detail user', 'list banned', 'list admins',
     'data today', 'list enabled', 'add user', 'delete user',
     'ban country', 'unban country', 'list country bans', 'user performance', 'user stats',
-    'inventory', 'request stats', 'list priority', 'round count'
+    'inventory', 'request stats', 'list priority', 'round count', 'cancel priority'
 }
 
 async def load_admins():
@@ -894,6 +894,7 @@ BAN_COUNTRY_RX        = re.compile(r"^\s*ban\s+country\s+([a-zA-Z\s]+)\s+for\s+@
 UNBAN_COUNTRY_RX      = re.compile(r"^\s*unban\s+country\s+([a-zA-Z\s]+)\s+for\s+@?(\S+)\s*$", re.IGNORECASE)
 LIST_COUNTRY_BANS_RX  = re.compile(r"^\s*list\s+country\s+bans(?:\s+@?(\S+))?\s*$", re.IGNORECASE)
 LIST_PRIORITY_RX      = re.compile(r"^\s*list\s+priority\s*$", re.IGNORECASE)
+CANCEL_PRIORITY_RX    = re.compile(r"^\s*cancel\s+priority\s+(@?\S+)\s*$", re.IGNORECASE)
 ROUND_COUNT_RX        = re.compile(r"^\s*round\s+count\s*$", re.IGNORECASE)
 USER_PERFORMANCE_RX   = re.compile(r"^\s*user\s+performance(?:\s+(today|yesterday|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 USER_STATS_RX         = re.compile(r"^\s*user\s+stats(?:\s+(today|yesterday|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
@@ -1467,6 +1468,8 @@ def _get_commands_text() -> str:
 <code>take 5 customer to owner @owner</code>
 <code>take 5 customer to owner @owner and stop</code>
 <code>list priority</code>
+<code>cancel priority @owner</code>
+<code>cancel priority all</code>
 <code>round count</code>
 <code>ban whatsapp @user</code>
 <code>unban whatsapp @user</code>
@@ -1955,6 +1958,30 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         lines.append("\nOwners are served in the order of the normal round-robin rotation.")
         return "\n".join(lines)
         
+    m = CANCEL_PRIORITY_RX.match(text)
+    if m:
+        if not _has_permission(user, 'cancel priority'):
+            return "You don't have permission to use this command."
+
+        target_str = m.group(1).strip().lower()
+        pq_map = state.setdefault("priority_queue", {})
+
+        if not pq_map:
+            return "The priority queue is already empty."
+
+        if target_str == "all":
+            state["priority_queue"] = {}
+            await save_state()
+            return "All active priority owners have been cancelled and removed from the queue."
+
+        owner_norm = _norm_owner_name(target_str)
+        if owner_norm in pq_map:
+            del pq_map[owner_norm]
+            await save_state()
+            return f"Priority for owner @{owner_norm} has been cancelled and removed from the queue."
+        else:
+            return f"Owner @{owner_norm} was not found in the active priority queue."
+
     m = ROUND_COUNT_RX.match(text)
     if m:
         if not _has_permission(user, 'round count'):
