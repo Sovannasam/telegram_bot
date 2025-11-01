@@ -215,7 +215,9 @@ BASE_STATE = {
     "whatsapp_temp_bans": {},
     "whatsapp_last_request_ts": {},
     "username_last_request_ts": {},
-    "whatsapp_offense_count": {}
+    "whatsapp_offense_count": {},
+    "username_round_count": 0, # NEW: Track completed round-robin cycles
+    "whatsapp_round_count": 0  # NEW: Track completed round-robin cycles
 }
 state: Dict = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
 WHATSAPP_BANNED_USERS: set[int] = set()
@@ -231,7 +233,7 @@ COMMAND_PERMISSIONS = {
     'stop open', 'take customer', 'ban whatsapp', 'unban whatsapp','performance', 'remind user', 'clear pending', 'list disabled', 'detail user', 'list banned', 'list admins',
     'data today', 'list enabled', 'add user', 'delete user',
     'ban country', 'unban country', 'list country bans', 'user performance', 'user stats',
-    'inventory', 'request stats', 'list priority' # ADDED: list priority
+    'inventory', 'request stats', 'list priority', 'round count'
 }
 
 async def load_admins():
@@ -338,6 +340,8 @@ async def load_state():
     state.setdefault("whatsapp_last_request_ts", {})
     state.setdefault("username_last_request_ts", {})
     state.setdefault("whatsapp_offense_count", {})
+    state.setdefault("username_round_count", 0) # Ensure new key exists
+    state.setdefault("whatsapp_round_count", 0) # Ensure new key exists
 
 
 async def save_state():
@@ -769,7 +773,13 @@ async def _next_from_username_pool() -> Optional[Dict[str, str]]:
             result = {"owner": owner_name, "username": arr[ei]}
             state["rr"]["username_entry_idx"][owner_name] = (ei + 1) % len(arr)
 
-            # --- NEW LOGIC START ---
+            # --- ROUND COUNT LOGIC START ---
+            next_owner_idx = (current_idx + 1) % len(USERNAME_POOL)
+            if next_owner_idx == 0 and current_idx == len(USERNAME_POOL) - 1:
+                state['username_round_count'] = state.get('username_round_count', 0) + 1
+                log.info(f"Username round count incremented to {state['username_round_count']}")
+            # --- ROUND COUNT LOGIC END ---
+            
             # Check if this owner is in the multi-owner priority map
             is_priority_owner = owner_name in state.get("priority_queue", {})
 
@@ -780,9 +790,8 @@ async def _next_from_username_pool() -> Optional[Dict[str, str]]:
                 await _decrement_priority_and_end_if_needed(owner_name) # Pass owner_name
             else:
                 # Normal rotation. Advance the owner_idx.
-                state["rr"]["username_owner_idx"] = (current_idx + 1) % len(USERNAME_POOL)
+                state["rr"]["username_owner_idx"] = next_owner_idx # Use pre-calculated index
                 await save_state()
-            # --- NEW LOGIC END ---
 
             return result
             
@@ -812,7 +821,13 @@ async def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
                 # Found a valid number.
                 state["rr"]["wa_entry_idx"][owner] = ((start + step) + 1) % len(numbers)
                 
-                # --- NEW LOGIC START ---
+                # --- ROUND COUNT LOGIC START ---
+                next_owner_idx = (current_idx + 1) % len(WHATSAPP_POOL)
+                if next_owner_idx == 0 and current_idx == len(WHATSAPP_POOL) - 1:
+                    state['whatsapp_round_count'] = state.get('whatsapp_round_count', 0) + 1
+                    log.info(f"WhatsApp round count incremented to {state['whatsapp_round_count']}")
+                # --- ROUND COUNT LOGIC END ---
+
                 # Check if this owner is in the multi-owner priority map
                 is_priority_owner = owner in state.get("priority_queue", {})
 
@@ -823,9 +838,8 @@ async def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
                     await _decrement_priority_and_end_if_needed(owner) # Pass owner
                 else:
                     # Normal rotation. Advance the wa_owner_idx.
-                    state["rr"]["wa_owner_idx"] = (current_idx + 1) % len(WHATSAPP_POOL)
+                    state["rr"]["wa_owner_idx"] = next_owner_idx # Use pre-calculated index
                     await save_state()
-                # --- NEW LOGIC END ---
 
                 return {"owner": owner, "number": cand}
                 
@@ -880,6 +894,7 @@ BAN_COUNTRY_RX        = re.compile(r"^\s*ban\s+country\s+([a-zA-Z\s]+)\s+for\s+@
 UNBAN_COUNTRY_RX      = re.compile(r"^\s*unban\s+country\s+([a-zA-Z\s]+)\s+for\s+@?(\S+)\s*$", re.IGNORECASE)
 LIST_COUNTRY_BANS_RX  = re.compile(r"^\s*list\s+country\s+bans(?:\s+@?(\S+))?\s*$", re.IGNORECASE)
 LIST_PRIORITY_RX      = re.compile(r"^\s*list\s+priority\s*$", re.IGNORECASE)
+ROUND_COUNT_RX        = re.compile(r"^\s*round\s+count\s*$", re.IGNORECASE)
 USER_PERFORMANCE_RX   = re.compile(r"^\s*user\s+performance(?:\s+(today|yesterday|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 USER_STATS_RX         = re.compile(r"^\s*user\s+stats(?:\s+(today|yesterday|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 INVENTORY_RX          = re.compile(r"^\s*inventory\s*$", re.IGNORECASE)
@@ -1452,6 +1467,7 @@ def _get_commands_text() -> str:
 <code>take 5 customer to owner @owner</code>
 <code>take 5 customer to owner @owner and stop</code>
 <code>list priority</code>
+<code>round count</code>
 <code>ban whatsapp @user</code>
 <code>unban whatsapp @user</code>
 <code>list banned</code>
@@ -1938,6 +1954,20 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
             
         lines.append("\nOwners are served in the order of the normal round-robin rotation.")
         return "\n".join(lines)
+        
+    m = ROUND_COUNT_RX.match(text)
+    if m:
+        if not _has_permission(user, 'round count'):
+            return "You're not authorized to use this command."
+        
+        user_rounds = state.get('username_round_count', 0)
+        wa_rounds = state.get('whatsapp_round_count', 0)
+        
+        lines = ["<b>🔄 Daily Round-Robin Summary</b>"]
+        lines.append(f"<b>- Username Rounds Completed:</b> {user_rounds}")
+        lines.append(f"<b>- WhatsApp Rounds Completed:</b> {wa_rounds}")
+        lines.append("\nNote: A round completes when the rotation index wraps from the last owner back to the first.")
+        return "\n".join(lines)
 
 
     m = LIST_OWNER_DETAIL_RX.match(text) or LIST_OWNER_ALIAS_RX.match(text)
@@ -2400,7 +2430,9 @@ async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
     log.info("Performing daily reset...")
     async with db_lock:
         state['whatsapp_offense_count'] = {} # Reset offense counts daily
-        log.info("Resetting daily WhatsApp offense counters.")
+        state['username_round_count'] = 0 # NEW: Reset round counts
+        state['whatsapp_round_count'] = 0 # NEW: Reset round counts
+        log.info("Resetting daily WhatsApp offense counters and round counts.")
         try:
             pool = await get_db_pool()
             async with pool.acquire() as conn:
