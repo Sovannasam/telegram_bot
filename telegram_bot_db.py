@@ -61,12 +61,12 @@ COUNTRY_DAILY_LIMIT = int(os.getenv("COUNTRY_DAILY_LIMIT", "15"))
 
 # Whitelist of allowed countries (lowercase for case-insensitive matching)
 ALLOWED_COUNTRIES = {
-    'morocco', 'panama', 'saudi arabia', 'united arab emirates', 'uae',
-    'oman', 'jordan', 'italy', 'germany', 'indonesia', 'colombia',
-    'bulgaria', 'brazil', 'spain', 'belgium', 'south africa',
-    'philippines', 'portugal', 'netherlands', 'poland', 'ghana', 'dominican republic',
-    'qatar', 'france', 'switzerland', 'argentina', 'costa rica', 'pakistan', 'kuwait', 'yemen', 'bahrain', 'malaysia',
-    'canada','mauritania'
+    'panama', 'united arab emirates','oman', 'jordan', 'italy', 'germany', 'indonesia',
+    'bulgaria', 'brazil', 'spain', 'belgium','portugal', 'netherlands', 'poland', 
+    'ghana', 'dominican republic', 'qatar', 'france', 'switzerland', 'argentina', 
+    'costa rica', 'kuwait', 'bahrain', 'malaysia','canada','mauritania',
+    'greece','belarus', 'slovakia', 'hungary', 'romania', 'luxembourg'
+
 }
 
 TIMEZONE = pytz.timezone("Asia/Phnom_Penh")
