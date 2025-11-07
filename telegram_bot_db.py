@@ -65,7 +65,8 @@ ALLOWED_COUNTRIES = {
     'bulgaria', 'brazil', 'spain', 'belgium','portugal', 'netherlands', 'poland', 
     'ghana', 'dominican republic', 'qatar', 'france', 'switzerland', 'argentina', 
     'costa rica', 'kuwait', 'bahrain', 'malaysia','canada','mauritania',
-    'greece','belarus', 'slovakia', 'hungary', 'romania', 'luxembourg'
+    'greece','belarus', 'slovakia', 'hungary', 'romania', 'luxembourg', 'czechia',
+    'austria', 'tunisia' 
 
 }
 
