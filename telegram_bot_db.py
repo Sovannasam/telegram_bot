@@ -62,8 +62,7 @@ COUNTRY_DAILY_LIMIT = int(os.getenv("COUNTRY_DAILY_LIMIT", "15"))
 # Whitelist of allowed countries (lowercase for case-insensitive matching)
 ALLOWED_COUNTRIES = {
     'panama', 'united arab emirates','oman', 'jordan', 'italy', 'germany', 'indonesia',
-    'bulgaria', 'brazil', 'spain', 'belgium','portugal', 'netherlands', 'poland', 
-    'ghana', 'dominican republic', 'qatar', 'france', 'switzerland', 'argentina', 
+    'bulgaria', 'brazil', 'spain', 'belgium','portugal', 'netherlands', 'poland', 'qatar', 'france', 'switzerland', 'argentina', 
     'costa rica', 'kuwait', 'bahrain', 'malaysia','canada','mauritania',
     'greece','belarus', 'slovakia', 'hungary', 'romania', 'luxembourg', 'czechia',
     'austria', 'tunisia' 
