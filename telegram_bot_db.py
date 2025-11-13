@@ -1147,7 +1147,7 @@ async def _get_owner_performance(owner_name: str, day: date) -> Tuple[int, int]:
 
 async def _get_owner_distribution_counts(owner_name: str, day: date) -> Tuple[int, int]:
     """Fetches an owner's distribution stats for a given day from the audit log."""
-    start_ts = TIMEZONE.localize(datetime.combine(day, time(5, 30)))
+    start_ts = TIMEZONE.localize(datetime.combine(day, time(3, 30)))
     end_ts = start_ts + timedelta(days=1)
     tg_count = 0
     wa_count = 0
