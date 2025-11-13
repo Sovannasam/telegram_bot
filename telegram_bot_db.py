@@ -1403,8 +1403,8 @@ async def _get_daily_data_summary_text() -> str:
 
 def _parse_report_day(arg: Optional[str]) -> date:
     now = datetime.now(TIMEZONE)
-    if not arg or arg.lower() == "today": return (now - timedelta(hours=5, minutes=30)).date()
-    if arg.lower() == "yesterday": return (now - timedelta(hours=5, minutes=30, days=1)).date()
+    if not arg or arg.lower() == "today": return (now - timedelta(hours=3, minutes=30)).date()
+    if arg.lower() == "yesterday": return (now - timedelta(hours=3, minutes=30, days=1)).date()
     try: return datetime.strptime(arg, "%Y-%m-%d").date()
     except Exception: return (now - timedelta(hours=5, minutes=30)).date()
 
