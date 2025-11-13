@@ -529,7 +529,7 @@ async def load_owner_directory():
 # =============================
 def _logical_day_today() -> date:
     now = datetime.now(TIMEZONE)
-    return (now - timedelta(hours=5, minutes=30)).date()
+    return (now - timedelta(hours=3, minutes=30)).date()
 
 async def _get_user_activity(user_id: int) -> Tuple[int, int]:
     try:
