@@ -64,7 +64,7 @@ ALLOWED_COUNTRIES = {
     'panama', 'united arab emirates','oman', 'jordan', 'italy', 'germany', 'indonesia',
     'bulgaria', 'brazil', 'spain', 'belgium','portugal', 'netherlands', 'poland', 'qatar', 'france', 'switzerland', 'argentina', 
     'costa rica', 'kuwait', 'bahrain', 'malaysia','canada','mauritania',
-    'greece','belarus', 'slovakia', 'hungary', 'romania', 'luxembourg', 'czechia', 'india', 'austria', 'tunisia' 
+    'greece','belarus', 'slovakia', 'hungary', 'romania', 'luxembourg', 'czechia', 'india', 'austria', 'tunisia', 'iran', 'iraq'
 
 }
 
