@@ -232,7 +232,7 @@ COMMAND_PERMISSIONS = {
     'stop open', 'take customer', 'ban whatsapp', 'unban whatsapp','performance', 'remind user', 'clear pending', 'list disabled', 'detail user', 'list banned', 'list admins',
     'data today', 'list enabled', 'add user', 'delete user',
     'ban country', 'unban country', 'list country bans', 'user performance', 'user stats',
-    'inventory', 'request stats', 'list priority', 'round count', 'cancel priority'
+    'inventory', 'request stats', 'list priority', 'round count', 'cancel priority', 'list owner'
 }
 
 async def load_admins():
