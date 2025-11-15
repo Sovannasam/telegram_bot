@@ -56,7 +56,7 @@ PERFORMANCE_GROUP_IDS = {
 }
 
 # NEW: Daily limit for submissions per country
-COUNTRY_DAILY_LIMIT = int(os.getenv("COUNTRY_DAILY_LIMIT", "25"))
+COUNTRY_DAILY_LIMIT = int(os.getenv("COUNTRY_DAILY_LIMIT", "17"))
 
 
 # Whitelist of allowed countries (lowercase for case-insensitive matching)
