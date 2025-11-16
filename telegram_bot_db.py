@@ -2476,6 +2476,16 @@ async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
         await save_state()
         log.info("Daily reset complete. Pending items from previous days are preserved.")
 
+async def _on_owner_change(connection, pid, channel, payload):
+    """
+    This is the callback function that runs when a NOTIFY is received.
+    """
+    log.info(f"Received NOTIFY on channel '{channel}'. Reloading owner directory.")
+    # Use db_lock to prevent conflict with other state-saving ops
+    async with db_lock:
+        await load_owner_directory()
+    log.info("Owner directory reloaded.")
+
 async def _listen_for_owner_changes(app: Application):
     """
     Listens for PostgreSQL NOTIFY 'owners_changed' and triggers a reload
