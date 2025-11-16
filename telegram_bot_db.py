@@ -29,8 +29,8 @@ log = logging.getLogger("bot")
 # CONFIG
 # =============================
 def get_env_variable(var_name: str) -> str:
-    value = os.getenv(var_name)
-    if not value:
+  value = os.getenv(var_name)
+  if not value:
         raise RuntimeError(
             f"Missing required environment variable '{var_name}'. "
             "Please set it in your hosting environment."
@@ -2476,6 +2476,31 @@ async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
         await save_state()
         log.info("Daily reset complete. Pending items from previous days are preserved.")
 
+async def _listen_for_owner_changes(app: Application):
+    """
+    Listens for PostgreSQL NOTIFY 'owners_changed' and triggers a reload
+    of the owner directory.
+    """
+    log.info("Starting 'owners_changed' listener task.")
+    while True: # Loop to reconnect if connection drops
+        try:
+            pool = await get_db_pool()
+            async with pool.acquire() as conn:
+                await conn.add_listener('owners_changed')
+                log.info("Listener connected, waiting for notifications...")
+                while True:
+                    # Wait for a notification indefinitely
+                    notification = await conn.wait_for_notification()
+                    if notification:
+                        log.info(f"Received NOTIFY on channel '{notification.channel}'. Reloading owner directory.")
+                        # Use db_lock to prevent conflict with other state-saving ops
+                        async with db_lock:
+                            await load_owner_directory()
+                        log.info("Owner directory reloaded.")
+        except Exception as e:
+            log.error(f"Listener task for 'owners_changed' failed: {e}. Reconnecting in 10 seconds.")
+            await asyncio.sleep(10) # Wait before reconnecting
+
 # =============================
 # MESSAGE HANDLER
 # =============================
@@ -2848,6 +2873,9 @@ async def post_initialization(application: Application):
     await load_user_country_bans() # NEW: Load country bans
     await load_admins()
     await load_whitelisted_users()
+    
+    # ADD THIS LINE to start the listener task
+    asyncio.create_task(_listen_for_owner_changes(application))
 
 async def post_shutdown(application: Application):
     """Runs once before the bot shuts down."""
