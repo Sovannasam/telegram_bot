@@ -2486,20 +2486,19 @@ async def _listen_for_owner_changes(app: Application):
         try:
             pool = await get_db_pool()
             async with pool.acquire() as conn:
-                await conn.add_listener('owners_changed')
+                # Add the listener and tell it to run _on_owner_change when it gets a signal
+                await conn.add_listener('owners_changed', _on_owner_change)
                 log.info("Listener connected, waiting for notifications...")
+                
+                # This loop just keeps the connection alive.
+                # The listener runs in the background.
                 while True:
-                    # Wait for a notification indefinitely
-                    notification = await conn.wait_for_notification()
-                    if notification:
-                        log.info(f"Received NOTIFY on channel '{notification.channel}'. Reloading owner directory.")
-                        # Use db_lock to prevent conflict with other state-saving ops
-                        async with db_lock:
-                            await load_owner_directory()
-                        log.info("Owner directory reloaded.")
+                    await asyncio.sleep(3600) # Keep the connection alive
+                    
         except Exception as e:
             log.error(f"Listener task for 'owners_changed' failed: {e}. Reconnecting in 10 seconds.")
-            await asyncio.sleep(10) # Wait before reconnecting
+            # The connection was lost, so we'll wait and the 'while True' loop will try to reconnect.
+            await asyncio.sleep(10)
 
 # =============================
 # MESSAGE HANDLER
