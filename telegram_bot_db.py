@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# This file was cleaned of invisible whitespace and indentation errors by GitHub Copilot.
+# All non-standard whitespace characters have been replaced with standard ASCII spaces.
 import os
 import json
 import csv
@@ -29,11 +31,11 @@ log = logging.getLogger("bot")
 # CONFIG
 # =============================
 def get_env_variable(var_name: str) -> str:
-value = os.getenv(var_name)
-if not value:
-    raise RuntimeError(
-        f"Missing required environment variable '{var_name}'. "
-        "Please set it in your hosting environment."
+    value = os.getenv(var_name)
+    if not value:
+        raise RuntimeError(
+            f"Missing required environment variable '{var_name}'. "
+            "Please set it in your hosting environment."
         )
     return value
 
