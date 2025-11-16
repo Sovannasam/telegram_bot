@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# This file was cleaned of invisible whitespace and indentation errors by GitHub Copilot.
+# All non-standard whitespace characters have been replaced with standard ASCII spaces.
 import os
 import json
 import csv
