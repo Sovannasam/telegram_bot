@@ -2397,61 +2397,6 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.error(f"Failed to send reminder/ban message to chat {r['chat_id']}: {e}")
 
-async def check_request_ratio_and_stop_whatsapp(context: ContextTypes.DEFAULT_TYPE):
-    """Checks the ratio of WA to Username requests for the previous 60-min block and stops all WA if the ratio is too high."""
-    log.info("Running 60-minute check of request ratio...")
-
-    now = datetime.now(TIMEZONE)
-
-    # Determine the start and end of the 60-minute block that just concluded.
-    # The job runs at the top of the hour, so we check the previous hour.
-    end_time = now.replace(minute=0, second=0, microsecond=0)
-    start_time = end_time - timedelta(hours=1)
-
-    try:
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
-            # Query for the specific, fixed block
-            wa_count = await conn.fetchval(
-                "SELECT COUNT(*) FROM audit_log WHERE kind = 'whatsapp' AND action = 'issued' AND ts_local >= $1 AND ts_local < $2",
-                start_time, end_time
-            )
-            username_count = await conn.fetchval(
-                "SELECT COUNT(*) FROM audit_log WHERE kind = 'username' AND action = 'issued' AND ts_local >= $1 AND ts_local < $2",
-                start_time, end_time
-            )
-    except Exception as e:
-        log.error(f"Failed to query audit log for request ratio check: {e}")
-        return
-
-    log.info(f"Request ratio check for block {start_time.strftime('%H:%M')}-{end_time.strftime('%H:%M')}: {wa_count} WhatsApps, {username_count} Usernames.")
-
-    if wa_count > username_count:
-        log.warning(f"WhatsApp requests ({wa_count}) exceeded username requests ({username_count}) in the last block. Stopping all WhatsApp numbers.")
-
-        changed = 0
-        async with db_lock:
-            for owner in OWNER_DATA:
-                for w_entry in owner.get("whatsapp", []):
-                    if not w_entry.get("disabled"):
-                        w_entry["disabled"] = True
-                        changed += 1
-
-            if changed > 0:
-                await _rebuild_pools_preserving_rotation()
-
-                notification_text = (
-                    f"⚠️ <b>Automatic Action</b> ⚠️\n\n"
-                    f"All WhatsApp numbers have been temporarily disabled because WhatsApp requests ({wa_count}) "
-                    f"exceeded username requests ({username_count}) in the last 60-minute block.\n\n"
-                    f"An admin can re-enable them using the <code>open all whatsapp</code> or <code>open [number]</code> command."
-                )
-                try:
-                    await context.bot.send_message(chat_id=REQUEST_GROUP_ID, text=notification_text, parse_mode=ParseMode.HTML)
-                except Exception as e:
-                    log.error(f"Failed to send request ratio notification: {e}")
-
-
 async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
     log.info("Performing daily reset...")
     async with db_lock:
@@ -2902,9 +2847,6 @@ if __name__ == "__main__":
 
     if app.job_queue:
         app.job_queue.run_repeating(check_reminders, interval=60, first=60)
-        # MODIFIED: Changed the check interval to 60 minutes (3600s).
-        app.job_queue.run_repeating(check_request_ratio_and_stop_whatsapp, interval=3600, first=3600)
-        # NEW JOB for clearing expired IDs, runs every hour
         app.job_queue.run_repeating(_clear_expired_app_ids, interval=3600, first=3600)
         reset_time = time(hour=5, minute=31, tzinfo=TIMEZONE)
         app.job_queue.run_daily(daily_reset, time=reset_time)
