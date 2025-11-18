@@ -217,7 +217,7 @@ BASE_STATE = {
     "whatsapp_offense_count": {},
     "username_round_count": 0, # NEW: Track completed round-robin cycles
     "whatsapp_round_count": 0,  # NEW: Track completed round-robin cycles
-    "wa_95min_counter": 0
+    "wa_45min_counter": 0
 }
 state: Dict = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
 WHATSAPP_BANNED_USERS: set[int] = set()
@@ -342,7 +342,7 @@ async def load_state():
     state.setdefault("whatsapp_offense_count", {})
     state.setdefault("username_round_count", 0) # Ensure new key exists
     state.setdefault("whatsapp_round_count", 0) # Ensure new key exists
-    state.setdefault("wa_90min_counter", 0)
+    state.setdefault("wa_45min_counter", 0)
 
 
 async def save_state():
@@ -2399,7 +2399,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.error(f"Failed to send reminder/ban message to chat {r['chat_id']}: {e}")
 
-async def reset_95min_wa_counter(context: ContextTypes.DEFAULT_TYPE):
+async def reset_45min_wa_counter(context: ContextTypes.DEFAULT_TYPE):
     """Resets the global 90-minute WhatsApp distribution counter."""
     log.info("Resetting 90-minute WhatsApp counter...")
     async with db_lock:
