@@ -2773,8 +2773,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         log.info(f"Temporary WhatsApp ban for user {uid} has expired and been removed.")
 
                 current_45min_count = state.setdefault("wa_45min_counter", 0)
-                if current_45min_count >= 15:
-                    log.info(f"User {uid} request for WA denied. Global 45-min limit of 15 reached.")
+                if current_45min_count >= 10:
+                    log.info(f"User {uid} request for WA denied. Global 45-min limit of 10 reached.")
                     await msg.reply_text("No available WhatsApp.")
                     return
 
