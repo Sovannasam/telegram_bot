@@ -2400,10 +2400,10 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             log.error(f"Failed to send reminder/ban message to chat {r['chat_id']}: {e}")
 
 async def reset_45min_wa_counter(context: ContextTypes.DEFAULT_TYPE):
-    """Resets the global 90-minute WhatsApp distribution counter."""
-    log.info("Resetting 90-minute WhatsApp counter...")
+    """Resets the global 45-minute WhatsApp distribution counter."""
+    log.info("Resetting 45-minute WhatsApp counter...")
     async with db_lock:
-        state['wa_90min_counter'] = 0
+        state['wa_45min_counter'] = 0
         await save_state()
     log.info("45-minute WhatsApp counter has been reset to 0.")
 
