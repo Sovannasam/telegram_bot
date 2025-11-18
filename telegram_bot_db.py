@@ -217,7 +217,7 @@ BASE_STATE = {
     "whatsapp_offense_count": {},
     "username_round_count": 0, # NEW: Track completed round-robin cycles
     "whatsapp_round_count": 0,  # NEW: Track completed round-robin cycles
-    "wa_90min_counter": 0
+    "wa_45min_counter": 0
 }
 state: Dict = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
 WHATSAPP_BANNED_USERS: set[int] = set()
@@ -2399,13 +2399,13 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.error(f"Failed to send reminder/ban message to chat {r['chat_id']}: {e}")
 
-async def reset_90min_wa_counter(context: ContextTypes.DEFAULT_TYPE):
+async def reset_45min_wa_counter(context: ContextTypes.DEFAULT_TYPE):
     """Resets the global 90-minute WhatsApp distribution counter."""
     log.info("Resetting 90-minute WhatsApp counter...")
     async with db_lock:
         state['wa_90min_counter'] = 0
         await save_state()
-    log.info("90-minute WhatsApp counter has been reset to 0.")
+    log.info("45-minute WhatsApp counter has been reset to 0.")
 
 async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
     log.info("Performing daily reset...")
@@ -2867,7 +2867,7 @@ if __name__ == "__main__":
         app.job_queue.run_repeating(_clear_expired_app_ids, interval=3600, first=3600)
         reset_time = time(hour=5, minute=31, tzinfo=TIMEZONE)
         app.job_queue.run_daily(daily_reset, time=reset_time)
-        app.job_queue.run_repeating(reset_90min_wa_counter, interval=5400, first=5400)
+        app.job_queue.run_repeating(reset_90min_wa_counter, interval=2700, first=2700)
 
     app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.ALL, on_message))
 
