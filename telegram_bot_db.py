@@ -2867,7 +2867,7 @@ if __name__ == "__main__":
         app.job_queue.run_repeating(_clear_expired_app_ids, interval=3600, first=3600)
         reset_time = time(hour=5, minute=31, tzinfo=TIMEZONE)
         app.job_queue.run_daily(daily_reset, time=reset_time)
-        app.job_queue.run_repeating(reset_90min_wa_counter, interval=2700, first=2700)
+        app.job_queue.run_repeating(reset_45min_wa_counter, interval=2700, first=2700)
 
     app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.ALL, on_message))
 
