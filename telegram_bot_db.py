@@ -216,7 +216,8 @@ BASE_STATE = {
     "username_last_request_ts": {},
     "whatsapp_offense_count": {},
     "username_round_count": 0, # NEW: Track completed round-robin cycles
-    "whatsapp_round_count": 0  # NEW: Track completed round-robin cycles
+    "whatsapp_round_count": 0,  # NEW: Track completed round-robin cycles
+    "wa_90min_counter": 0
 }
 state: Dict = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
 WHATSAPP_BANNED_USERS: set[int] = set()
@@ -341,6 +342,7 @@ async def load_state():
     state.setdefault("whatsapp_offense_count", {})
     state.setdefault("username_round_count", 0) # Ensure new key exists
     state.setdefault("whatsapp_round_count", 0) # Ensure new key exists
+    state.setdefault("wa_90min_counter", 0)
 
 
 async def save_state():
@@ -2397,6 +2399,14 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.error(f"Failed to send reminder/ban message to chat {r['chat_id']}: {e}")
 
+async def reset_90min_wa_counter(context: ContextTypes.DEFAULT_TYPE):
+    """Resets the global 90-minute WhatsApp distribution counter."""
+    log.info("Resetting 90-minute WhatsApp counter...")
+    async with db_lock:
+        state['wa_90min_counter'] = 0
+        await save_state()
+    log.info("90-minute WhatsApp counter has been reset to 0.")
+
 async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
     log.info("Performing daily reset...")
     async with db_lock:
@@ -2762,6 +2772,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await save_state()
                         log.info(f"Temporary WhatsApp ban for user {uid} has expired and been removed.")
 
+                current_90min_count = state.setdefault("wa_90min_counter", 0)
+                if current_90min_count >= 7:
+                    log.info(f"User {uid} request for WA denied. Global 90-min limit of 5 reached.")
+                    await msg.reply_text("No available WhatsApp.")
+                    return
+
                 # Cooldown check
                 now = datetime.now(TIMEZONE)
                 last_req_ts_str = state.setdefault("whatsapp_last_request_ts", {}).get(str(uid))
@@ -2790,6 +2806,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.reply_text(reply)
                 if rec:
                     await _wa_inc_count(_norm_phone(rec["number"]), _logical_day_today())
+                    state["wa_90min_counter"] = state.setdefault("wa_90min_counter", 0) + 1
                     # Record the time of this successful request before saving state
                     state.setdefault("whatsapp_last_request_ts", {})[str(uid)] = now.isoformat()
                     await _set_issued(uid, chat_id, "whatsapp", rec["number"], context_data={"owner": rec["owner"]})
@@ -2850,6 +2867,7 @@ if __name__ == "__main__":
         app.job_queue.run_repeating(_clear_expired_app_ids, interval=3600, first=3600)
         reset_time = time(hour=5, minute=31, tzinfo=TIMEZONE)
         app.job_queue.run_daily(daily_reset, time=reset_time)
+        app.job_queue.run_repeating(reset_90min_wa_counter, interval=5400, first=5400)
 
     app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.ALL, on_message))
 
