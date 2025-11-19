@@ -55,7 +55,7 @@ PERFORMANCE_GROUP_IDS = {
     -1002670785417, -1002659012767, -1002790753092, -1002520117752
 }
 
-# NEW: Daily limit for submissions per country
+# Daily limit for submissions per country
 COUNTRY_DAILY_LIMIT = int(os.getenv("COUNTRY_DAILY_LIMIT", "17"))
 
 
@@ -210,13 +210,13 @@ BASE_STATE = {
         "wa_owner_idx": 0, "wa_entry_idx": {},
     },
     "issued": {"username": {}, "whatsapp": {}, "app_id": {}},
-    "priority_queue": {}, # NEW: Will store {owner_name: {"remaining": N, "stop_after": bool}}
+    "priority_queue": {}, # Will store {owner_name: {"remaining": N, "stop_after": bool}}
     "whatsapp_temp_bans": {},
     "whatsapp_last_request_ts": {},
     "username_last_request_ts": {},
     "whatsapp_offense_count": {},
-    "username_round_count": 0, # NEW: Track completed round-robin cycles
-    "whatsapp_round_count": 0,  # NEW: Track completed round-robin cycles
+    "username_round_count": 0, # Track completed round-robin cycles
+    "whatsapp_round_count": 0,  # Track completed round-robin cycles
     "wa_45min_counter": 0
 }
 state: Dict = {k: (v.copy() if isinstance(v, dict) else v) for k, v in BASE_STATE.items()}
@@ -2542,7 +2542,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # ================================================================
-        # START OF MODIFIED BLOCK FOR CLEARING_GROUP_ID (Unified)
+        # START OF MODIFIED BLOCK FOR CLEARING_GROUP_ID
         # ================================================================
         elif chat_id == CLEARING_GROUP_ID:
             # Find any pending items mentioned in the message
@@ -2560,10 +2560,17 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if _norm_phone(p) == _norm_phone(pending_p):
                         values_found_in_message.add(pending_p)
             
+            # --- MODIFIED: Pre-validation checks moved up ---
+            found_country, country_status = _find_country_in_text(text)
+            app_id_match = APP_ID_RX.search(text)
+            
+            # An actionable message must have a pending item OR a new app ID OR a valid country
+            if not values_found_in_message and not app_id_match and not found_country:
+                return
+
             # --- 1. Determine Source Item, Owner, and Target Group ---
             source_item_to_clear, source_kind, source_owner = None, None, None
-            app_id_match = APP_ID_RX.search(text)
-
+            
             # Priority 1: Link to an item explicitly mentioned in this message
             if values_found_in_message:
                 value = next(iter(values_found_in_message))
@@ -2592,6 +2599,17 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     source_item_to_clear, source_kind = last_item, last_item['kind']
                     source_owner = last_item.get("owner")
 
+            # --- NEW OVERRIDE: Check for Owner Mention ---
+            # If the text explicitly mentions an owner, that owner takes precedence 
+            # for forwarding, regardless of who issued the item.
+            for u in found_usernames:
+                possible_owner = _find_owner_group(u)
+                if possible_owner:
+                     source_owner = possible_owner['owner']
+                     # We found an owner mention. Stop looking.
+                     break
+            # ----------------------------------------
+
             # Determine the target group ID for forwarding
             target_forward_group = FORWARD_GROUP_ID # Default to global ID (Normal flow)
 
@@ -2605,13 +2623,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         target_forward_group = owner_group_id
                     # If it's None (default), target_forward_group remains FORWARD_GROUP_ID.
 
-
-            # An actionable message must have a pending item or a new app ID
-            if not values_found_in_message and not app_id_match:
-                return
-
             # --- 2. Validation Checks ---
-            found_country, country_status = _find_country_in_text(text)
+            # found_country, country_status were extracted above
             age = _find_age_in_text(text)
             is_allowed = True
             rejection_reason = ""
@@ -2706,7 +2719,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             return # End of processing for this group
         # ================================================================
-        # END OF MODIFIED BLOCK (Unified)
+        # END OF MODIFIED BLOCK
         # ================================================================
 
         elif chat_id == REQUEST_GROUP_ID:
