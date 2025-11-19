@@ -233,7 +233,7 @@ COMMAND_PERMISSIONS = {
     'stop open', 'take customer', 'ban whatsapp', 'unban whatsapp','performance', 'remind user', 'clear pending', 'list disabled', 'detail user', 'list banned', 'list admins',
     'data today', 'list enabled', 'add user', 'delete user',
     'ban country', 'unban country', 'list country bans', 'user performance', 'user stats',
-    'inventory', 'request stats', 'list priority', 'round count', 'cancel priority', 'list owner'
+    'inventory', 'list priority', 'round count', 'cancel priority', 'list owner'
 }
 
 async def load_admins():
@@ -440,6 +440,7 @@ def _ensure_owner_shape(g: dict) -> dict:
     g.setdefault("managed_by", None)
     g.setdefault("entries", [])
     g.setdefault("whatsapp", [])
+    g.setdefault("forward_group_id", None) # <-- ADDED: New field for owner's forward group ID
 
     norm_entries = []
     for e in g.get("entries", []):
@@ -900,8 +901,7 @@ ROUND_COUNT_RX        = re.compile(r"^\s*round\s+count\s*$", re.IGNORECASE)
 USER_PERFORMANCE_RX   = re.compile(r"^\s*user\s+performance(?:\s+(today|yesterday|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 USER_STATS_RX         = re.compile(r"^\s*user\s+stats(?:\s+(today|yesterday|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 INVENTORY_RX          = re.compile(r"^\s*inventory\s*$", re.IGNORECASE)
-REQUEST_STATS_RX      = re.compile(r"^\s*request\s+stats\s*$", re.IGNORECASE)
-
+SET_FORWARD_GROUP_RX  = re.compile(r"^\s*set\s+forward\s+group\s+@?(\S+?)\s+(-?\d+)\s*$", re.IGNORECASE) # <-- ADDED
 
 def _looks_like_phone(s: str) -> bool:
     return bool(PHONE_LIKE_RX.fullmatch((s or "").strip()))
@@ -1454,6 +1454,7 @@ def _get_commands_text() -> str:
 <code>delete username @user</code>
 <code>add whatsapp +123... to @owner</code>
 <code>delete whatsapp +123...</code>
+<code>set forward group @owner -123456...</code> - Set a specific group ID for owner's forwards.
 
 <b>--- Admin: Availability Control ---</b>
 <code>stop @owner/@user/+123...</code>
@@ -1482,7 +1483,6 @@ def _get_commands_text() -> str:
 <b>--- Admin: Reports & Manual Actions ---</b>
 <code>user performance [day]</code> - See ranked list of users by customers added.
 <code>user stats [day]</code> - See user success rates.
-<code>request stats</code> - See current request ratio for auto-shutdown.
 <code>performance @owner [day]</code> - See owner's customer stats.
 <code>remind user</code>
 <code>clear pending @item_or_number</code>
@@ -1504,47 +1504,6 @@ def _get_commands_text() -> str:
 <code>add user @user</code>
 <code>delete user @user</code>
 """
-
-async def _get_request_stats_text() -> str:
-    """Generates a real-time report on the request ratio for the current 60-minute block."""
-    now = datetime.now(TIMEZONE)
-    # Use fixed 60-minute blocks (always starts at the top of the hour)
-    start_time = now.replace(minute=0, second=0, microsecond=0)
-
-    try:
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
-            wa_count = await conn.fetchval(
-                "SELECT COUNT(*) FROM audit_log WHERE kind = 'whatsapp' AND action = 'issued' AND ts_local >= $1",
-                start_time
-            )
-            username_count = await conn.fetchval(
-                "SELECT COUNT(*) FROM audit_log WHERE kind = 'username' AND action = 'issued' AND ts_local >= $1",
-                start_time
-            )
-    except Exception as e:
-        log.error(f"Failed to query audit log for request stats: {e}")
-        return "Error fetching request stats from the database."
-
-    minutes_until_next_block = 60 - now.minute
-    block_start_str = start_time.strftime('%I:%M %p')
-
-    lines = [f"<b>⏱️ Request Ratio Status (Block starts {block_start_str})</b>"]
-    lines.append(f"<b>- Time Until Next Block:</b> {minutes_until_next_block} minutes")
-    lines.append("")
-    lines.append(f"<b>- Username Requests:</b> {username_count}")
-    lines.append(f"<b>- WhatsApp Requests:</b> {wa_count}")
-    lines.append("")
-
-    if wa_count > username_count:
-        status = "🔴 HIGH - WhatsApp numbers will be automatically stopped if this ratio persists."
-    else:
-        status = "🟢 NORMAL - Ratio is stable."
-
-    lines.append(f"<b>- Current Status:</b> {status}")
-
-    return "\n".join(lines)
-
 
 def _get_inventory_text() -> str:
     """Generates a summary of the total number of items in the bot."""
@@ -1575,6 +1534,28 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
 
     # Super Admin Commands First
     if _is_super_admin(user):
+        
+        # --- START ADDED BLOCK: SET FORWARD GROUP ---
+        m_set_forward_group = SET_FORWARD_GROUP_RX.match(text)
+        if m_set_forward_group:
+            owner_name_raw, group_id_str = m_set_forward_group.groups()
+            owner_name = _norm_owner_name(owner_name_raw)
+            group_id = int(group_id_str)
+            owner = _find_owner_group(owner_name)
+            
+            if not owner: return f"Owner '{owner_name}' not found."
+
+            owner["forward_group_id"] = group_id
+            await save_owner_directory() # Save change to DB
+            await load_owner_directory() # Reload to update cache
+            
+            status_msg = f"Forwarding set to <code>{group_id}</code>."
+            if group_id == 0:
+                status_msg = "Forwarding explicitly DISABLED."
+                
+            return f"Forward group ID for owner '{owner_name}' updated. {status_msg}"
+        # --- END ADDED BLOCK: SET FORWARD GROUP ---
+
         m_add_admin = ADD_ADMIN_RX.match(text)
         if m_add_admin:
             name = _norm_owner_name(m_add_admin.group(1))
@@ -2190,10 +2171,6 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
         if not _has_permission(user, 'inventory'): return "You're not authorized to use this command."
         return _get_inventory_text()
 
-    if REQUEST_STATS_RX.match(text):
-        if not _has_permission(user, 'request stats'): return "You're not authorized to use this command."
-        return await _get_request_stats_text()
-
     if COMMANDS_RX.match(text):
         command_list_text = _get_commands_text()
         return command_list_text
@@ -2565,7 +2542,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # ================================================================
-        # START OF MODIFIED BLOCK FOR CLEARING_GROUP_ID
+        # START OF MODIFIED BLOCK FOR CLEARING_GROUP_ID (Unified)
         # ================================================================
         elif chat_id == CLEARING_GROUP_ID:
             # Find any pending items mentioned in the message
@@ -2582,19 +2559,58 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for pending_p in pending_whatsapps:
                     if _norm_phone(p) == _norm_phone(pending_p):
                         values_found_in_message.add(pending_p)
-
-
-            # --- START CHANGE 1: Find app_id_match *before* validation ---
-            # Find a new App ID in the message
+            
+            # --- 1. Determine Source Item, Owner, and Target Group ---
+            source_item_to_clear, source_kind, source_owner = None, None, None
             app_id_match = APP_ID_RX.search(text)
+
+            # Priority 1: Link to an item explicitly mentioned in this message
+            if values_found_in_message:
+                value = next(iter(values_found_in_message))
+                kind = "whatsapp" if _looks_like_phone(value) else "username"
+                for item in _issued_bucket(kind).get(str(uid), []):
+                    if item.get("value") == value:
+                        source_item_to_clear, source_kind = item, kind
+                        source_owner = item.get("owner")
+                        break
+            # Priority 2 (Fallback): Link to the most recently issued item for this user
+            elif app_id_match:
+                last_item, last_ts = None, datetime.min.replace(tzinfo=TIMEZONE)
+                for kind in ("username", "whatsapp"):
+                    user_items = _issued_bucket(kind).get(str(uid), [])
+                    if user_items:
+                        latest_in_kind = user_items[-1]
+                        try:
+                            item_ts = datetime.fromisoformat(latest_in_kind["ts"])
+                        except Exception:
+                            continue # Skip if timestamp is invalid
+                        if item_ts > last_ts:
+                            last_ts = item_ts
+                            last_item = latest_in_kind
+                            last_item['kind'] = kind # Store kind for later
+                if last_item:
+                    source_item_to_clear, source_kind = last_item, last_item['kind']
+                    source_owner = last_item.get("owner")
+
+            # Determine the target group ID for forwarding
+            target_forward_group = FORWARD_GROUP_ID # Default to global ID (Normal flow)
+
+            if source_owner:
+                owner_group = _find_owner_group(source_owner)
+                if owner_group:
+                    owner_group_id = owner_group.get("forward_group_id")
+                    
+                    # If the owner explicitly set a group ID (including 0 to disable), use it.
+                    if owner_group_id is not None:
+                        target_forward_group = owner_group_id
+                    # If it's None (default), target_forward_group remains FORWARD_GROUP_ID.
+
 
             # An actionable message must have a pending item or a new app ID
             if not values_found_in_message and not app_id_match:
                 return
-            # --- END CHANGE 1 ---
 
-            # --- START CHANGE 2: Un-indent validation block ---
-            # Now validation runs if *either* a pending item OR an app_id is found.
+            # --- 2. Validation Checks ---
             found_country, country_status = _find_country_in_text(text)
             age = _find_age_in_text(text)
             is_allowed = True
@@ -2605,7 +2621,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 is_allowed = False
                 rejection_reason = f"Country '{found_country}' is not on the allowed list."
 
-            # MODIFICATION: Added new validation logic here
             elif country_status: # If it's a known country, check bans and limits
 
                 # 1. Check for manual (permanent) bans
@@ -2626,8 +2641,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             rejection_reason = f"Age must be provided and must be 30 or older for India (found: {age})."
 
             if not is_allowed:
-                # --- START CHANGE 3: Modified rejection message ---
-                # This now handles cases where no pending item was found, but an app_id was.
                 item_for_reply = "an item"
                 if values_found_in_message:
                     first_offending_value = next(iter(values_found_in_message))
@@ -2639,74 +2652,45 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 reply_text = (f"{mention_user_html(uid)}, your submission was rejected. Reason: {rejection_reason}\n"
                               f"Please use {item_for_reply} for another customer.")
-                # --- END CHANGE 3 ---
                 await msg.reply_html(reply_text)
                 log.warning(f"Rejected post from user {uid}. Reason: {rejection_reason}. No items cleared.")
                 return
             else:
-                # --- 2. Validation Passed. Process the message. ---
+                # --- 3. Validation Passed. Process and Forward. ---
                 if country_status:
                     await _increment_user_country_count(uid, country_status)
                     log.info(f"Incremented country count for user {uid} for '{country_status}'")
 
-                # --- START CHANGE 4: Move forwarding block ---
-                # This block is now un-indented and will run if validation passes
-                # for *any* actionable message.
-                # ========================================================
-                log.info(f"Validation passed. Forwarding message {msg.message_id} using forward_message.")
-                try:
-                    await context.bot.forward_message(
-                        chat_id=FORWARD_GROUP_ID, # The new target group ID
-                        from_chat_id=chat_id,
-                        message_id=msg.message_id
-                    )
-                    log.info(f"Forwarded successfully cleared message {msg.message_id} to {FORWARD_GROUP_ID}.")
-                except Exception as e:
-                    log.error(f"Failed to forward cleared message {msg.message_id} to {FORWARD_GROUP_ID}: {e}")
-                # ========================================================
-                # --- END CHANGE 4 ---
-            # --- END CHANGE 2 ---
+                # --- FORWARDING BLOCK: Uses target_forward_group ---
+                if target_forward_group and target_forward_group != 0:
+                    log.info(f"Validation passed. Forwarding message {msg.message_id} to group {target_forward_group} (Owner: {source_owner or 'Unknown'}).")
+                    try:
+                        await context.bot.forward_message(
+                            chat_id=target_forward_group,
+                            from_chat_id=chat_id,
+                            message_id=msg.message_id
+                        )
+                        log.info(f"Forwarded successfully cleared message {msg.message_id} to {target_forward_group}.")
+                    except Exception as e:
+                        log.error(f"Failed to forward cleared message {msg.message_id} to {target_forward_group}: {e}")
+                else:
+                    log.info(f"Validation passed but no target group for forwarding (Owner: {source_owner or 'Unknown'}). Message {msg.message_id} not forwarded.")
+                # --- END FORWARDING BLOCK ---
 
-            # --- 4. Process App ID and clear source item ---
-            # This logic was already here, but now it runs *after* validation and forwarding.
-            # It is no longer inside an `else` block.
+            # --- 4. Process App ID and clear source item (using pre-determined items) ---
+
             if app_id_match:
                 app_id = f"@{app_id_match.group(2)}"
-                source_item_to_clear, source_kind = None, None
-
-                # Priority 1: Link to an item explicitly mentioned in this message
-                if values_found_in_message:
-                    value = next(iter(values_found_in_message))
-                    kind = "whatsapp" if _looks_like_phone(value) else "username"
-                    for item in _issued_bucket(kind).get(str(uid), []):
-                        if item.get("value") == value:
-                            source_item_to_clear, source_kind = item, kind
-                            break
-                # Priority 2 (Fallback): Link to the most recently issued item for this user
-                else:
-                    last_item, last_ts = None, datetime.min.replace(tzinfo=TIMEZONE)
-                    for kind in ("username", "whatsapp"):
-                        user_items = _issued_bucket(kind).get(str(uid), [])
-                        if user_items:
-                            latest_in_kind = user_items[-1]
-                            item_ts = datetime.fromisoformat(latest_in_kind["ts"])
-                            if item_ts > last_ts:
-                                last_ts = item_ts
-                                last_item = latest_in_kind
-                                last_item['kind'] = kind # Store kind for later
-                    if last_item:
-                        source_item_to_clear, source_kind = last_item, last_item['kind']
-
 
                 # If we found a source item, log the new App ID and clear the source
                 if source_item_to_clear and source_kind:
                     context_data = {
-                        "source_owner": source_item_to_clear.get("owner"),
+                        "source_owner": source_owner,
                         "source_kind": source_kind
                     }
                     value_to_clear = source_item_to_clear.get("value")
                     await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
-                    await _log_event("app_id", "issued", update, app_id, owner=context_data.get("source_owner", ""))
+                    await _log_event("app_id", "issued", update, app_id, owner=source_owner or "")
                     log.info(f"Recorded App ID '{app_id}' for user {uid}, linked to {source_kind} '{value_to_clear}'")
                     if await _clear_one_issued(uid, source_kind, value_to_clear):
                         await _log_event(source_kind, "cleared", update, value_to_clear)
@@ -2722,7 +2706,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             return # End of processing for this group
         # ================================================================
-        # END OF MODIFIED BLOCK
+        # END OF MODIFIED BLOCK (Unified)
         # ================================================================
 
         elif chat_id == REQUEST_GROUP_ID:
