@@ -47,7 +47,7 @@ USERNAME_THRESHOLD_FOR_BONUS = int(os.getenv("USERNAME_THRESHOLD_FOR_BONUS", "25
 REQUEST_GROUP_ID = int(os.getenv("REQUEST_GROUP_ID", "-1002438185636")) # Group for 'i need ...' commands
 CLEARING_GROUP_ID = int(os.getenv("CLEARING_GROUP_ID", "-1002624324856")) # Group for auto-clearing pendings
 CONFIRMATION_GROUP_ID = int(os.getenv("CONFIRMATION_GROUP_ID", "-1002694540582"))
-CONFIRMATION_FORWARD_GROUP_ID = int(os.getenv("CONFIRMATION_FORWARD_GROUP_ID", "-1002694540582")) # Target for successful confirmations (NEW)
+CONFIRMATION_FORWARD_GROUP_ID = int(os.getenv("CONFIRMATION_FORWARD_GROUP_ID", "-1003109226804")) # Target for successful confirmations (NEW)
 DETAIL_GROUP_ID = int(os.getenv("DETAIL_GROUP_ID", "-1002598927727")) # Group for 'my detail' reports
 # --- TARGET GROUP FOR FORWARDED MESSAGES ---
 FORWARD_GROUP_ID = int(os.getenv("FORWARD_GROUP_ID", "-1003109226804")) # Target for cleared messages
