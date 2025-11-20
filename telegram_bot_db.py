@@ -47,6 +47,7 @@ USERNAME_THRESHOLD_FOR_BONUS = int(os.getenv("USERNAME_THRESHOLD_FOR_BONUS", "25
 REQUEST_GROUP_ID = int(os.getenv("REQUEST_GROUP_ID", "-1002438185636")) # Group for 'i need ...' commands
 CLEARING_GROUP_ID = int(os.getenv("CLEARING_GROUP_ID", "-1002624324856")) # Group for auto-clearing pendings
 CONFIRMATION_GROUP_ID = int(os.getenv("CONFIRMATION_GROUP_ID", "-1002694540582"))
+CONFIRMATION_FORWARD_GROUP_ID = int(os.getenv("CONFIRMATION_FORWARD_GROUP_ID", "-1002694540582")) # Target for successful confirmations (NEW)
 DETAIL_GROUP_ID = int(os.getenv("DETAIL_GROUP_ID", "-1002598927727")) # Group for 'my detail' reports
 # --- TARGET GROUP FOR FORWARDED MESSAGES ---
 FORWARD_GROUP_ID = int(os.getenv("FORWARD_GROUP_ID", "-1003109226804")) # Target for cleared messages
@@ -2500,6 +2501,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         if chat_id == CONFIRMATION_GROUP_ID:
+            if not _is_owner(update.effective_user):
+                log.info(f"Non-owner user {update.effective_user.username} sent message in CONFIRMATION_GROUP_ID. Ignoring.")
+                return
+                
             if '+1' in text:
                 match = re.search(r'@([^\s]+)', text)
                 if match:
@@ -2526,6 +2531,20 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 log.info(f"Owner {confirming_owner_name} confirmed App ID {stored_app_id_raw}. Counted and cleared for user {user_id_of_item}")
                                 found_and_counted = True
                                 break
+
+                    if found_and_counted:
+                        # NEW: Forward the message on successful confirmation
+                        if CONFIRMATION_FORWARD_GROUP_ID and CONFIRMATION_FORWARD_GROUP_ID != 0:
+                            try:
+                                await context.bot.forward_message(
+                                    chat_id=CONFIRMATION_FORWARD_GROUP_ID,
+                                    from_chat_id=chat_id,
+                                    message_id=msg.message_id
+                                )
+                                log.info(f"Forwarded successful confirmation {msg.message_id} to {CONFIRMATION_FORWARD_GROUP_ID}.")
+                            except Exception as e:
+                                log.error(f"Failed to forward confirmation message {msg.message_id} to {CONFIRMATION_FORWARD_GROUP_ID}: {e}")
+                        # END NEW: Forwarding
 
                     if not found_and_counted:
                         suggestion = _find_closest_app_id(app_id_confirmed_raw)
