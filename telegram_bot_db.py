@@ -2503,51 +2503,51 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         if chat_id == CONFIRMATION_GROUP_ID:
-                if not _is_owner(update.effective_user):
-                    log.info(f"Non-owner user {update.effective_user.username} sent message in CONFIRMATION_GROUP_ID. Ignoring.")
-                    return
-                
-                if '+1' in text:
-                    match = re.search(r'@([^\s]+)', text)
-                    if match:
-                        app_id_confirmed_raw = f"@{match.group(1)}"
-                        found_and_counted = False
+            if not _is_owner(update.effective_user):
+                log.info(f"Non-owner user {update.effective_user.username} sent message in CONFIRMATION_GROUP_ID. Ignoring.")
+                return
 
-                        # Search all users to find who this App ID belongs to
-                        for user_id_str, items in list(_issued_bucket("app_id").items()):
-                            if found_and_counted: break
-                            for item in items:
-                                stored_app_id_raw = item.get("value", "")
+            if '+1' in text:
+                match = re.search(r'@([^\s]+)', text)
+                if match:
+                    app_id_confirmed_raw = f"@{match.group(1)}"
+                    found_and_counted = False
 
-                                match_is_found = (_normalize_app_id(stored_app_id_raw) == _normalize_app_id(app_id_confirmed_raw))
+                    # Search all users to find who this App ID belongs to
+                    for user_id_str, items in list(_issued_bucket("app_id").items()):
+                        if found_and_counted: break
+                        for item in items:
+                            stored_app_id_raw = item.get("value", "")
 
-                                if match_is_found:
-                                    user_id_of_item = int(user_id_str)
-                                    confirming_owner_name = _norm_owner_name(update.effective_user.username)
-                                    source_kind = item.get("source_kind")
+                            match_is_found = (_normalize_app_id(stored_app_id_raw) == _normalize_app_id(app_id_confirmed_raw))
 
-                                    await _increment_user_confirmation_count(user_id_of_item)
-                                    await _increment_owner_performance(confirming_owner_name, source_kind)
-                                    await _log_event("app_id", "confirmed", update, stored_app_id_raw, owner=confirming_owner_name)
-                                    await _clear_one_issued(user_id_of_item, "app_id", stored_app_id_raw)
-                                    log.info(f"Owner {confirming_owner_name} confirmed App ID {stored_app_id_raw}. Counted and cleared for user {user_id_of_item}")
-                                    found_and_counted = True
-                                    break
+                            if match_is_found:
+                                user_id_of_item = int(user_id_str)
+                                confirming_owner_name = _norm_owner_name(update.effective_user.username)
+                                source_kind = item.get("source_kind")
 
-                        if found_and_counted:
-                            # NEW: Forward the message on successful confirmation
-                            if CONFIRMATION_FORWARD_GROUP_ID and CONFIRMATION_FORWARD_GROUP_ID != 0:
-                                try:
-                                    await context.bot.forward_message(
-                                        chat_id=CONFIRMATION_FORWARD_GROUP_ID,
-                                        message_thread_id=CONFIRMATION_FORWARD_TOPIC_ID, # <--- ADDED THIS LINE
-                                        from_chat_id=chat_id,
-                                        message_id=msg.message_id
-                                    )
-                                    log.info(f"Forwarded successful confirmation {msg.message_id} to {CONFIRMATION_FORWARD_GROUP_ID} (Topic: {CONFIRMATION_FORWARD_TOPIC_ID}).")
-                                except Exception as e:
-                                    log.error(f"Failed to forward confirmation message {msg.message_id} to {CONFIRMATION_FORWARD_GROUP_ID}: {e}")
-                            # END NEW: Forwarding
+                                await _increment_user_confirmation_count(user_id_of_item)
+                                await _increment_owner_performance(confirming_owner_name, source_kind)
+                                await _log_event("app_id", "confirmed", update, stored_app_id_raw, owner=confirming_owner_name)
+                                await _clear_one_issued(user_id_of_item, "app_id", stored_app_id_raw)
+                                log.info(f"Owner {confirming_owner_name} confirmed App ID {stored_app_id_raw}. Counted and cleared for user {user_id_of_item}")
+                                found_and_counted = True
+                                break
+
+                    if found_and_counted:
+                        # NEW: Forward the message on successful confirmation
+                        if CONFIRMATION_FORWARD_GROUP_ID and CONFIRMATION_FORWARD_GROUP_ID != 0:
+                            try:
+                                await context.bot.forward_message(
+                                    chat_id=CONFIRMATION_FORWARD_GROUP_ID,
+                                    message_thread_id=CONFIRMATION_FORWARD_TOPIC_ID,
+                                    from_chat_id=chat_id,
+                                    message_id=msg.message_id
+                                )
+                                log.info(f"Forwarded successful confirmation {msg.message_id} to {CONFIRMATION_FORWARD_GROUP_ID} (Topic: {CONFIRMATION_FORWARD_TOPIC_ID}).")
+                            except Exception as e:
+                                log.error(f"Failed to forward confirmation message {msg.message_id} to {CONFIRMATION_FORWARD_GROUP_ID}: {e}")
+                        # END NEW: Forwarding
 
                     if not found_and_counted:
                         suggestion = _find_closest_app_id(app_id_confirmed_raw)
@@ -2714,6 +2714,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # --- 4. Process App ID and clear source item (using pre-determined items) ---
 
+            # ... (previous code inside elif chat_id == CLEARING_GROUP_ID:) ...
+
+            # 4. Process App ID and clear source item
             if app_id_match:
                 app_id = f"@{app_id_match.group(2)}"
 
@@ -2727,6 +2730,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
                     await _log_event("app_id", "issued", update, app_id, owner=source_owner or "")
                     log.info(f"Recorded App ID '{app_id}' for user {uid}, linked to {source_kind} '{value_to_clear}'")
+                    
                     if await _clear_one_issued(uid, source_kind, value_to_clear):
                         await _log_event(source_kind, "cleared", update, value_to_clear)
                         log.info(f"Auto-cleared pending {source_kind} for user {uid}: {value_to_clear}")
@@ -2736,9 +2740,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     context_data = {"source_owner": "unknown", "source_kind": "app_id"}
                     await _set_issued(uid, chat_id, "app_id", app_id, context_data=context_data)
                     await _log_event("app_id", "issued", update, app_id)
-                    log.info(
-                        f"Recorded App ID '{app_id}' for user {uid} without a source item"
-                    )
+                    log.info(f"Recorded App ID '{app_id}' for user {uid} without a source item")
+            
             return # End of processing for this group
         # ================================================================
         # END OF MODIFIED BLOCK
