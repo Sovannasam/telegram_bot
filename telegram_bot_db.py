@@ -2279,9 +2279,15 @@ async def report_hourly_confirmations(context: ContextTypes.DEFAULT_TYPE):
     2. Cleared count -> Clearing Group
     """
     current_day = _logical_day_today()
+
+    now = datetime.now(TIMEZONE)
+    # Only run if hour is >= 16 (4 PM) OR hour <= 3 (3 AM)
+    # This covers: 4PM, 5PM, ... 12AM, 1AM, 2AM, 3AM.
+    if not (now.hour >= 16 or now.hour <= 3):
+        return
     
     # Calculate 3:30 AM today for the clearing report
-    start_of_day = datetime.combine(current_day, time(4, 00))
+    start_of_day = datetime.combine(current_day, time(3, 30))
     start_of_day = TIMEZONE.localize(start_of_day)
 
     total_confirmed = 0
@@ -2960,7 +2966,10 @@ if __name__ == "__main__":
     if app.job_queue:
         app.job_queue.run_repeating(check_reminders, interval=60, first=60)
         app.job_queue.run_repeating(_clear_expired_app_ids, interval=3600, first=3600)
-        app.job_queue.run_repeating(report_hourly_confirmations, interval=3600, first=60)
+        now = datetime.now(TIMEZONE)
+        next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        wait_seconds = (next_hour - now).total_seconds()
+        app.job_queue.run_repeating(report_hourly_confirmations, interval=3600, first=wait_seconds)
         reset_time = time(hour=5, minute=31, tzinfo=TIMEZONE)
         app.job_queue.run_daily(daily_reset, time=reset_time)
         app.job_queue.run_repeating(reset_45min_wa_counter, interval=2700, first=2700)
