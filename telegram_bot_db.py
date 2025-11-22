@@ -2274,44 +2274,76 @@ async def _clear_expired_app_ids(context: ContextTypes.DEFAULT_TYPE):
 
 async def report_hourly_confirmations(context: ContextTypes.DEFAULT_TYPE):
     """
-    Calculates total confirmed customers for the current day and sends 
-    a cumulative count to the specific confirmation topic.
+    Calculates stats for the current day and sends:
+    1. Confirmed count -> Confirmation Topic
+    2. Cleared count -> Clearing Group
     """
     current_day = _logical_day_today()
     
-    # Check if the forwarding group/topic are set
-    if not CONFIRMATION_FORWARD_GROUP_ID or not CONFIRMATION_FORWARD_TOPIC_ID:
-        return
+    # Calculate 3:30 AM today for the clearing report
+    start_of_day = datetime.combine(current_day, time(3, 30))
+    start_of_day = TIMEZONE.localize(start_of_day)
 
     total_confirmed = 0
+    total_cleared = 0
+
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
-            # Sum up all confirmation counts for today
-            result = await conn.fetchval(
+            # 1. Get Confirmations (Customer Added)
+            res_confirm = await conn.fetchval(
                 "SELECT SUM(confirm_count) FROM user_daily_confirmations WHERE day=$1",
                 current_day
             )
-            if result:
-                total_confirmed = int(result)
-    except Exception as e:
-        log.error(f"Failed to calculate hourly confirmation total: {e}")
-        return
-        
-    message_text = (
-        f" <b>Total: {total_confirmed}</b>"
-    )
+            if res_confirm:
+                total_confirmed = int(res_confirm)
 
-    try:
-        await context.bot.send_message(
-            chat_id=CONFIRMATION_FORWARD_GROUP_ID,
-            message_thread_id=CONFIRMATION_FORWARD_TOPIC_ID,
-            text=message_text,
-            parse_mode=ParseMode.HTML
-        )
-        log.info(f"Sent hourly confirmation report: {total_confirmed}")
+            # 2. Get Clearings (Messages sent to Clearing Group)
+            res_clear = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM audit_log 
+                WHERE action='cleared' 
+                AND ts_local >= $1
+                """,
+                start_of_day
+            )
+            if res_clear:
+                total_cleared = int(res_clear)
+
     except Exception as e:
-        log.error(f"Failed to send hourly confirmation report: {e}")
+        log.error(f"Failed to calculate hourly stats: {e}")
+        return
+
+    # --- REPORT 1: Send Confirmation Count to the Confirmation Topic ---
+    if CONFIRMATION_FORWARD_GROUP_ID and CONFIRMATION_FORWARD_TOPIC_ID:
+        msg_confirmed = (
+            f"✅ <b>total add: {total_confirmed}</b>"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=CONFIRMATION_FORWARD_GROUP_ID,
+                message_thread_id=CONFIRMATION_FORWARD_TOPIC_ID,
+                text=msg_confirmed,
+                parse_mode=ParseMode.HTML
+            )
+            log.info(f"Sent confirmation report: {total_confirmed}")
+        except Exception as e:
+            log.error(f"Failed to send confirmation report: {e}")
+
+    # --- REPORT 2: Send Cleared Count to the Clearing Group ---
+    if CLEARING_GROUP_ID:
+        msg_cleared = (
+            f"🧹 <b>total customer: {total_cleared}</b>"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=CLEARING_GROUP_ID,
+                text=msg_cleared,
+                parse_mode=ParseMode.HTML
+            )
+            log.info(f"Sent clearing report: {total_cleared}")
+        except Exception as e:
+            log.error(f"Failed to send clearing report: {e}")
 
 
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
