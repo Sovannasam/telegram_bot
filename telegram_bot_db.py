@@ -2281,7 +2281,7 @@ async def report_hourly_confirmations(context: ContextTypes.DEFAULT_TYPE):
     current_day = _logical_day_today()
     
     # Calculate 3:30 AM today for the clearing report
-    start_of_day = datetime.combine(current_day, time(3, 30))
+    start_of_day = datetime.combine(current_day, time(4, 00))
     start_of_day = TIMEZONE.localize(start_of_day)
 
     total_confirmed = 0
