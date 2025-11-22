@@ -2272,6 +2272,47 @@ async def _clear_expired_app_ids(context: ContextTypes.DEFAULT_TYPE):
     else:
         log.info("No expired App IDs found.")
 
+async def report_hourly_confirmations(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Calculates total confirmed customers for the current day and sends 
+    a cumulative count to the specific confirmation topic.
+    """
+    current_day = _logical_day_today()
+    
+    # Check if the forwarding group/topic are set
+    if not CONFIRMATION_FORWARD_GROUP_ID or not CONFIRMATION_FORWARD_TOPIC_ID:
+        return
+
+    total_confirmed = 0
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            # Sum up all confirmation counts for today
+            result = await conn.fetchval(
+                "SELECT SUM(confirm_count) FROM user_daily_confirmations WHERE day=$1",
+                current_day
+            )
+            if result:
+                total_confirmed = int(result)
+    except Exception as e:
+        log.error(f"Failed to calculate hourly confirmation total: {e}")
+        return
+        
+    message_text = (
+        f" <b>Total: {total_confirmed}</b>"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=CONFIRMATION_FORWARD_GROUP_ID,
+            message_thread_id=CONFIRMATION_FORWARD_TOPIC_ID,
+            text=message_text,
+            parse_mode=ParseMode.HTML
+        )
+        log.info(f"Sent hourly confirmation report: {total_confirmed}")
+    except Exception as e:
+        log.error(f"Failed to send hourly confirmation report: {e}")
+
 
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     """
@@ -2887,6 +2928,7 @@ if __name__ == "__main__":
     if app.job_queue:
         app.job_queue.run_repeating(check_reminders, interval=60, first=60)
         app.job_queue.run_repeating(_clear_expired_app_ids, interval=3600, first=3600)
+        app.job_queue.run_repeating(report_hourly_confirmations, interval=3600, first=60)
         reset_time = time(hour=5, minute=31, tzinfo=TIMEZONE)
         app.job_queue.run_daily(daily_reset, time=reset_time)
         app.job_queue.run_repeating(reset_45min_wa_counter, interval=2700, first=2700)
