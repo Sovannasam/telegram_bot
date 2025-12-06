@@ -59,16 +59,16 @@ PERFORMANCE_GROUP_IDS = {
 }
 
 # Daily limit for submissions per country
-COUNTRY_DAILY_LIMIT = int(os.getenv("COUNTRY_DAILY_LIMIT", "17"))
+COUNTRY_DAILY_LIMIT = int(os.getenv("COUNTRY_DAILY_LIMIT", "100"))
 
 
 # Whitelist of allowed countries (lowercase for case-insensitive matching)
 ALLOWED_COUNTRIES = {
-    'panama', 'united arab emirates','oman', 'jordan', 'italy', 'germany', 'indonesia',
-    'bulgaria', 'brazil', 'spain', 'belgium','portugal', 'netherlands', 'poland', 'qatar', 'france', 'switzerland', 'argentina', 
-    'costa rica', 'kuwait', 'bahrain', 'malaysia','canada','mauritania',
-    'greece','belarus', 'slovakia', 'hungary', 'romania', 'luxembourg', 'czechia', 'india', 'austria', 'tunisia', 'iran', 'mexico', 'russia'
-
+    'panama', 'georgia', 'norway', 'sweden', 'finland', 'albania', 'serbia', 'croatia', 'slovenia', 'moldova', 'estonia', 'latvia', 'malta', 
+    'montenegro', 'north nacedonia',  'denmark', 'kosovo', 'lithuania', 'ireland', 'iceland', 'scotland', 'wales', 'italy', 'germany', 'indonesia',
+    'bulgaria', 'brazil', 'spain', 'belgium', 'portugal', 'netherlands', 'poland', 'france', 'switzerland', 'argentina', 'costa rica',
+    'malaysia', 'canada', 'mauritania', 'greece', 'belarus', 'slovakia', 'hungary', 'romania', 'luxembourg', 'czechia', 'austria', 'iran', 
+    'mexico', 'russia', 'india'
 }
 
 TIMEZONE = pytz.timezone("Asia/Phnom_Penh")
