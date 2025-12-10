@@ -66,7 +66,7 @@ COUNTRY_DAILY_LIMIT = int(os.getenv("COUNTRY_DAILY_LIMIT", "100"))
 ALLOWED_COUNTRIES = {
     'panama', 'georgia', 'norway', 'sweden', 'finland', 'albania', 'serbia', 'croatia', 'slovenia', 'moldova', 'estonia', 'latvia', 'malta', 
     'montenegro', 'north macedonia',  'denmark', 'kosovo', 'lithuania', 'ireland', 'iceland', 'scotland', 'wales', 'italy', 'germany', 'indonesia',
-    'bulgaria', 'brazil', 'spain', 'belgium', 'portugal', 'netherlands', 'poland', 'france', 'switzerland', 'argentina', 'costa rica',
+    'bulgaria', 'brazil', 'spain', 'belgium', 'portugal', 'netherlands', 'poland', 'france', 'argentina', 'costa rica',
     'malaysia', 'canada', 'mauritania', 'greece', 'belarus', 'slovakia', 'hungary', 'romania', 'luxembourg', 'czechia', 'austria', 'iran', 
     'mexico', 'russia', 'india'
 }
