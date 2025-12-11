@@ -60,7 +60,7 @@ FORWARD_GROUP_ID = int(os.getenv("FORWARD_GROUP_ID", "-1003109226804")) # Target
 PERFORMANCE_GROUP_IDS = {
     -1002670785417, -1002659012767, -1002790753092, -1002520117752
 }
-CHECKER_GROUP_ID = int(os.getenv("CHECKER_GROUP_ID", "-1001234567890")) # Group for time tracking (Checker Bot)
+CHECKER_GROUP_ID = int(os.getenv("CHECKER_GROUP_ID", "-1002553328243")) # Group for time tracking (Checker Bot)
 
 # Daily limit for submissions per country
 COUNTRY_DAILY_LIMIT = int(os.getenv("COUNTRY_DAILY_LIMIT", "100"))
