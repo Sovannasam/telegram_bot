@@ -788,15 +788,25 @@ async def _next_from_username_pool() -> Optional[Dict[str, str]]:
             # Check if this owner is in the multi-owner priority map
             is_priority_owner = owner_name in state.get("priority_queue", {})
 
-            if is_priority_owner:
+            # telegram_bot_db.py (lines 600-612)
+
+                if is_priority_owner:
                     # It's the priority owner's turn. Give them the item.
                     # DO NOT advance the owner_idx, so the next request also lands here.
                     log.info(f"Priority queue: Serving {owner_name} (turn matched).")
-                    await _decrement_priority_and_end_if_needed(owner_name)
+                    await _decrement_priority_and_end_if_needed(owner_name) # This function saves state
                 else:
                     # Normal rotation. Advance the owner_idx.
                     state["rr"]["username_owner_idx"] = next_owner_idx # Use pre-calculated index
-                    # REMOVE: await save_state() 
+                    await save_state() # <--- REMOVE THIS LINE
+                    
+                # The index advancement is now in memory, and will be saved by _set_issued later.
+                
+                # Check for the unintended side effect from the code structure:
+                if not is_priority_owner:
+                    # Normal rotation. Advance the owner_idx.
+                    state["rr"]["username_owner_idx"] = next_owner_idx # Use pre-calculated index
+                    # await save_state() <--- REMOVED
 
                 return result
             
