@@ -9,6 +9,9 @@ from typing import Dict, Optional, List, Tuple
 import re
 import io
 import unicodedata
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font, Border, Side, Alignment
 
 import pytz
 import asyncpg
@@ -57,6 +60,7 @@ FORWARD_GROUP_ID = int(os.getenv("FORWARD_GROUP_ID", "-1003109226804")) # Target
 PERFORMANCE_GROUP_IDS = {
     -1002670785417, -1002659012767, -1002790753092, -1002520117752
 }
+CHECKER_GROUP_ID = int(os.getenv("CHECKER_GROUP_ID", "-1001234567890")) # Group for time tracking (Checker Bot)
 
 # Daily limit for submissions per country
 COUNTRY_DAILY_LIMIT = int(os.getenv("COUNTRY_DAILY_LIMIT", "100"))
@@ -227,6 +231,13 @@ WHATSAPP_BANNED_USERS: set[int] = set()
 WHITELISTED_USERS: set[int] = set()
 ADMIN_PERMISSIONS: Dict[str, List[str]] = {}
 USER_COUNTRY_BANS: Dict[int, set[str]] = {}
+
+# =============================
+# CHECKER BOT STATE
+# =============================
+# In-memory state for checker bot time tracking:
+user_data = {}
+user_breaks = {}
 
 # =============================
 # PERMISSIONS & ADMINS
@@ -529,6 +540,101 @@ async def load_owner_directory():
 
     log.info("[owner_directory] owners(active): usernames=%d, whatsapp=%d | handles=%d, phones=%d",
              len(USERNAME_POOL), len(WHATSAPP_POOL), len(HANDLE_INDEX), len(PHONE_INDEX))
+
+# =============================
+# CHECKER BOT UTILS
+# =============================
+def get_now() -> datetime:
+    """Gets the current time in Cambodia timezone."""
+    return datetime.now(TIMEZONE)
+
+def _ensure_user_data(user: Update.effective_user):
+    """Creates a data entry for a user if it doesn't exist."""
+    user_id = user.id
+    if user_id not in user_data:
+        user_data[user_id] = {
+            "name": user.full_name,
+            "check_in": None,
+            "check_out": None,
+            "wc_count": 0, "wc_late": 0,
+            "smoke_count": 0, "smoke_late": 0,
+            "eat_count": 0, "eat_late": 0
+        }
+
+async def _set_owner_status_in_db(owner_name: str, is_stopped: bool):
+    """Finds an owner in the 'owners' JSON blob in kv_storage and sets their disabled status, then notifies other bots."""
+    if not owner_name:
+        log.warning("Attempted to set owner status for an empty username.")
+        return
+    
+    normalized_name = _norm_owner_name(owner_name)
+    if not normalized_name:
+        return
+
+    async with db_lock:
+        try:
+            pool = await get_db_pool()
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    # Select with FOR UPDATE to prevent concurrent modifications
+                    result = await conn.fetchval("SELECT data FROM kv_storage WHERE key = 'owners' FOR UPDATE")
+                    
+                    if not result:
+                        log.warning(f"Could not find 'owners' key in kv_storage.")
+                        return
+
+                    owner_data = json.loads(result)
+                    found_owner = False
+                    for owner_group in owner_data:
+                        if _norm_owner_name(owner_group.get("owner", "")) == normalized_name:
+                            owner_group["disabled"] = is_stopped
+                            if not is_stopped:
+                                owner_group.pop("disabled_until", None) # Clear timed pause
+                            found_owner = True
+                            break
+                    
+                    if found_owner:
+                        await conn.execute("UPDATE kv_storage SET data = $1, updated_at = NOW() WHERE key = 'owners'", json.dumps(owner_data))
+                        # Trigger reload in all connected bots (including itself if necessary)
+                        await conn.execute("NOTIFY owners_changed;") 
+                        log.info(f"Set owner '{normalized_name}' status to {'STOPPED' if is_stopped else 'OPENED'} and notified owners_changed.")
+                    else:
+                        log.info(f"User '{normalized_name}' checked in/out, but is not a configured owner in kv_storage.")
+
+        except Exception as e:
+            log.error(f"Failed to set owner status for '{normalized_name}': {e}", exc_info=True)
+
+
+async def _stop_all_owners_in_db():
+    """Sets all owners in the 'owners' JSON blob to disabled: true for daily reset."""
+    log.info("Running daily job to stop all owners...")
+    async with db_lock:
+        try:
+            pool = await get_db_pool()
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    result = await conn.fetchval("SELECT data FROM kv_storage WHERE key = 'owners' FOR UPDATE")
+                    if not result:
+                        log.warning(f"Could not find 'owners' key in kv_storage for daily stop.")
+                        return
+                    
+                    owner_data = json.loads(result)
+                    changes_made = False
+                    for owner_group in owner_data:
+                        if not owner_group.get("disabled", False):
+                            owner_group["disabled"] = True
+                            changes_made = True
+                    
+                    if changes_made:
+                        await conn.execute("UPDATE kv_storage SET data = $1, updated_at = NOW() WHERE key = 'owners'", json.dumps(owner_data))
+                        await conn.execute("NOTIFY owners_changed;")
+                        log.info("Stopped all owners for end-of-day and notified owners_changed.")
+                    else:
+                        log.info("All owners were already stopped. No changes made.")
+
+        except Exception as e:
+            log.error(f"Failed to stop all owners: {e}", exc_info=True)
+
 
 # =============================
 # QUOTA & USER ACTIVITY
@@ -905,6 +1011,17 @@ USER_PERFORMANCE_RX   = re.compile(r"^\s*user\s+performance(?:\s+(today|yesterda
 USER_STATS_RX         = re.compile(r"^\s*user\s+stats(?:\s+(today|yesterday|\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)
 INVENTORY_RX          = re.compile(r"^\s*inventory\s*$", re.IGNORECASE)
 SET_FORWARD_GROUP_RX  = re.compile(r"^\s*set\s+forward\s+group\s+@?(\S+?)\s+(-?\d+)\s*$", re.IGNORECASE) # <-- ADDED
+
+# =============================
+# CHECKER BOT REGEXES
+# =============================
+CHECKIN_REGEX = re.compile(r"^\s*(?:check\s*[- ]?in|checkin|ci|in|start(?:\s*[- ]?work)?)\s*$", re.IGNORECASE)
+CHECKOUT_REGEX = re.compile(r"^\s*(?:check\s*[- ]?out|checkout|co|out|end(?:\s*[- ]?work)?)\s*$", re.IGNORECASE)
+WC_REGEX = re.compile(r"^\s*(?:wc|toilet|restroom)(?:\d{1,2})?\s*$", re.IGNORECASE)
+SMOKE_REGEX = re.compile(r"^\s*(?:sm|smoke|cig(?:arette)?)(?:\d{1,2})?\s*$", re.IGNORECASE)
+EAT_REGEX = re.compile(r"^\s*(?:eat|meal|dinner|lunch)(?:\d{1,2})?\s*$", re.IGNORECASE)
+END_TOKENS_REGEX = re.compile(r"^\s*(?:\+?1|back(?:\s+to\s+seat)?|finish|done)\s*$", re.IGNORECASE)
+
 
 def _looks_like_phone(s: str) -> bool:
     return bool(PHONE_LIKE_RX.fullmatch((s or "").strip()))
@@ -2197,6 +2314,275 @@ async def _handle_admin_command(text: str, context: ContextTypes.DEFAULT_TYPE, u
     return None
 
 # =============================
+# CHECKER BOT HANDLERS
+# =============================
+
+async def checker_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sends a welcome message when the /start command is issued."""
+    await update.message.reply_text(
+        "Welcome to the Time Tracker Bot!\n\n"
+        "You can use the following commands:\n"
+        "- `check in`\n"
+        "- `check out`\n"
+        "- `wc`\n"
+        "- `smoke`\n"
+        "- `eat`\n\n"
+        "When you are back from a break, please reply with `1`, `+1`, `back`, `finish`, or `done`."
+    )
+
+async def checker_check_in(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the 'check in' message."""
+    user = update.message.from_user
+    _ensure_user_data(user) 
+
+    now = get_now()
+    user_data[user.id]["check_in"] = now
+
+    if user.username:
+        log.info(f"User @{user.username} checking in. Attempting to open owner.")
+        await _set_owner_status_in_db(user.username, is_stopped=False)
+    else:
+        log.warning(f"User {user.full_name} (ID: {user.id}) checked in but has no Telegram @username. Cannot link to owner.")
+
+    check_time = now.time()
+    
+    # Original logic from telegram_bot.py
+    if time(13, 0) <= check_time < time(15, 0):
+        await update.message.reply_text("Well done!")
+    elif time(15, 5) < check_time < time(21, 0):
+        late_start = now.replace(hour=15, minute=0, second=0, microsecond=0)
+        # Ensure we are checking within the same day for time difference
+        if now.date() == late_start.date() or now > late_start:
+            late_minutes = int((now - late_start).total_seconds() / 60)
+            await update.message.reply_text(f"You are late {late_minutes} minutes.")
+    elif time(21, 1) < check_time < time(22, 0): # Using 22:00 for simplicity as 21:59 was in original
+        late_start = now.replace(hour=21, minute=0, second=0, microsecond=0)
+        if now.date() == late_start.date() or now > late_start:
+            late_minutes = int((now - late_start).total_seconds() / 60)
+            await update.message.reply_text(f"You are late {late_minutes} minutes (from 9 PM).")
+
+
+async def checker_check_out(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the 'check out' message."""
+    user = update.message.from_user 
+    user_id = user.id
+    now = get_now()
+    check_time = now.time()
+    
+    # Original valid times: 21:00 to 23:59:59 OR 03:00 to 06:00
+    is_valid_time = (time(21, 0) <= check_time <= time(23, 59, 59)) or \
+                      (time(3, 0) <= check_time <= time(6, 0))
+
+    if is_valid_time:
+        # Check if user has checked in today before allowing checkout
+        if user_id in user_data:
+            user_data[user_id]["check_out"] = now
+        
+        if user.username:
+            log.info(f"User @{user.username} checking out. Attempting to stop owner.")
+            await _set_owner_status_in_db(user.username, is_stopped=True)
+        else:
+            log.warning(f"User {user.full_name} (ID: {user.id}) checked out but has no Telegram @username. Cannot link to owner.")
+
+    else:
+        await update.message.reply_text("You are not allowed to check out at this time.")
+
+async def checker_wc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the 'wc' message."""
+    async with db_lock:
+        user = update.message.from_user
+        _ensure_user_data(user) 
+
+        if user.id not in user_breaks:
+            user_breaks[user.id] = {"type": "wc", "start_time": get_now()}
+            await update.message.reply_text("Break started. Reply with `1`, `+1`, `back`, `finish`, or `done` to end.")
+        else:
+            await update.message.reply_text("You are already on another break.")
+
+
+async def checker_smoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the 'smoke' message."""
+    async with db_lock:
+        user = update.message.from_user
+        _ensure_user_data(user)
+
+        if user.id not in user_breaks:
+            user_breaks[user.id] = {"type": "smoke", "start_time": get_now()}
+            await update.message.reply_text("Break started. Reply with `1`, `+1`, `back`, `finish`, or `done` to end.")
+        else:
+            await update.message.reply_text("You are already on another break.")
+
+
+async def checker_eat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the 'eat' message."""
+    user = update.message.from_user
+    now = get_now()
+    check_time = now.time()
+
+    # Original valid times: 17:00 to 17:30 OR 00:30 to 01:00
+    is_valid_time = (time(17, 0) <= check_time <= time(17, 30)) or \
+                    (time(0, 30) <= check_time <= time(1, 0))
+
+    if is_valid_time:
+        async with db_lock:
+            _ensure_user_data(user) 
+
+            if user.id not in user_breaks:
+                user_breaks[user.id] = {"type": "eat", "start_time": get_now()}
+                await update.message.reply_text("Break started. Reply with `1`, `+1`, `back`, `finish`, or `done` to end.")
+            else:
+                await update.message.reply_text("You are already on another break.")
+    else:
+        await update.message.reply_text("It's not time to eat yet.")
+
+async def checker_back_from_break(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles replies for returning from breaks and calculates lateness."""
+    user = update.message.from_user
+    user_id = user.id
+    
+    # Must use lock because user_breaks and user_data are shared state
+    async with db_lock:
+        if user_id in user_breaks:
+            break_info = user_breaks.pop(user_id)
+            break_type = break_info["type"]
+            start_time = break_info["start_time"]
+            end_time = get_now()
+
+            _ensure_user_data(user) 
+
+            late_minutes = 0
+            duration_minutes = (end_time - start_time).total_seconds() / 60
+            
+            if break_type == 'wc':
+                user_data[user_id]["wc_count"] += 1
+                max_duration = 15
+                if duration_minutes > max_duration:
+                    late_minutes = int(duration_minutes - max_duration)
+                    user_data[user_id]["wc_late"] += late_minutes
+            
+            elif break_type == 'smoke':
+                user_data[user_id]["smoke_count"] += 1
+                max_duration = 10
+                if duration_minutes > max_duration:
+                    late_minutes = int(duration_minutes - max_duration)
+                    user_data[user_id]["smoke_late"] += late_minutes
+
+            elif break_type == 'eat':
+                user_data[user_id]["eat_count"] += 1
+                
+                deadline = None
+                
+                if start_time.hour == 17:
+                    deadline = start_time.replace(hour=17, minute=30, second=0, microsecond=0)
+                
+                elif time(0, 30) <= start_time.time() <= time(1, 0): 
+                    # Assuming the break is for the 00:30-01:00 slot, the deadline is 01:00 AM
+                    deadline = start_time.replace(hour=1, minute=0, second=0, microsecond=0)
+                
+                if deadline and end_time > deadline:
+                    late_minutes = int((end_time - deadline).total_seconds() / 60)
+                    if late_minutes > 0:
+                        user_data[user_id]["eat_late"] += late_minutes
+            
+            if late_minutes > 0:
+                await update.message.reply_text(f"You are late {late_minutes} minutes.")
+            else:
+                await update.message.reply_text(f"Break finished. You took {int(duration_minutes)} minutes.")
+        
+        # If not on break, silently ignore the message.
+
+
+async def checker_get_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generates and sends the daily report if requested by an admin."""
+    
+    user = update.message.from_user
+    # Use the existing ADMIN_USERNAME from telegram_bot_db.py config
+    if _norm_owner_name(user.username) != _norm_owner_name(ADMIN_USERNAME):
+        await update.message.reply_text("You are not authorized to perform this action.")
+        return
+    
+    # Must use lock because user_data is shared state
+    async with db_lock:
+        if not user_data:
+            await update.message.reply_text("No activity to report for today.")
+            return
+            
+        try:
+            # pandas is imported globally at the top
+            import pandas as pd 
+        except ImportError:
+            log.error("Pandas not installed. Cannot generate Excel report.")
+            await update.message.reply_text("Report generation failed (missing pandas library).")
+            return
+            
+        # Sort by check-in time
+        sorted_users = sorted(user_data.items(), 
+                            key=lambda item: item[1].get('check_in') or datetime.max.replace(tzinfo=TIMEZONE))
+
+        report_data = []
+        for user_id, data in sorted_users:
+            check_in_time = data["check_in"].strftime("%H:%M") if data.get("check_in") else ""
+            check_out_time = data["check_out"].strftime("%H:%M") if data.get("check_out") else ""
+            
+            report_data.append({
+                "User": data["name"],
+                "Check-in": check_in_time,
+                "Check-out": check_out_time,
+                "WC": data["wc_count"],
+                "WC late (m)": data["wc_late"],
+                "Smoke": data["smoke_count"],
+                "Smoke late (m)": data["smoke_late"],
+                "Eat": data["eat_count"],
+                "Eat late (m)": data["eat_late"],
+            })
+        
+        df = pd.DataFrame(report_data)
+        file_path = f"daily_report_{get_now().strftime('%Y-%m-%d')}.xlsx"
+        df.to_excel(file_path, index=False)
+        
+        
+        # openpyxl components are imported globally
+        wb = load_workbook(file_path)
+        ws = wb.active
+
+        # Define styles locally (copied from checker bot)
+        header_fill = PatternFill(start_color="4AACC5", end_color="4AACC5", fill_type="solid")
+        header_font = Font(color="FFFFFF", bold=True)
+        late_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+        thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+        center_align = Alignment(horizontal='center', vertical='center')
+
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.border = thin_border
+            cell.alignment = center_align
+
+        late_columns_indices = [col_idx for col_idx, cell in enumerate(ws[1], 1) if cell.value in ["WC late (m)", "Smoke late (m)", "Eat late (m)"]]
+
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            for cell in row:
+                cell.border = thin_border
+                cell.alignment = center_align
+                
+                if cell.column in late_columns_indices and isinstance(cell.value, (int, float)) and cell.value > 0:
+                    cell.fill = late_fill
+                    cell.value = f"{cell.value} minute"
+
+        for column_cells in ws.columns:
+            max_length = max(len(str(cell.value or "")) for cell in column_cells)
+            ws.column_dimensions[column_cells[0].column_letter].width = (max_length + 2)
+
+        wb.save(file_path)
+        
+
+        with open(file_path, 'rb') as document:
+            await context.bot.send_document(chat_id=update.message.chat_id, document=document)
+        
+        os.remove(file_path)
+        await update.message.reply_text("Report sent.")
+
+# =============================
 # REMINDER & RESET TASKS
 # =============================
 async def _send_all_pending_reminders(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -2466,6 +2852,18 @@ async def reset_45min_wa_counter(context: ContextTypes.DEFAULT_TYPE):
         await save_state()
     log.info("45-minute WhatsApp counter has been reset to 0.")
 
+
+async def clear_data_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clears all checker bot user data and STOPS all owners in the main bot via DB update."""
+    
+    await _stop_all_owners_in_db()
+    
+    # Must use lock to modify shared in-memory state
+    async with db_lock:
+        user_data.clear()
+        user_breaks.clear()
+        log.info("Daily checker bot user data has been cleared automatically.")
+
 async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
     log.info("Performing daily reset...")
     async with db_lock:
@@ -2537,6 +2935,45 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     chat_id = msg.chat_id
     cache_user_info(update.effective_user)
+    
+    # --- NEW: CHECKER BOT ROUTING (Must be outside main lock to avoid deadlock with owner status update) ---
+    if chat_id == CHECKER_GROUP_ID:
+        
+        # Handle commands that require the text/message
+        if text.lower() == '/start':
+            await checker_start(update, context)
+            return
+
+        if text.lower() == '/getreport':
+            await checker_get_report(update, context)
+            return
+
+        if CHECKIN_REGEX.match(text):
+            await checker_check_in(update, context)
+            return
+        
+        if CHECKOUT_REGEX.match(text):
+            await checker_check_out(update, context)
+            return
+            
+        if WC_REGEX.match(text):
+            await checker_wc(update, context)
+            return
+
+        if SMOKE_REGEX.match(text):
+            await checker_smoke(update, context)
+            return
+
+        if EAT_REGEX.match(text):
+            await checker_eat(update, context)
+            return
+
+        if END_TOKENS_REGEX.match(text):
+            await checker_back_from_break(update, context)
+            return
+        
+        return 
+    # --- END NEW: CHECKER BOT ROUTING ---
 
     async with db_lock:
         # User "my detail" command
@@ -2793,8 +3230,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # --- 4. Process App ID and clear source item (using pre-determined items) ---
 
-            # ... (previous code inside elif chat_id == CLEARING_GROUP_ID:) ...
-
             # 4. Process App ID and clear source item
             if app_id_match:
                 app_id = f"@{app_id_match.group(2)}"
@@ -2970,9 +3405,16 @@ if __name__ == "__main__":
         next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
         wait_seconds = (next_hour - now).total_seconds()
         app.job_queue.run_repeating(report_hourly_confirmations, interval=3600, first=wait_seconds)
+        
+        # Main bot daily reset (clears DB activity)
         reset_time = time(hour=5, minute=31, tzinfo=TIMEZONE)
         app.job_queue.run_daily(daily_reset, time=reset_time)
+        
         app.job_queue.run_repeating(reset_45min_wa_counter, interval=2700, first=2700)
+
+        # NEW CHECKER BOT JOB (stops owners and clears checker state)
+        clear_time = time(hour=4, minute=00, tzinfo=TIMEZONE)
+        app.job_queue.run_daily(clear_data_job, time=clear_time)
 
     app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.ALL, on_message))
 
