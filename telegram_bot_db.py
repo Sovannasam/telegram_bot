@@ -789,16 +789,16 @@ async def _next_from_username_pool() -> Optional[Dict[str, str]]:
             is_priority_owner = owner_name in state.get("priority_queue", {})
 
             if is_priority_owner:
-                # It's the priority owner's turn. Give them the item.
-                # DO NOT advance the owner_idx, so the next request also lands here.
-                log.info(f"Priority queue: Serving {owner_name} (turn matched).")
-                await _decrement_priority_and_end_if_needed(owner_name) # Pass owner_name
-            else:
-                # Normal rotation. Advance the owner_idx.
-                state["rr"]["username_owner_idx"] = next_owner_idx # Use pre-calculated index
-                await save_state()
+                    # It's the priority owner's turn. Give them the item.
+                    # DO NOT advance the owner_idx, so the next request also lands here.
+                    log.info(f"Priority queue: Serving {owner_name} (turn matched).")
+                    await _decrement_priority_and_end_if_needed(owner_name)
+                else:
+                    # Normal rotation. Advance the owner_idx.
+                    state["rr"]["username_owner_idx"] = next_owner_idx # Use pre-calculated index
+                    # REMOVE: await save_state() 
 
-            return result
+                return result
             
     return None # No owners with items found
 
@@ -840,11 +840,11 @@ async def _next_from_whatsapp_pool() -> Optional[Dict[str, str]]:
                     # It's the priority owner's turn. Give them the item.
                     # DO NOT advance the wa_owner_idx, so the next request also lands here.
                     log.info(f"Priority queue: Serving {owner} (turn matched).")
-                    await _decrement_priority_and_end_if_needed(owner) # Pass owner
+                    await _decrement_priority_and_end_if_needed(owner)
                 else:
                     # Normal rotation. Advance the wa_owner_idx.
                     state["rr"]["wa_owner_idx"] = next_owner_idx # Use pre-calculated index
-                    await save_state()
+                    # REMOVE: await save_state()
 
                 return {"owner": owner, "number": cand}
                 
