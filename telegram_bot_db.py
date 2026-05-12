@@ -1297,32 +1297,32 @@ async def _get_user_detail_text(user_id: int) -> str:
     pending_usernames = [item['value'] for item in _issued_bucket("username").get(str(user_id), [])]
     pending_whatsapps = [item['value'] for item in _issued_bucket("whatsapp").get(str(user_id), [])]
 
-    lines = [f"<b>📊 Daily Detail for {user_display}</b>"]
-    lines.append(f"<b>- Usernames Received:</b> {username_reqs}")
-    lines.append(f"<b>- WhatsApps Received:</b> {whatsapp_reqs}")
-    lines.append(f"<b>- Customers Added:</b> {confirmation_count}")
+    lines = [f"<b>📊 ព័ត៌មានលម្អិតប្រចាំថ្ងៃសម្រាប់ {user_display}</b>"]
+    lines.append(f"<b>- Username ដែលបានទទួល៖</b> {username_reqs}")
+    lines.append(f"<b>- WhatsApp ដែលបានទទួល៖</b> {whatsapp_reqs}")
+    lines.append(f"<b>- អតិថិជនដែលបានបន្ថែម៖</b> {confirmation_count}")
 
     if country_counts:
         lines.append("")
-        lines.append("<b>🌍 Country Submissions:</b>")
+        lines.append("<b>🌍 ការដាក់ស្នើតាមប្រទេស៖</b>")
         for country, count in country_counts:
             lines.append(f"  - {country.title()}: {count}")
 
     lines.append("")
 
     if pending_usernames:
-        lines.append("<b>⏳ Pending Usernames:</b>")
+        lines.append("<b>⏳ Username កំពុងរង់ចាំ៖</b>")
         for u in pending_usernames:
             lines.append(f"  - <code>{u}</code>")
     else:
-        lines.append("<b>✅ No Pending Usernames</b>")
+        lines.append("<b>✅ មិនមាន Username កំពុងរង់ចាំ</b>")
 
     if pending_whatsapps:
-        lines.append("\n<b>⏳ Pending WhatsApps:</b>")
+        lines.append("\n<b>⏳ WhatsApp កំពុងរង់ចាំ៖</b>")
         for w in pending_whatsapps:
             lines.append(f"  - <code>{w}</code>")
     else:
-        lines.append("\n<b>✅ No Pending WhatsApps</b>")
+        lines.append("\n<b>✅ មិនមាន WhatsApp កំពុងរង់ចាំ</b>")
 
     return "\n".join(lines)
 
@@ -2323,7 +2323,7 @@ async def report_hourly_confirmations(context: ContextTypes.DEFAULT_TYPE):
     # --- REPORT 1: Send Confirmation Count to the Confirmation Topic ---
     if CONFIRMATION_FORWARD_GROUP_ID and CONFIRMATION_FORWARD_TOPIC_ID:
         msg_confirmed = (
-            f"✅ <b>total add: {total_confirmed}</b>"
+            f"✅ <b>បន្ថែមសរុប៖ {total_confirmed}</b>"
         )
         try:
             await context.bot.send_message(
@@ -2339,7 +2339,7 @@ async def report_hourly_confirmations(context: ContextTypes.DEFAULT_TYPE):
     # --- REPORT 2: Send Cleared Count to the Clearing Group ---
     if CLEARING_GROUP_ID:
         msg_cleared = (
-            f"🧹 <b>total customer: {total_cleared}</b>"
+            f"🧹 <b>អតិថិជនសរុប៖ {total_cleared}</b>"
         )
         try:
             await context.bot.send_message(
@@ -2632,13 +2632,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         suggestion = _find_closest_app_id(app_id_confirmed_raw)
                         if suggestion:
                             reply_text = (
-                                f"Wrong ID. Did you mean <code>{suggestion}</code>?\n\n"
-                                f"Tap to copy and send again:\n"
+                                f"លេខ ID មិនត្រឹមត្រូវ។ តើអ្នកចង់សំដៅលើ <code>{suggestion}</code> មែនទេ?\n\n"
+                                f"ចុចដើម្បីចម្លង និងផ្ញើម្តងទៀត៖\n"
                                 f"<code>+1 {suggestion}</code>"
                             )
                             await msg.reply_html(reply_text)
                         else:
-                            await msg.reply_text("Wrong ID, please check.")
+                            await msg.reply_text("លេខ ID មិនត្រឹមត្រូវ សូមពិនិត្យឡើងវិញ។")
                         log.warning(f"Received confirmation for incorrect App ID '{app_id_confirmed_raw}' from {update.effective_user.username}.")
             return
 
@@ -2841,7 +2841,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         return
 
                 rec = await _next_from_username_pool()
-                reply = "No available username." if not rec else f"@{rec['owner']}\n{rec['username']}"
+                reply = "មិនមាន username ទំនេរទេ។" if not rec else f"@{rec['owner']}\n{rec['username']}"
                 await msg.reply_text(reply)
                 if rec:
                     # Record the time of this successful request
@@ -2876,7 +2876,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 current_45min_count = state.setdefault("wa_45min_counter", 0)
                 if current_45min_count >= 10:
                     log.info(f"User {uid} request for WA denied. Global 45-min limit of 10 reached.")
-                    await msg.reply_text("No available WhatsApp.")
+                    await msg.reply_text("មិនមានលេខ WhatsApp ទំនេរទេ។")
                     return
 
                 # Cooldown check
@@ -2896,10 +2896,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
 
                 rec = await _next_from_whatsapp_pool()
-                reply = "No available WhatsApp."
+                reply = "មិនមានលេខ WhatsApp ទំនេរទេ។"
                 if rec:
                     if await _wa_quota_reached(rec["number"]):
-                        reply = "No available WhatsApp (daily limit may be reached)."
+                        reply = "មិនមានលេខ WhatsApp ទំនេរទេ (ប្រហែលដល់ដែនកំណត់ប្រចាំថ្ងៃហើយ)។"
                         rec = None
                     else:
                         reply = f"@{rec['owner']}\n{rec['number']}"
